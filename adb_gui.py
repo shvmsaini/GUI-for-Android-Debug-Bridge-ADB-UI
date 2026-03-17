@@ -15,8 +15,55 @@ from PyQt6.QtWidgets import (
     QMessageBox, QInputDialog, QFrame, QScrollArea, QGroupBox, QSizePolicy,
     QDialog, QListWidget, QCheckBox, QRadioButton, QButtonGroup, QTabWidget
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon
+
+
+class DeviceFileListWidget(QListWidget):
+    """List widget that accepts file drops for upload to device."""
+
+    files_dropped = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            paths = []
+            for url in event.mimeData().urls():
+                if isinstance(url, QUrl) and url.isLocalFile():
+                    p = url.toLocalFile()
+                    if p:
+                        paths.append(p)
+            if paths:
+                self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
+
+class _UICaller(QObject):
+    """Thread-safe UI callback helper."""
+
+    call = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.call.connect(lambda fn: fn())
 
 class ADBManager:
     """Manages ADB operations"""
@@ -459,8 +506,15 @@ class ADBGUI(QMainWindow):
         
         # File operations
         file_group = self.create_card("📁 File Transfer")
-        self.create_button(file_group, "⬆️ Push File to Device", self.push_file)
-        self.create_button(file_group, "⬇️ Pull File from Device", self.pull_file)
+        push_pull_row = QHBoxLayout()
+        push_btn = QPushButton("⬆️ Push")
+        push_btn.clicked.connect(self.push_file)
+        pull_btn = QPushButton("⬇️ Pull")
+        pull_btn.clicked.connect(self.pull_file)
+        push_pull_row.addWidget(push_btn)
+        push_pull_row.addWidget(pull_btn)
+        file_group.layout().addLayout(push_pull_row)
+        self.create_button(file_group, "🗂️ File Explorer (/sdcard)", self.open_file_explorer)
         ops_layout.addWidget(file_group)
         
         # App operations
@@ -477,14 +531,21 @@ class ADBGUI(QMainWindow):
         self.separator.setStyleSheet(f"color: {self.colors['border']};")
         app_group.layout().addWidget(self.separator)
         
-        self.create_button(app_group, "🚫 DeGoogle Device", self.degoogle_device, accent=True)
-        self.create_button(app_group, "↩️ Undo DeGoogle", self.undo_degoogle)
+        degoogle_row = QHBoxLayout()
+        degoogle_btn = QPushButton("🚫 DeGoogle")
+        degoogle_btn.clicked.connect(self.degoogle_device)
+        degoogle_btn.setProperty("accent", "true")
+        undo_degoogle_btn = QPushButton("↩️ Undo DeGoogle")
+        undo_degoogle_btn.clicked.connect(self.undo_degoogle)
+        degoogle_row.addWidget(degoogle_btn)
+        degoogle_row.addWidget(undo_degoogle_btn)
+        app_group.layout().addLayout(degoogle_row)
         ops_layout.addWidget(app_group)
         
         # Device operations
         device_ops_group = self.create_card("⚡ Device Operations")
         self.create_button(device_ops_group, "📸 Take Screenshot", self.take_screenshot)
-        self.create_button(device_ops_group, "🪞 Mirror Screen (scrcpy)", self.scrcpy_device, accent=True)
+        self.create_button(device_ops_group, "🪞 Mirror Screen (scrcpy)", self.scrcpy_device)
         self.create_button(device_ops_group, "🔄 Reboot Device", self.reboot_device)
         self.create_button(device_ops_group, "🔧 Reboot to Recovery", self.reboot_recovery)
         self.create_button(device_ops_group, "⚙️ Reboot to Bootloader", self.reboot_bootloader)
@@ -977,6 +1038,348 @@ class ADBGUI(QMainWindow):
                 self.update_status("Failed to pull file")
         
         threading.Thread(target=do_pull, daemon=True).start()
+
+    def open_file_explorer(self):
+        """Open a simple device file explorer (defaults to /sdcard)."""
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+
+        device_id = self.current_device
+        ui = _UICaller(self)
+
+        def sh_quote(s: str) -> str:
+            # Safe single-quote for Android shell
+            return "'" + s.replace("'", "'\"'\"'") + "'"
+
+        explorer = QDialog(self)
+        explorer.setWindowTitle(f"File Explorer — {device_id}")
+        explorer.setMinimumSize(900, 600)
+        explorer.setModal(True)
+
+        layout = QVBoxLayout(explorer)
+        layout.setSpacing(8)
+
+        # Path + controls
+        top_row = QHBoxLayout()
+        path_label = QLabel("Path:")
+        top_row.addWidget(path_label)
+
+        path_entry = QLineEdit("/sdcard")
+        path_entry.setReadOnly(False)
+        top_row.addWidget(path_entry, 1)
+
+        up_btn = QPushButton("⬆️ Up")
+        top_row.addWidget(up_btn)
+
+        refresh_btn = QPushButton("🔄 Refresh")
+        top_row.addWidget(refresh_btn)
+
+        layout.addLayout(top_row)
+
+        hint = QLabel("Tip: Drag & drop files from your computer into the list to upload to the current folder.")
+        hint.setStyleSheet(f"color: {self.colors['text_secondary']};")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # File list (drop enabled)
+        listbox = DeviceFileListWidget()
+        layout.addWidget(listbox, 1)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        upload_btn = QPushButton("⬆️ Upload…")
+        download_btn = QPushButton("⬇️ Download…")
+        delete_btn = QPushButton("🗑️ Delete")
+        mkdir_btn = QPushButton("📁 New Folder…")
+        close_btn = QPushButton("Close")
+
+        btn_row.addWidget(upload_btn)
+        btn_row.addWidget(download_btn)
+        btn_row.addWidget(delete_btn)
+        btn_row.addWidget(mkdir_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        # Helpers
+        def current_path() -> str:
+            p = path_entry.text().strip()
+            if not p:
+                return "/sdcard"
+            if not p.startswith("/"):
+                p = "/" + p
+            return p.rstrip("/") if p != "/" else "/"
+
+        def join_remote(base: str, name: str) -> str:
+            if base == "/":
+                return "/" + name.lstrip("/")
+            return base.rstrip("/") + "/" + name.lstrip("/")
+
+        def selected_items():
+            return listbox.selectedItems()
+
+        def refresh_listing():
+            p = current_path()
+            listbox.clear()
+            listbox.addItem("Loading…")
+
+            def do_ls():
+                try:
+                    # Portable listing for older Android "toolbox" (may not support ls flags like -1/-p).
+                    # We append "/" for directories ourselves.
+                    # Pass path as $1 to avoid fragile nested quoting.
+                    script = (
+                        'cd "$1" 2>/dev/null || exit 2; '
+                        'for f in * .*; do '
+                        '[ "$f" = "." ] && continue; '
+                        '[ "$f" = ".." ] && continue; '
+                        '[ -e "$f" ] || continue; '
+                        'if [ -d "$f" ]; then echo "$f/"; '
+                        'else echo "$f"; fi; '
+                        "done"
+                    )
+                    # Note: avoid complicated quoting here; /sdcard paths normally have no spaces
+                    cmd = f'{self.get_device_flag()} shell sh -c {sh_quote(script)} sh {p}'
+                    res = self.adb.run_command(cmd)
+
+                    def apply():
+                        listbox.clear()
+                        if not res["success"]:
+                            err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                            listbox.addItem(f"[Error] {err.strip()}")
+                            return
+
+                        lines = [ln.strip() for ln in (res.get("stdout") or "").splitlines() if ln.strip()]
+                        # Filter out . and .. if present
+                        lines = [ln for ln in lines if ln not in (".", "..")]
+
+                        # Separate dirs/files (dirs end with / when -p is available)
+                        dirs = []
+                        files = []
+                        for name in lines:
+                            if name.endswith("/"):
+                                dirs.append(name)
+                            else:
+                                files.append(name)
+
+                        for name in sorted(dirs, key=lambda s: s.lower()):
+                            listbox.addItem("📁 " + name.rstrip("/"))
+                        for name in sorted(files, key=lambda s: s.lower()):
+                            listbox.addItem(name)
+
+                    ui.call.emit(apply)
+                except Exception as e:
+                    err = str(e)
+                    def apply_err():
+                        listbox.clear()
+                        listbox.addItem(f"[Error] {err}")
+                    ui.call.emit(apply_err)
+
+            threading.Thread(target=do_ls, daemon=True).start()
+
+        def go_up():
+            p = current_path()
+            if p == "/":
+                return
+            parent = os.path.dirname(p.rstrip("/"))
+            if not parent:
+                parent = "/"
+            path_entry.setText(parent)
+            refresh_listing()
+
+        def on_double_click(item):
+            text = item.text()
+            # For dirs we prefix "📁 ". If -p wasn't supported, we'll still try to enter and show an error if it fails.
+            name = text
+            is_dir_hint = False
+            if text.startswith("📁 "):
+                name = text.replace("📁 ", "", 1).strip()
+                is_dir_hint = True
+            if name.startswith("[Error]") or name == "Loading…":
+                return
+            target = join_remote(current_path(), name)
+            if is_dir_hint:
+                path_entry.setText(target)
+                refresh_listing()
+                return
+            # Best-effort: check if it's a directory
+            def do_check_dir():
+                res = self.adb.run_command(f"{self.get_device_flag()} shell sh -c {sh_quote(f'test -d {sh_quote(target)} && echo DIR || echo FILE')}")
+                out = (res.get("stdout") or "").strip()
+                if res["success"] and out == "DIR":
+                    ui.call.emit(lambda: path_entry.setText(target))
+                    ui.call.emit(refresh_listing)
+            threading.Thread(target=do_check_dir, daemon=True).start()
+
+        def upload_files(local_paths):
+            if not local_paths:
+                return
+            dest_dir = current_path()
+            self.log(f"Uploading {len(local_paths)} file(s) to {dest_dir}…")
+            self.update_status("Uploading file(s)…")
+
+            def do_upload():
+                ok = 0
+                failed = 0
+                for lp in local_paths:
+                    if not os.path.exists(lp):
+                        failed += 1
+                        continue
+                    # Push into the current folder (adb push <local> <remote_dir>/)
+                    res = self.adb.run_command(f"{self.get_device_flag()} push {lp} {dest_dir}/", timeout=120)
+                    if res["success"]:
+                        ok += 1
+                    else:
+                        failed += 1
+                        err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                        self.log(f"Upload failed for {lp}: {err}", "ERROR")
+
+                QTimer.singleShot(0, refresh_listing)
+                ui.call.emit(lambda: self.update_status("Upload complete"))
+                ui.call.emit(lambda: QMessageBox.information(
+                    self,
+                    "Upload complete",
+                    f"Uploaded: {ok}\nFailed: {failed}\n\nDestination:\n{dest_dir}"
+                ))
+
+            threading.Thread(target=do_upload, daemon=True).start()
+
+        def upload_clicked():
+            files, _ = QFileDialog.getOpenFileNames(self, "Select file(s) to upload")
+            upload_files(files)
+
+        def download_clicked():
+            items = selected_items()
+            if not items:
+                QMessageBox.warning(self, "No Selection", "Select one or more files/folders to download.")
+                return
+
+            dest = QFileDialog.getExistingDirectory(self, "Select destination folder")
+            if not dest:
+                return
+
+            # Build remote paths
+            remote_paths = []
+            for it in items:
+                name = it.text()
+                if name.startswith("[Error]") or name == "Loading…":
+                    continue
+                if name.startswith("📁 "):
+                    name = name.replace("📁 ", "", 1).strip()
+                remote_paths.append(join_remote(current_path(), name))
+
+            if not remote_paths:
+                return
+
+            self.log(f"Downloading {len(remote_paths)} item(s) to {dest}…")
+            self.update_status("Downloading…")
+
+            def do_pull():
+                ok = 0
+                failed = 0
+                for rp in remote_paths:
+                    res = self.adb.run_command(f"{self.get_device_flag()} pull {rp} {dest}", timeout=300)
+                    if res["success"]:
+                        ok += 1
+                    else:
+                        failed += 1
+                        err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                        self.log(f"Download failed for {rp}: {err}", "ERROR")
+
+                QTimer.singleShot(0, lambda: self.update_status("Download complete"))
+                ui.call.emit(lambda: QMessageBox.information(
+                    self,
+                    "Download complete",
+                    f"Downloaded: {ok}\nFailed: {failed}\n\nDestination:\n{dest}"
+                ))
+
+            threading.Thread(target=do_pull, daemon=True).start()
+
+        def delete_clicked():
+            items = selected_items()
+            if not items:
+                QMessageBox.warning(self, "No Selection", "Select one or more files/folders to delete.")
+                return
+            reply = QMessageBox.question(
+                self,
+                "Confirm Delete",
+                "Delete selected item(s) from the device?\n\nThis cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            targets = []
+            for it in items:
+                name = it.text()
+                if name.startswith("📁 "):
+                    name = name.replace("📁 ", "", 1).strip()
+                if name.startswith("[Error]") or name == "Loading…":
+                    continue
+                targets.append(join_remote(current_path(), name))
+
+            if not targets:
+                return
+
+            self.log(f"Deleting {len(targets)} item(s)…")
+            self.update_status("Deleting…")
+
+            def do_delete():
+                ok = 0
+                failed = 0
+                for t in targets:
+                    # rm -rf handles both files and dirs
+                    res = self.adb.run_command(f"{self.get_device_flag()} shell rm -rf {sh_quote(t)}")
+                    if res["success"]:
+                        ok += 1
+                    else:
+                        failed += 1
+                        err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                        self.log(f"Delete failed for {t}: {err}", "ERROR")
+
+                QTimer.singleShot(0, refresh_listing)
+                ui.call.emit(lambda: self.update_status("Delete complete"))
+                ui.call.emit(lambda: QMessageBox.information(self, "Delete complete", f"Deleted: {ok}\nFailed: {failed}"))
+
+            threading.Thread(target=do_delete, daemon=True).start()
+
+        def mkdir_clicked():
+            folder, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
+            if not ok or not folder or not folder.strip():
+                return
+            folder = folder.strip().strip("/")
+            dest = join_remote(current_path(), folder)
+            self.log(f"Creating folder {dest}…")
+            self.update_status("Creating folder…")
+
+            def do_mkdir():
+                res = self.adb.run_command(f"{self.get_device_flag()} shell mkdir -p {sh_quote(dest)}")
+                if res["success"]:
+                    ui.call.emit(refresh_listing)
+                    ui.call.emit(lambda: self.update_status("Folder created"))
+                else:
+                    err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                    self.log(f"mkdir failed: {err}", "ERROR")
+                    ui.call.emit(lambda: self.update_status("Failed to create folder"))
+                    ui.call.emit(lambda: QMessageBox.critical(self, "Error", f"Failed to create folder:\n\n{err}"))
+
+            threading.Thread(target=do_mkdir, daemon=True).start()
+
+        # Wire events
+        close_btn.clicked.connect(explorer.accept)
+        refresh_btn.clicked.connect(refresh_listing)
+        up_btn.clicked.connect(go_up)
+        listbox.itemDoubleClicked.connect(on_double_click)
+        upload_btn.clicked.connect(upload_clicked)
+        download_btn.clicked.connect(download_clicked)
+        delete_btn.clicked.connect(delete_clicked)
+        mkdir_btn.clicked.connect(mkdir_clicked)
+        listbox.files_dropped.connect(upload_files)
+        path_entry.returnPressed.connect(refresh_listing)
+
+        refresh_listing()
+        explorer.exec()
     
     def install_apk(self):
         """Install APK file"""

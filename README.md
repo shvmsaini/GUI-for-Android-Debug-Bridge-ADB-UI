@@ -17,6 +17,7 @@ Works on **macOS, Linux, and Windows** (ADB + device drivers permitting).
 ### File Operations
 - Push files from PC to Android device
 - Pull files from Android device to PC
+- File Explorer: browse `/sdcard`, upload/download, drag-and-drop upload
 
 ### App Management
 - Install APK files (supports split APKs)
@@ -152,6 +153,11 @@ Works on **macOS, Linux, and Windows** (ADB + device drivers permitting).
 ### File Transfer
 - **Push**: Select a file from your PC and specify destination path on device
 - **Pull**: Specify file path on device and choose where to save on PC
+- **File Explorer**:
+  - Browse the device filesystem (starts at `/sdcard`)
+  - Double-click folders to navigate
+  - Upload via button or **drag-and-drop** files from your computer into the list
+  - Download selected files/folders to a chosen local folder
 
 ### App Management
 - **Install APK**: Browse and install APK files (supports split APKs)
@@ -180,6 +186,7 @@ Works on **macOS, Linux, and Windows** (ADB + device drivers permitting).
 ### Screen Mirroring (scrcpy)
 - Click **"🪞 Mirror Screen (scrcpy)"** to mirror the currently selected device
 - If `scrcpy` is not found, the app will suggest installing it (and can also let you browse to the binary)
+ - Note: Some scrcpy builds don’t support a custom `--adb` option; the app will auto-fallback if needed.
 
 ### Logcat
 - Click "Start Logcat" to begin streaming Android logs
@@ -197,6 +204,7 @@ Works on **macOS, Linux, and Windows** (ADB + device drivers permitting).
   - Unsafe packages: Critical system components (use with extreme caution)
 - Choose to disable (can be re-enabled) or uninstall (can be restored)
 - **Undo DeGoogle**: Restore previously removed packages from saved state
+ - In the UI, **DeGoogle** and **Undo DeGoogle** are placed side-by-side for convenience.
 
 ### Dark Mode
 - Toggle between light and dark themes using the button in the header
