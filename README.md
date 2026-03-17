@@ -1,8 +1,10 @@
-# ADB Tool for Windows
+# ADB GUI (PyQt6)
 
 <img width="2560" height="1377" alt="image" src="https://github.com/user-attachments/assets/2feec627-48e1-434e-810a-051b3fca04fc" />
 
-A modern, user-friendly GUI application for Android Debug Bridge (ADB) operations on Windows, built with PyQt6.
+A modern, user-friendly GUI application for Android Debug Bridge (ADB) operations, built with PyQt6.
+
+Works on **macOS, Linux, and Windows** (ADB + device drivers permitting).
 
 ## Features
 
@@ -22,17 +24,19 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 - Reinstall apps for current user
 - List all installed apps with search functionality
 - Enable/disable apps
+- Start / stop / force-stop apps (from the Installed Apps window)
 - View app details and package information
 - Open APKs folder
 
 ### Device Operations
 - Take screenshots (automatically saved to `screenshots/` folder with timestamps)
 - Reboot device (normal, recovery, bootloader)
+- Mirror screen with **scrcpy** (optional)
 
 ### Shell Commands
 - Multi-line textbox for entering complex commands
 - Execute ADB shell commands directly on your Android device
-- Supports Linux commands (not Windows commands)
+- Commands run on Android (Linux), not your desktop OS
 - Optional prefixes: You can include "adb shell" prefix, but it's not required (auto-stripped)
 - View output in real-time in the log window
 
@@ -64,9 +68,11 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 1. **Python 3.8+**
 2. **PyQt6** (install via `pip install PyQt6`)
 3. **ADB (Android Debug Bridge)**
-   - Download from: https://developer.android.com/studio/releases/platform-tools
-   - Extract the `platform-tools` folder
+   - Install via Android Studio Platform Tools or your package manager
+   - Or download from: https://developer.android.com/studio/releases/platform-tools
 4. **Android Device** with USB debugging enabled
+5. **scrcpy** (optional, for screen mirroring)
+   - macOS (Homebrew): `brew install scrcpy`
 
 ## Installation
 
@@ -97,14 +103,13 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 
 3. **Run the application:**
    ```bash
-   python adb_gui.py
+   python3 adb_gui.py
    ```
 
-4. **First Launch - Select ADB Path:**
-   - On first launch, you'll be prompted to select the `platform-tools` folder
-   - Navigate to where you extracted the Android SDK Platform Tools
-   - Select the `platform-tools` folder (the one containing `adb.exe`)
-   - The path will be saved automatically for future use
+4. **ADB auto-detection (recommended):**
+   - The app will try to find `adb` automatically via your `PATH` (and common SDK/Homebrew locations on macOS).
+   - If it cannot find ADB, it will prompt you to select it.
+   - You can always change it later using the **"ADB Path"** button.
 
 5. **Select your device** from the dropdown (devices auto-refresh every 5 seconds)
 
@@ -113,7 +118,8 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 ## How It Works
 
 ### ADB Path Selection
-- On first launch, the application prompts you to select the `platform-tools` folder
+- The app first attempts to auto-detect `adb` (PATH + common locations)
+- If auto-detection fails, it will prompt you to select the `platform-tools` folder or the `adb` executable
 - The selected path is saved to `settings.json` for persistence
 - You can change the ADB path later using the "ADB Path" button in the UI
 - The application will also check system PATH as a fallback
@@ -153,7 +159,7 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 - **List Apps**: View all installed packages with:
   - Search functionality (by app name or package)
   - Filter to show only disabled apps
-  - Uninstall, reinstall, enable, disable actions
+  - Uninstall, reinstall, enable/disable, start/stop/force-stop actions
   - Double-click to view app details
 - **Reinstall for User**: Restore apps that were uninstalled for your user account
 - **Open APKs Folder**: Quickly access pulled APK files
@@ -164,12 +170,16 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 
 ### Shell Commands
 - Enter any ADB shell command in the multi-line textbox
-- Commands run on your Android device (Linux), not on Windows
-- Use Linux commands: `grep` (not `findstr`), `ls` (not `dir`), `cat` (not `type`)
+- Commands run on your Android device (Linux), not your desktop OS
+- Use Android/Linux commands like `grep`, `ls`, `cat`
 - You can include "adb shell" prefix, but it's optional (will be auto-stripped)
 - Click "Run Command" to execute
 - Output appears in real-time in the log window
 - Examples: `ls /sdcard`, `pm list packages`, `dumpsys battery | grep level`
+
+### Screen Mirroring (scrcpy)
+- Click **"🪞 Mirror Screen (scrcpy)"** to mirror the currently selected device
+- If `scrcpy` is not found, the app will suggest installing it (and can also let you browse to the binary)
 
 ### Logcat
 - Click "Start Logcat" to begin streaming Android logs
@@ -204,12 +214,12 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 - Check USB cable connection
 - Try different USB port
 - On device, check for "Allow USB debugging?" prompt and accept it
-- Run `adb devices` in command prompt to verify ADB can see your device
+- Run `adb devices` in a terminal to verify ADB can see your device
 
 **ADB not found:**
-- On first launch, you'll be prompted to select the ADB folder
-- If you skipped it, use the "ADB Path" button to set it
-- Make sure you select the `platform-tools` folder (contains `adb.exe`)
+- The app tries to auto-detect `adb` via PATH and common SDK locations
+- If it still can’t find it, use the **"ADB Path"** button to set it
+- Make sure you select the `platform-tools` folder (contains `adb`) or the `adb` executable itself
 - The application will also check system PATH as a fallback
 
 **Permission denied errors:**
@@ -227,10 +237,14 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 - Restart the application if issues persist
 
 **Shell command errors (e.g., "findstr: inaccessible or not found"):**
-- Remember: Commands run on your Android device (Linux), not Windows
-- Use Linux commands: `grep` instead of `findstr`, `ls` instead of `dir`, `cat` instead of `type`
+- Remember: Commands run on your Android device (Linux), not your desktop OS
+- Use Android/Linux commands: `grep`, `ls`, `cat`
 - You can include "adb shell" prefix, but it's optional (auto-stripped)
 - Check the help text in the UI for examples
+
+**scrcpy not found:**
+- Install scrcpy and try again
+  - macOS (Homebrew): `brew install scrcpy`
 
 **Logcat not showing output:**
 - Make sure a device is selected
@@ -245,11 +259,18 @@ A modern, user-friendly GUI application for Android Debug Bridge (ADB) operation
 adb/
 ├── adb_gui.py          # Main application file
 ├── requirements.txt    # Python dependencies
-├── settings.json       # User settings (ADB path, dark mode)
+├── settings.json       # User settings (ADB path, scrcpy path, dark mode)
 ├── degoogle_state.json # DeGoogle operation history
 ├── screenshots/        # Screenshot storage (auto-created)
 └── apks/              # Pulled APK storage (auto-created)
 ```
+
+## Optional: App Icon
+
+If you add an icon file next to `adb_gui.py`, it will be used automatically:
+
+- `icon.icns` (macOS)
+- `icon.png` / `icon.jpg`
 
 ## License
 
