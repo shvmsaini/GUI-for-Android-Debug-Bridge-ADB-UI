@@ -1,6 +1,7 @@
 # ADB GUI (PyQt6)
+<img width="1312" height="944" alt="Screenshot 2026-03-17 at 10 58 42 PM" src="https://github.com/user-attachments/assets/29026d6b-492a-406d-aa83-d1777ac4a5b7" />
+<img width="1012" height="744" alt="Screenshot 2026-03-17 at 10 58 47 PM" src="https://github.com/user-attachments/assets/fd65ee5b-1ae0-4dab-bcce-c441b9b1977c" />
 
-<img width="2560" height="1377" alt="image" src="https://github.com/user-attachments/assets/2feec627-48e1-434e-810a-051b3fca04fc" />
 
 A modern, user-friendly GUI application for Android Debug Bridge (ADB) operations, built with PyQt6.
 
