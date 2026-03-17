@@ -5,6 +5,8 @@ import os
 import shlex
 import tempfile
 import json
+import shutil
+import time
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -14,7 +16,7 @@ from PyQt6.QtWidgets import (
     QDialog, QListWidget, QCheckBox, QRadioButton, QButtonGroup, QTabWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon
 
 class ADBManager:
     """Manages ADB operations"""
@@ -29,20 +31,44 @@ class ADBManager:
         """Try to find ADB executable (fallback only - should use saved path from settings)"""
         # Try to find in PATH first (most reliable if installed system-wide)
         try:
-            result = subprocess.run(['where', 'adb'], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0 and result.stdout.strip():
-                path = result.stdout.strip().split('\n')[0]
-                if os.path.exists(path):
-                    return path
-        except:
+            if sys.platform == 'win32':
+                # Windows: use "where"
+                result = subprocess.run(['where', 'adb'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and result.stdout.strip():
+                    path = result.stdout.strip().split('\n')[0]
+                    if os.path.exists(path):
+                        return path
+            else:
+                # macOS / Linux: rely on PATH lookup for "adb"
+                result = subprocess.run(['which', 'adb'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and result.stdout.strip():
+                    path = result.stdout.strip().split('\n')[0]
+                    if os.path.exists(path):
+                        return path
+        except Exception:
             pass
         
         # Check common locations as fallback
-        common_paths = [
-            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk', 'platform-tools', 'adb.exe'),
-            os.path.join(os.environ.get('ProgramFiles', ''), 'Android', 'android-sdk', 'platform-tools', 'adb.exe'),
-            os.path.join(os.path.expanduser('~'), 'Downloads', 'platform-tools-latest-windows', 'platform-tools', 'adb.exe'),
-        ]
+        if sys.platform == 'win32':
+            common_paths = [
+                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk', 'platform-tools', 'adb.exe'),
+                os.path.join(os.environ.get('ProgramFiles', ''), 'Android', 'android-sdk', 'platform-tools', 'adb.exe'),
+                os.path.join(os.path.expanduser('~'), 'Downloads', 'platform-tools-latest-windows', 'platform-tools', 'adb.exe'),
+            ]
+        elif sys.platform == 'darwin':
+            # Default Android SDK and Homebrew locations on macOS
+            common_paths = [
+                os.path.join(os.path.expanduser('~'), 'Library', 'Android', 'sdk', 'platform-tools', 'adb'),
+                '/opt/homebrew/bin/adb',   # Apple Silicon Homebrew
+                '/usr/local/bin/adb',      # Intel Homebrew / manual installs
+            ]
+        else:
+            # Common Linux locations
+            common_paths = [
+                os.path.join(os.path.expanduser('~'), 'Android', 'Sdk', 'platform-tools', 'adb'),
+                '/usr/bin/adb',
+                '/usr/local/bin/adb',
+            ]
         
         for path in common_paths:
             if os.path.exists(path):
@@ -55,9 +81,19 @@ class ADBManager:
         if os.path.exists(path):
             self.adb_path = path
             return True
-        elif os.path.exists(os.path.join(path, 'adb.exe')):
-            self.adb_path = os.path.join(path, 'adb.exe')
-            return True
+        # If a directory is provided, look for adb / adb.exe inside it
+        if os.path.isdir(path):
+            candidates = []
+            if sys.platform == 'win32':
+                candidates.append(os.path.join(path, 'adb.exe'))
+            else:
+                candidates.append(os.path.join(path, 'adb'))
+                # Also accept adb.exe in case user selected a Windows SDK location
+                candidates.append(os.path.join(path, 'adb.exe'))
+            for candidate in candidates:
+                if os.path.exists(candidate):
+                    self.adb_path = candidate
+                    return True
         return False
     
     def run_command(self, command, timeout=30):
@@ -213,7 +249,7 @@ class ADBGUI(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ADB Tool for Windows")
+        self.setWindowTitle("ADB Tool")
         self.setGeometry(100, 100, 1200, 800)
         self.setMinimumSize(1000, 700)
         
@@ -274,32 +310,40 @@ class ADBGUI(QMainWindow):
         # Check for saved ADB path in settings
         saved_adb_path = self.settings.get('adb_path', None)
         
-        # If no saved path, prompt user to select it before creating ADBManager
+        # If no saved path, try to auto-detect ADB before bothering the user
         if not saved_adb_path or not os.path.exists(saved_adb_path):
-            # Show dialog to select ADB path on first boot
-            QMessageBox.information(
-                self,
-                "ADB Path Required",
-                "Please select the ADB executable (adb.exe) to continue.\n\n"
-                "This is typically located in the 'platform-tools' folder of your Android SDK."
-            )
-            
-            # Prompt user to select ADB folder or executable
-            adb_path = self.prompt_for_adb_path()
-            if not adb_path:
-                # User cancelled - use fallback
-                QMessageBox.warning(
+            auto_manager = ADBManager()
+            auto_path = getattr(auto_manager, 'adb_path', None)
+            if auto_path and isinstance(auto_path, str) and os.path.exists(auto_path):
+                # Auto-detected ADB successfully, save it
+                saved_adb_path = auto_path
+                self.settings['adb_path'] = auto_path
+                self.save_settings()
+            else:
+                # Auto-detection failed – prompt user to select ADB path
+                QMessageBox.information(
                     self,
                     "ADB Path Required",
-                    "ADB path is required. The application will use 'adb' from PATH as fallback.\n\n"
-                    "You can set the ADB path later using the 'ADB Path' button."
+                    "Please select the ADB executable to continue.\n\n"
+                    "This is typically located in the 'platform-tools' folder of your Android SDK."
                 )
-                saved_adb_path = 'adb'  # Fallback
-            else:
-                # Save the selected path
-                self.settings['adb_path'] = adb_path
-                self.save_settings()
-                saved_adb_path = adb_path
+                
+                # Prompt user to select ADB folder or executable
+                adb_path = self.prompt_for_adb_path()
+                if not adb_path:
+                    # User cancelled - use fallback
+                    QMessageBox.warning(
+                        self,
+                        "ADB Path Required",
+                        "ADB path is required. The application will use 'adb' from PATH as fallback.\n\n"
+                        "You can set the ADB path later using the 'ADB Path' button."
+                    )
+                    saved_adb_path = 'adb'  # Fallback
+                else:
+                    # Save the selected path
+                    self.settings['adb_path'] = adb_path
+                    self.save_settings()
+                    saved_adb_path = adb_path
         
         # Create ADBManager with saved path
         self.adb = ADBManager(adb_path=saved_adb_path)
@@ -337,12 +381,12 @@ class ADBGUI(QMainWindow):
         # Header with title
         header_layout = QHBoxLayout()
         self.title_label = QLabel("ADB Tool")
-        self.title_label.setFont(QFont('Segoe UI', 20, QFont.Weight.Bold))
+        self.title_label.setFont(QFont('', 20, QFont.Weight.Bold))
         self.title_label.setStyleSheet(f"color: {self.colors['fg']};")
         header_layout.addWidget(self.title_label)
         
         self.subtitle_label = QLabel("Android Device Manager")
-        self.subtitle_label.setFont(QFont('Segoe UI', 10))
+        self.subtitle_label.setFont(QFont('', 10))
         self.subtitle_label.setStyleSheet(f"color: {self.colors['text_secondary']};")
         header_layout.addWidget(self.subtitle_label)
         header_layout.addStretch()
@@ -440,6 +484,7 @@ class ADBGUI(QMainWindow):
         # Device operations
         device_ops_group = self.create_card("⚡ Device Operations")
         self.create_button(device_ops_group, "📸 Take Screenshot", self.take_screenshot)
+        self.create_button(device_ops_group, "🪞 Mirror Screen (scrcpy)", self.scrcpy_device, accent=True)
         self.create_button(device_ops_group, "🔄 Reboot Device", self.reboot_device)
         self.create_button(device_ops_group, "🔧 Reboot to Recovery", self.reboot_recovery)
         self.create_button(device_ops_group, "⚙️ Reboot to Bootloader", self.reboot_bootloader)
@@ -447,10 +492,11 @@ class ADBGUI(QMainWindow):
         
         # Shell operations
         shell_group = self.create_card("💻 Shell Commands")
-        shell_group.layout().addWidget(QLabel("Run commands ON YOUR ANDROID DEVICE (not Windows):"))
-        help_text = ("⚠️ These commands run on your Android device (Linux), not on Windows!\n\n"
+        host_os = "Windows" if sys.platform == "win32" else ("macOS" if sys.platform == "darwin" else "Linux")
+        shell_group.layout().addWidget(QLabel(f"Run commands ON YOUR ANDROID DEVICE (not {host_os}):"))
+        help_text = (f"⚠️ These commands run on your Android device (Linux), not on {host_os}.\n\n"
                     "Examples: 'ls /sdcard', 'pm list packages', 'dumpsys battery | grep level'\n"
-                    "Use Linux commands: 'grep' (not 'findstr'), 'ls' (not 'dir'), 'cat' (not 'type')\n\n"
+                    "Use Android/Linux shell commands: 'grep', 'ls', 'cat' (not desktop OS commands).\n\n"
                     "Note: You can include 'adb shell' prefix, but it's not required (auto-stripped)")
         self.shell_help_label = QLabel(help_text)
         self.shell_help_label.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 8pt;")
@@ -774,32 +820,38 @@ class ADBGUI(QMainWindow):
         # First, try folder selection (most common use case)
         folder_path = QFileDialog.getExistingDirectory(
             self,
-            "Select platform-tools folder (contains adb.exe)",
+            "Select platform-tools folder (contains adb)",
             initial_dir
         )
         
         if folder_path:
-            adb_exe = os.path.join(folder_path, 'adb.exe')
-            if os.path.exists(adb_exe):
-                return adb_exe
+            # Accept both adb (Unix) and adb.exe (Windows)
+            candidates = [
+                os.path.join(folder_path, 'adb'),
+                os.path.join(folder_path, 'adb.exe'),
+            ]
+            for candidate in candidates:
+                if os.path.exists(candidate):
+                    return candidate
             else:
-                QMessageBox.warning(self, "Error", f"adb.exe not found in:\n{folder_path}\n\nPlease select the folder that contains adb.exe")
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    f"adb/adb.exe not found in:\n{folder_path}\n\nPlease select the folder that contains the adb executable"
+                )
                 return None
         
         # Allow file selection as alternative
         adb_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Or select ADB executable (adb.exe) directly",
+            "Or select ADB executable directly",
             initial_dir,
-            "Executable files (*.exe);;All files (*.*)"
+            "All files (*.*)"
         )
         
         if adb_path:
-            if os.path.basename(adb_path).lower() == 'adb.exe':
-                return adb_path
-            else:
-                QMessageBox.warning(self, "Warning", "Please select adb.exe file")
-                return None
+            # Just return whatever the user selected; validation happens in ADBManager.set_adb_path / test
+            return adb_path
         
         return None
     
@@ -818,7 +870,7 @@ class ADBGUI(QMainWindow):
         # First, try folder selection (most common use case)
         folder_path = QFileDialog.getExistingDirectory(
             self,
-            "Select platform-tools folder (contains adb.exe)",
+            "Select platform-tools folder (contains adb)",
             initial_dir
         )
         
@@ -845,29 +897,26 @@ class ADBGUI(QMainWindow):
             # Allow file selection as alternative
             adb_path, _ = QFileDialog.getOpenFileName(
                 self,
-                "Or select ADB executable (adb.exe) directly",
+                "Or select ADB executable directly",
                 initial_dir,
-                "Executable files (*.exe);;All files (*.*)"
+                "All files (*.*)"
             )
             
             if adb_path:
-                if os.path.basename(adb_path).lower() == 'adb.exe':
-                    if self.adb.set_adb_path(adb_path):
-                        # Save to settings
-                        self.settings['adb_path'] = adb_path
-                        self.save_settings()
-                        
-                        self.adb_path_label.setText(f"✓ ADB: {adb_path}")
-                        self.adb_path_label.setStyleSheet(f"color: {self.colors['success']};")
-                        self.log(f"ADB path set to: {adb_path}")
-                        self.update_status("ADB path updated successfully")
-                        QMessageBox.information(self, "Success", f"ADB path set to:\n{adb_path}")
-                        # Refresh devices to test the new path
-                        self.refresh_devices()
-                    else:
-                        QMessageBox.critical(self, "Error", "Failed to set ADB path")
+                if self.adb.set_adb_path(adb_path):
+                    # Save to settings
+                    self.settings['adb_path'] = adb_path
+                    self.save_settings()
+                    
+                    self.adb_path_label.setText(f"✓ ADB: {adb_path}")
+                    self.adb_path_label.setStyleSheet(f"color: {self.colors['success']};")
+                    self.log(f"ADB path set to: {adb_path}")
+                    self.update_status("ADB path updated successfully")
+                    QMessageBox.information(self, "Success", f"ADB path set to:\n{adb_path}")
+                    # Refresh devices to test the new path
+                    self.refresh_devices()
                 else:
-                    QMessageBox.warning(self, "Warning", "Please select adb.exe file")
+                    QMessageBox.critical(self, "Error", "Failed to set ADB path")
     
     def get_device_flag(self):
         """Get device flag for ADB commands"""
@@ -1808,6 +1857,94 @@ class ADBGUI(QMainWindow):
                     QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", help_text))
             
             threading.Thread(target=do_enable, daemon=True).start()
+
+        def start_selected():
+            """Start selected app (best-effort launch)"""
+            package_name = get_selected_package()
+            if not package_name:
+                QMessageBox.warning(self, "No Selection", "Please select an app to start")
+                return
+            
+            app_label = app_window.app_labels.get(package_name, package_name)
+            display_name = f"{app_label} ({package_name})" if app_label != package_name else package_name
+            self.log(f"Starting {package_name}...")
+            self.update_status("Starting app...")
+            
+            def do_start():
+                # monkey is a reliable way to launch the default launcher activity without needing to resolve it ourselves
+                result = self.adb.run_command(
+                    f"{self.get_device_flag()} shell monkey -p {package_name} -c android.intent.category.LAUNCHER 1",
+                    timeout=30
+                )
+                if result['success']:
+                    self.log("App start command sent successfully")
+                    self.update_status("App started")
+                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Started:\n{display_name}"))
+                else:
+                    error_msg = result['stderr'] if result['stderr'] else result['stdout']
+                    if not error_msg or error_msg.strip() == '':
+                        error_msg = "Unknown error"
+                    self.log(f"Failed to start app: {error_msg}", "ERROR")
+                    self.update_status("Failed to start app")
+                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to start:\n{display_name}\n\n{error_msg}"))
+            
+            threading.Thread(target=do_start, daemon=True).start()
+
+        def stop_selected():
+            """Stop (kill) selected app without force-stopping it"""
+            package_name = get_selected_package()
+            if not package_name:
+                QMessageBox.warning(self, "No Selection", "Please select an app to stop")
+                return
+            
+            app_label = app_window.app_labels.get(package_name, package_name)
+            display_name = f"{app_label} ({package_name})" if app_label != package_name else package_name
+            self.log(f"Stopping (kill) {package_name}...")
+            self.update_status("Stopping app...")
+            
+            def do_stop():
+                result = self.adb.run_command(f"{self.get_device_flag()} shell am kill {package_name}")
+                if result['success']:
+                    self.log("App stop (kill) command sent successfully")
+                    self.update_status("App stopped")
+                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Stopped (killed):\n{display_name}"))
+                else:
+                    error_msg = result['stderr'] if result['stderr'] else result['stdout']
+                    if not error_msg or error_msg.strip() == '':
+                        error_msg = "Unknown error"
+                    self.log(f"Failed to stop app: {error_msg}", "ERROR")
+                    self.update_status("Failed to stop app")
+                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to stop:\n{display_name}\n\n{error_msg}"))
+            
+            threading.Thread(target=do_stop, daemon=True).start()
+
+        def force_stop_selected():
+            """Force-stop selected app"""
+            package_name = get_selected_package()
+            if not package_name:
+                QMessageBox.warning(self, "No Selection", "Please select an app to force stop")
+                return
+            
+            app_label = app_window.app_labels.get(package_name, package_name)
+            display_name = f"{app_label} ({package_name})" if app_label != package_name else package_name
+            self.log(f"Force stopping {package_name}...")
+            self.update_status("Force stopping app...")
+            
+            def do_force_stop():
+                result = self.adb.run_command(f"{self.get_device_flag()} shell am force-stop {package_name}")
+                if result['success']:
+                    self.log("App force-stop command sent successfully")
+                    self.update_status("App force-stopped")
+                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Force-stopped:\n{display_name}"))
+                else:
+                    error_msg = result['stderr'] if result['stderr'] else result['stdout']
+                    if not error_msg or error_msg.strip() == '':
+                        error_msg = "Unknown error"
+                    self.log(f"Failed to force stop app: {error_msg}", "ERROR")
+                    self.update_status("Failed to force stop app")
+                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to force stop:\n{display_name}\n\n{error_msg}"))
+            
+            threading.Thread(target=do_force_stop, daemon=True).start()
         
         def refresh_list():
             """Refresh the app list"""
@@ -1929,6 +2066,18 @@ class ADBGUI(QMainWindow):
         enable_btn = QPushButton("Enable Selected")
         enable_btn.clicked.connect(enable_selected)
         button_layout.addWidget(enable_btn)
+
+        start_btn = QPushButton("Start App")
+        start_btn.clicked.connect(start_selected)
+        button_layout.addWidget(start_btn)
+        
+        stop_btn = QPushButton("Stop App")
+        stop_btn.clicked.connect(stop_selected)
+        button_layout.addWidget(stop_btn)
+        
+        force_stop_btn = QPushButton("Force Stop")
+        force_stop_btn.clicked.connect(force_stop_selected)
+        button_layout.addWidget(force_stop_btn)
         
         refresh_btn = QPushButton("Refresh List")
         refresh_btn.clicked.connect(refresh_list)
@@ -2117,6 +2266,129 @@ class ADBGUI(QMainWindow):
                 QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"An error occurred:\n{error_msg}"))
         
         threading.Thread(target=do_screenshot, daemon=True).start()
+
+    def find_scrcpy(self):
+        """Find scrcpy executable (PATH + common locations)."""
+        saved = self.settings.get('scrcpy_path', '')
+        if saved and isinstance(saved, str) and os.path.exists(saved):
+            return saved
+        
+        path = shutil.which('scrcpy')
+        if path and os.path.exists(path):
+            return path
+        
+        candidates = []
+        if sys.platform == 'darwin':
+            candidates.extend([
+                '/opt/homebrew/bin/scrcpy',   # Apple Silicon Homebrew
+                '/usr/local/bin/scrcpy',      # Intel Homebrew / manual installs
+            ])
+        elif sys.platform == 'win32':
+            # If user has scrcpy in PATH, shutil.which handles it; keep minimal fallbacks here.
+            candidates.extend([
+                os.path.join(os.path.expanduser('~'), 'scrcpy', 'scrcpy.exe'),
+            ])
+        else:
+            candidates.extend([
+                '/usr/bin/scrcpy',
+                '/usr/local/bin/scrcpy',
+            ])
+        
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        
+        return None
+
+    def scrcpy_device(self):
+        """Mirror device screen using scrcpy."""
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+        
+        scrcpy_path = self.find_scrcpy()
+        if not scrcpy_path:
+            msg = (
+                "scrcpy was not found on your system.\n\n"
+                "On macOS (Homebrew):\n"
+                "  brew install scrcpy\n\n"
+                "Or select the scrcpy executable manually."
+            )
+            reply = QMessageBox.question(
+                self,
+                "scrcpy not found",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                picked, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Select scrcpy executable",
+                    os.path.expanduser('~'),
+                    "All files (*.*)"
+                )
+                if picked and os.path.exists(picked):
+                    self.settings['scrcpy_path'] = picked
+                    self.save_settings()
+                    scrcpy_path = picked
+        
+        if not scrcpy_path:
+            return
+        
+        device_id = self.current_device
+        adb_path = getattr(self.adb, 'adb_path', 'adb') if hasattr(self, 'adb') else 'adb'
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+        def launch(cmd, capture=False):
+            if capture:
+                return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', creationflags=creationflags)
+            return subprocess.Popen(cmd, creationflags=creationflags)
+
+        # Prefer telling scrcpy which adb to use (when supported), but some builds don't support it.
+        cmd_base = [scrcpy_path, '-s', device_id]
+        cmd_with_adb = None
+        if isinstance(adb_path, str) and os.path.exists(adb_path):
+            # scrcpy uses "--adb <path>" (not "--adb=<path>") on many versions
+            cmd_with_adb = cmd_base + ['--adb', adb_path]
+
+        self.log(f"Launching scrcpy for {device_id}...")
+        self.update_status("Launching scrcpy...")
+
+        def do_launch():
+            try:
+                if cmd_with_adb:
+                    # Start once, quickly detect unsupported option, then fall back.
+                    p = launch(cmd_with_adb, capture=True)
+                    time.sleep(0.25)
+                    if p.poll() is not None:
+                        stderr = (p.stderr.read() if p.stderr else '') or ''
+                        if 'unrecognized option' in stderr.lower() and '--adb' in stderr:
+                            self.log("scrcpy does not support '--adb'. Launching without it.", "WARNING")
+                            QTimer.singleShot(0, lambda: self.update_status("Launching scrcpy (fallback)..."))
+                            launch(cmd_base, capture=False)
+                            QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+                            return
+                        # Other immediate failure: surface the error
+                        err = stderr.strip() or "scrcpy exited immediately."
+                        self.log(f"scrcpy failed to start: {err}", "ERROR")
+                        QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
+                        QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{err}"))
+                        return
+
+                    # Running fine
+                    QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+                    return
+
+                # No custom adb path; just run normally
+                launch(cmd_base, capture=False)
+                QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+            except Exception as e:
+                error_msg = str(e)
+                self.log(f"Failed to launch scrcpy: {error_msg}", "ERROR")
+                QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
+                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"Failed to launch scrcpy:\n\n{error_msg}"))
+
+        threading.Thread(target=do_launch, daemon=True).start()
     
     def reboot_device(self):
         """Reboot device"""
@@ -2411,7 +2683,7 @@ class ADBGUI(QMainWindow):
                 border: 1px solid {self.colors['border']};
                 border-radius: 4px;
                 padding: 8px;
-                font-family: 'Segoe UI';
+                font-family: system-ui;
                 font-size: 9pt;
             }}
             QPushButton:hover {{
@@ -2454,7 +2726,7 @@ class ADBGUI(QMainWindow):
                 border-radius: 4px;
                 background-color: {'#1e1e1e' if self.dark_mode else '#1e1e1e'};
                 color: {'#d4d4d4' if self.dark_mode else '#d4d4d4'};
-                font-family: 'Consolas';
+                font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
                 font-size: 9pt;
             }}
             QLabel {{
@@ -2689,7 +2961,7 @@ class ADBGUI(QMainWindow):
         
         # Mode selection
         mode_label = QLabel("Choose mode:")
-        mode_label.setFont(QFont('Segoe UI', 10, QFont.Weight.Bold))
+        mode_label.setFont(QFont('', 10, QFont.Weight.Bold))
         mode_layout.addWidget(mode_label)
         
         mode_group = QButtonGroup(mode_dialog)
@@ -3681,7 +3953,31 @@ class ADBGUI(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # App identity (shows in macOS menu bar/app switcher)
+    app.setApplicationName("ADB GUI")
+    app.setApplicationDisplayName("ADB GUI")
+    app.setOrganizationName("ADB GUI")
+
+    # App/window icon: prefer bundled icon files, otherwise use a built-in Qt icon
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    icon = None
+    for name in ("icon.icns", "icon.png", "icon.jpg", "icon.jpeg"):
+        p = os.path.join(base_dir, name)
+        if os.path.exists(p):
+            icon = QIcon(p)
+            break
+
+    if icon is None or icon.isNull():
+        # Fallback so there is still an icon even without bundled assets
+        icon = app.style().standardIcon(app.style().StandardPixmap.SP_ComputerIcon)
+
+    app.setWindowIcon(icon)
     window = ADBGUI()
+    window.setWindowIcon(icon)
     window.show()
     sys.exit(app.exec())
 
