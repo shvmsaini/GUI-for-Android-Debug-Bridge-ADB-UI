@@ -391,6 +391,39 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(security_group)
 
+        # Template Commands section
+        template_group = QGroupBox("📋 Template Commands")
+        template_layout = QVBoxLayout(template_group)
+
+        template_info = QLabel("Create custom bash commands for quick access in the header")
+        template_info.setStyleSheet("color: #666; font-size: 9pt;")
+        template_layout.addWidget(template_info)
+
+        # Commands list
+        self.template_list = QListWidget()
+        self.template_list.setMinimumHeight(150)
+        self.template_commands = self.current_settings.get('template_commands', [])
+        self._refresh_template_list()
+        template_layout.addWidget(self.template_list)
+
+        # Buttons for template management
+        template_buttons_row = QHBoxLayout()
+
+        add_template_btn = QPushButton("➕ Add Command")
+        add_template_btn.clicked.connect(self._show_add_template_dialog)
+        template_buttons_row.addWidget(add_template_btn)
+
+        edit_template_btn = QPushButton("✏️ Edit Selected")
+        edit_template_btn.clicked.connect(self._show_edit_template_dialog)
+        template_buttons_row.addWidget(edit_template_btn)
+
+        delete_template_btn = QPushButton("🗑️ Delete Selected")
+        delete_template_btn.clicked.connect(self._delete_template)
+        template_buttons_row.addWidget(delete_template_btn)
+
+        template_layout.addLayout(template_buttons_row)
+        layout.addWidget(template_group)
+
         # Buttons
         button_row = QHBoxLayout()
         button_row.addStretch()
@@ -478,6 +511,154 @@ class SettingsDialog(QDialog):
         if path:
             self.pf_path_edit.setText(path)
 
+    def _refresh_template_list(self):
+        """Refresh the template commands list display"""
+        self.template_list.clear()
+        for cmd in self.template_commands:
+            title = cmd.get('title', 'Untitled')
+            snippet = cmd.get('snippet', '')
+            preview = snippet[:50] + '...' if len(snippet) > 50 else snippet
+            self.template_list.addItem(f"{title} — {preview}")
+
+    def _show_add_template_dialog(self):
+        """Show dialog to add a new template command"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Template Command")
+        dialog.setMinimumWidth(600)
+        dialog.setMinimumHeight(400)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        # Title
+        title_label = QLabel("Command Title:")
+        layout.addWidget(title_label)
+
+        title_edit = QLineEdit()
+        title_edit.setPlaceholderText("e.g., Reset ADB, Show Props, etc.")
+        layout.addWidget(title_edit)
+
+        # Snippet
+        snippet_label = QLabel("Bash Command Snippet:")
+        layout.addWidget(snippet_label)
+
+        snippet_edit = QTextEdit()
+        snippet_edit.setPlaceholderText("e.g., adb kill-server && adb start-server\nor: adb shell getprop | grep model")
+        snippet_edit.setMinimumHeight(200)
+        layout.addWidget(snippet_edit)
+
+        # Buttons
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_btn)
+
+        add_btn = QPushButton("➕ Add")
+        add_btn.setProperty("accent", "true")
+
+        def on_add():
+            title = title_edit.text().strip()
+            snippet = snippet_edit.toPlainText().strip()
+
+            if not title or not snippet:
+                QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
+                return
+
+            self.template_commands.append({"title": title, "snippet": snippet})
+            self._refresh_template_list()
+            dialog.accept()
+
+        add_btn.clicked.connect(on_add)
+        button_row.addWidget(add_btn)
+
+        layout.addLayout(button_row)
+        dialog.exec()
+
+    def _show_edit_template_dialog(self):
+        """Show dialog to edit selected template command"""
+        current_row = self.template_list.currentRow()
+        if current_row < 0:
+            QMessageBox.warning(self, "No Selection", "Please select a command to edit")
+            return
+
+        cmd = self.template_commands[current_row]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Template Command")
+        dialog.setMinimumWidth(600)
+        dialog.setMinimumHeight(400)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        # Title
+        title_label = QLabel("Command Title:")
+        layout.addWidget(title_label)
+
+        title_edit = QLineEdit()
+        title_edit.setText(cmd.get('title', ''))
+        layout.addWidget(title_edit)
+
+        # Snippet
+        snippet_label = QLabel("Bash Command Snippet:")
+        layout.addWidget(snippet_label)
+
+        snippet_edit = QTextEdit()
+        snippet_edit.setPlainText(cmd.get('snippet', ''))
+        snippet_edit.setMinimumHeight(200)
+        layout.addWidget(snippet_edit)
+
+        # Buttons
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_btn)
+
+        save_btn = QPushButton("💾 Save")
+        save_btn.setProperty("accent", "true")
+
+        def on_save():
+            title = title_edit.text().strip()
+            snippet = snippet_edit.toPlainText().strip()
+
+            if not title or not snippet:
+                QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
+                return
+
+            self.template_commands[current_row] = {"title": title, "snippet": snippet}
+            self._refresh_template_list()
+            dialog.accept()
+
+        save_btn.clicked.connect(on_save)
+        button_row.addWidget(save_btn)
+
+        layout.addLayout(button_row)
+        dialog.exec()
+
+    def _delete_template(self):
+        """Delete selected template command"""
+        current_row = self.template_list.currentRow()
+        if current_row < 0:
+            QMessageBox.warning(self, "No Selection", "Please select a command to delete")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Delete command '{self.template_commands[current_row]['title']}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            del self.template_commands[current_row]
+            self._refresh_template_list()
+
     def save(self):
         """Save settings"""
         if self.parent:
@@ -485,12 +666,16 @@ class SettingsDialog(QDialog):
             self.parent.settings['adb_path'] = self.adb_path_edit.text()
             self.parent.settings['seat_script_path'] = self.seat_path_edit.text()
             self.parent.settings['portforward_script_path'] = self.pf_path_edit.text()
+            self.parent.settings['template_commands'] = self.template_commands
             self.parent.save_settings()
 
             # Reload ADB if path changed
             self.parent.adb = ADBManager(adb_path=self.parent.settings['adb_path'])
             self.parent.adb.log_callback = self.parent.log
             self.parent.update_adb_path_display()
+
+            # Refresh template buttons in header
+            self.parent.refresh_template_commands_ui()
 
             self.parent.log("Settings updated", "INFO")
 
@@ -911,6 +1096,14 @@ class ADBGUI(QMainWindow):
         self.seat_port_refresh_timer.timeout.connect(self.refresh_seat_port_lists)
         self.seat_port_refresh_timer.start(10000)
 
+        # Check port forward status every 10 seconds to detect if it died
+        self.pf_status_timer = QTimer()
+        self.pf_status_timer.timeout.connect(self.check_portforward_alive)
+        self.pf_status_timer.start(10000)
+        # Track previous state for comparison
+        self.last_pf_active = False
+        self.last_active_rack = None
+
         # Connect signal for custom dialog
         self.custom_dialog_ready.connect(self._show_custom_dialog)
         # Connect signal for app list dialog
@@ -938,6 +1131,17 @@ class ADBGUI(QMainWindow):
         self.subtitle_label.setFont(QFont('', 12))
         self.subtitle_label.setStyleSheet(f"color: {self.colors['text_secondary']};")
         header_layout.addWidget(self.subtitle_label)
+
+        # Template commands buttons container
+        self.template_commands_widget = QWidget()
+        self.template_commands_layout = QHBoxLayout(self.template_commands_widget)
+        self.template_commands_layout.setContentsMargins(0, 0, 0, 0)
+        self.template_commands_layout.setSpacing(5)
+        header_layout.addWidget(self.template_commands_widget)
+
+        # Load and populate template commands from settings
+        self.refresh_template_commands_ui()
+
         header_layout.addStretch()
         
         # Theme selection button
@@ -1877,19 +2081,11 @@ class ADBGUI(QMainWindow):
                 text = f"{entry['gateway']}"
                 btn_connected = is_connected
 
-            # Create container widget with horizontal layout for button + play button (no spacing)
-            container = QWidget()
-            container_layout = QHBoxLayout(container)
-            container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.setSpacing(0)  # No space between button and play button
-
-            # Main button
+            # Main button (no play button for port forward - uses full available width)
             btn = QPushButton(text)
             btn.setMinimumHeight(50)
             btn.setMaximumHeight(50)
-            btn.setMinimumWidth(280)
-            btn.setMaximumWidth(280)
-            btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+            btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.clicked.connect(lambda checked, e=entry: self._on_portforward_clicked(e))
 
@@ -1929,23 +2125,8 @@ class ADBGUI(QMainWindow):
                 """)
                 btn.setToolTip("Click to connect")
 
-            # Play button for scrcpy (tightly attached, no gap, no border)
-            play_btn = QPushButton("▶")
-            play_btn.setMaximumWidth(40)
-            play_btn.setMinimumWidth(40)
-            play_btn.setMaximumHeight(50)
-            play_btn.setMinimumHeight(50)
-            play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            play_btn.clicked.connect(lambda checked=False, gateway=entry['gateway']: self._scrcpy_via_portforward(gateway))
-            play_btn.setToolTip("Mirror screen via scrcpy")
-            play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
-
-            container_layout.addWidget(btn, 0)
-            container_layout.addWidget(play_btn, 0)
-            container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.setSpacing(0)
-
-            self.portforward_list_layout.addWidget(container)
+            # Add button directly to layout (no container, no play button)
+            self.portforward_list_layout.addWidget(btn)
 
     def _on_seat_clicked(self, entry):
         """Handle seat button click"""
@@ -1979,8 +2160,38 @@ class ADBGUI(QMainWindow):
             else:
                 self.log("Invalid gateway format", "ERROR")
 
+    def check_portforward_alive(self):
+        """Check port forward status and update UI if it changed"""
+        try:
+            pf_status = self.seat_port_manager.get_portforward_status()
+            current_active = pf_status and pf_status.get('active', False)
+            current_rack = pf_status.get('rack', None) if current_active else None
+
+            # Check if status changed
+            if current_active != self.last_pf_active or current_rack != self.last_active_rack:
+                if current_active and not self.last_pf_active:
+                    # Port forward just became active
+                    self.log(f"Port forward is now active: Rack {current_rack}", "INFO")
+                elif not current_active and self.last_pf_active:
+                    # Port forward died
+                    self.log(f"Port forward stopped (was: Rack {self.last_active_rack})", "WARNING")
+                    # Update internal state
+                    self.seat_port_manager.mark_portforward_disconnected()
+                elif current_active and self.last_active_rack != current_rack:
+                    # Port forward changed to different rack
+                    self.log(f"Port forward changed: Rack {self.last_active_rack} → {current_rack}", "INFO")
+
+                # Update tracking
+                self.last_pf_active = current_active
+                self.last_active_rack = current_rack
+
+                # Refresh UI to update green highlight
+                self.refresh_seat_port_lists()
+
+        except Exception as e:
+            self.log(f"Error checking port forward status: {e}", "ERROR")
+
     def _scrcpy_via_seat(self, seat):
-        """Launch scrcpy for a device via seat connection"""
         self.log(f"Launching scrcpy for seat {seat}...")
 
         # Check if seat is connected, if not connect first
@@ -4848,6 +5059,69 @@ class ADBGUI(QMainWindow):
         """Open settings dialog"""
         dialog = SettingsDialog(self, self.settings)
         dialog.exec()
+
+    def refresh_template_commands_ui(self):
+        """Rebuild template command buttons in header"""
+        # Clear existing buttons
+        while self.template_commands_layout.count():
+            item = self.template_commands_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Load template commands from settings
+        template_commands = self.settings.get('template_commands', [])
+
+        # Create buttons for each template command
+        for cmd in template_commands:
+            title = cmd.get('title', 'Command')
+            snippet = cmd.get('snippet', '')
+            btn = self._create_template_button(title, snippet)
+            self.template_commands_layout.addWidget(btn)
+
+    def _create_template_button(self, title, snippet):
+        """Create a styled button for a template command"""
+        btn = QPushButton(f"📝 {title}")
+        btn.setMaximumWidth(200)
+        btn.clicked.connect(lambda: self.execute_template_command(title, snippet))
+        return btn
+
+    def execute_template_command(self, title, snippet):
+        """Execute a template command in a separate thread"""
+        self.log(f"Executing template command: {title}")
+        self.update_status(f"Running: {title}...")
+
+        def run_command():
+            try:
+                self.log(f"Command: {snippet}", "DEBUG")
+                result = subprocess.run(
+                    snippet,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=30
+                )
+
+                if result.returncode == 0:
+                    self.log(f"✓ {title} completed successfully")
+                    if result.stdout:
+                        self.log(f"Output:\n{result.stdout}")
+                else:
+                    self.log(f"✗ {title} failed (exit code: {result.returncode})", "ERROR")
+                    if result.stderr:
+                        self.log(f"Error:\n{result.stderr}", "ERROR")
+
+                self.update_status(f"Completed: {title}")
+
+            except subprocess.TimeoutExpired:
+                self.log(f"✗ {title} timed out after 30 seconds", "ERROR")
+                self.update_status("Command timed out")
+            except Exception as e:
+                self.log(f"✗ Error executing {title}: {str(e)}", "ERROR")
+                self.update_status(f"Error: {str(e)}")
+
+        threading.Thread(target=run_command, daemon=True).start()
 
     def update_widget_styles(self):
         """Update all widgets with custom stylesheets when theme changes"""
