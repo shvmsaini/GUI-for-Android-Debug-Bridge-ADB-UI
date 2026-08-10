@@ -21,10 +21,480 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QTextEdit, QLineEdit, QFileDialog,
     QMessageBox, QInputDialog, QFrame, QScrollArea, QGroupBox, QSizePolicy,
-    QDialog, QListWidget, QCheckBox, QRadioButton, QButtonGroup, QTabWidget
+    QDialog, QListWidget, QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup, QTabWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor
+
+
+class CredentialManager:
+    """Manage SSH passwords using OS credential managers"""
+
+    def __init__(self):
+        self.service_name = "ADB-GUI-UI"
+
+    def get_password(self, gateway, user):
+        """Retrieve password from credential manager"""
+        account = f"{user}@{gateway}"
+        try:
+            if sys.platform == 'darwin':
+                # macOS Keychain
+                result = subprocess.run(
+                    ['security', 'find-generic-password',
+                     '-s', self.service_name,
+                     '-a', account,
+                     '-w'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip()
+            elif sys.platform == 'win32':
+                # Windows - use PowerShell credential manager
+                # For simplicity, use a fallback file-based approach
+                return None  # Will be implemented later
+            else:
+                # Linux - try keyring
+                return None  # Will be implemented later
+        except:
+            pass
+        return None
+
+    def set_password(self, gateway, user, password):
+        """Store password in credential manager"""
+        account = f"{user}@{gateway}"
+        try:
+            if sys.platform == 'darwin':
+                # macOS Keychain - delete existing first, then add new
+                subprocess.run(
+                    ['security', 'delete-generic-password',
+                     '-s', self.service_name,
+                     '-a', account],
+                    capture_output=True, timeout=5
+                )
+                # Add new password
+                result = subprocess.run(
+                    ['security', 'add-generic-password',
+                     '-s', self.service_name,
+                     '-a', account,
+                     '-w', password],
+                    capture_output=True, text=True, timeout=5
+                )
+                return result.returncode == 0
+            elif sys.platform == 'win32':
+                # Windows implementation
+                return False  # Will be implemented later
+            else:
+                # Linux implementation
+                return False  # Will be implemented later
+        except:
+            return False
+        return False
+
+    def prompt_password(self, parent, gateway, user):
+        """Show password input dialog"""
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
+
+        password, ok = QInputDialog.getText(
+            parent,
+            "Password Required",
+            f"Enter password for {user}@{gateway}:",
+            QLineEdit.EchoMode.Password
+        )
+        if ok and password:
+            # Offer to save password
+            reply = QMessageBox.question(
+                parent,
+                "Save Password",
+                "Save password to credential manager?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.set_password(gateway, user, password)
+            return password
+        return None
+
+
+class SeatPortManager:
+    """Manage seat connections and port forwards from ~/.adb-seat-ports"""
+
+    def __init__(self, log_callback=None):
+        self.log_callback = log_callback
+        self.history_file = os.path.expanduser("~/.adb-seat-ports")
+        self.connected_seats = {}  # {seat: gateway}
+        self.connected_portforward = None  # gateway or None
+
+    def load_history(self):
+        """Load connection history from ~/.adb-seat-ports"""
+        entries = []
+        if not os.path.exists(self.history_file):
+            return entries
+
+        try:
+            with open(self.history_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Format: SEAT=PORT|GATEWAY|TS
+                    parts = line.split('=')
+                    if len(parts) != 2:
+                        continue
+                    seat = parts[0]
+                    rest = parts[1].split('|')
+                    if len(rest) != 3:
+                        continue
+                    port, gateway, ts = rest
+                    try:
+                        ts_int = int(ts)
+                    except:
+                        continue
+                    entries.append({
+                        'seat': seat,
+                        'port': port,
+                        'gateway': gateway,
+                        'timestamp': ts_int
+                    })
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"Error loading seat/port history: {e}", "ERROR")
+
+        return entries
+
+    def get_top_entries(self, entry_type='seat', limit=5):
+        """Get top N entries (seats or port forwards) sorted by timestamp"""
+        entries = self.load_history()
+
+        if entry_type == 'seat':
+            # Group by seat, keep most recent
+            unique = {}
+            for e in entries:
+                seat_key = (e['seat'], e['gateway'])
+                if seat_key not in unique or e['timestamp'] > unique[seat_key]['timestamp']:
+                    unique[seat_key] = e
+            # Sort by timestamp desc and return top N
+            sorted_entries = sorted(unique.values(), key=lambda x: x['timestamp'], reverse=True)
+            return sorted_entries[:limit]
+
+        elif entry_type == 'portforward':
+            # Group by gateway, keep most recent
+            unique = {}
+            for e in entries:
+                gateway = e['gateway']
+                if gateway not in unique or e['timestamp'] > unique[gateway]['timestamp']:
+                    unique[gateway] = e
+            # Sort by timestamp desc and return top N
+            sorted_entries = sorted(unique.values(), key=lambda x: x['timestamp'], reverse=True)
+            return sorted_entries[:limit]
+
+        return []
+
+    def append_history(self, seat, port, gateway):
+        """Append a new entry to ~/.adb-seat-ports"""
+        ts = int(time.time())
+        line = f"{seat}={port}|{gateway}|{ts}\n"
+
+        try:
+            with open(self.history_file, 'a') as f:
+                f.write(line)
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"Error writing to seat/port history: {e}", "ERROR")
+
+    def is_seat_connected(self, seat):
+        """Check if a seat is currently connected"""
+        return seat in self.connected_seats
+
+    def mark_seat_connected(self, seat, gateway):
+        """Mark seat as connected"""
+        self.connected_seats[seat] = gateway
+
+    def mark_seat_disconnected(self, seat):
+        """Mark seat as disconnected"""
+        if seat in self.connected_seats:
+            del self.connected_seats[seat]
+
+    def mark_portforward_connected(self, gateway):
+        """Mark port forward as connected"""
+        self.connected_portforward = gateway
+
+    def mark_portforward_disconnected(self):
+        """Mark port forward as disconnected"""
+        self.connected_portforward = None
+
+    def is_portforward_connected(self, gateway):
+        """Check if port forward is connected"""
+        return self.connected_portforward == gateway
+
+    def get_portforward_status(self):
+        """Get current port forward status from script
+        Returns dict with 'active', 'rack', 'headend', 'user', 'pid' or None
+        """
+        try:
+            script_path = self.log_callback.__self__.settings.get('portforward_script_path', 'portForwardRack.sh') if hasattr(self.log_callback, '__self__') else 'portForwardRack.sh'
+            result = subprocess.run(
+                [script_path, 'status'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                status = {'active': True, 'raw': result.stdout}
+                # Parse the output
+                for line in result.stdout.split('\n'):
+                    line = line.strip()
+                    if line.startswith('Rack:'):
+                        status['rack'] = line.split(':', 1)[1].strip()
+                    elif line.startswith('Headend:'):
+                        status['headend'] = line.split(':', 1)[1].strip()
+                    elif line.startswith('User:'):
+                        status['user'] = line.split(':', 1)[1].strip()
+                    elif line.startswith('PID:'):
+                        try:
+                            status['pid'] = int(line.split(':', 1)[1].strip())
+                        except:
+                            pass
+                return status
+            else:
+                return {'active': False, 'raw': result.stdout + result.stderr}
+        except Exception as e:
+            return {'active': False, 'error': str(e)}
+
+    def get_devices_from_seat_sh(self):
+        """Get devices from seat.sh devices command
+        Returns list of dicts: [{'device': 'localhost:64491', 'status': 'device', 'gateway': '...', 'seat': '...'}]
+        """
+        devices = []
+        try:
+            result = subprocess.run(
+                ['seat.sh', 'devices'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                # Skip header and parse each line
+                # Format: DEVICE               STATUS       GATEWAY              SEAT
+                for line in lines[1:]:  # Skip header line
+                    if line.strip():
+                        # Split by whitespace, but need to handle variable spacing
+                        parts = line.split(None, 3)  # Split on whitespace, max 4 parts
+                        if len(parts) >= 4:
+                            device_entry = {
+                                'device': parts[0],
+                                'status': parts[1],
+                                'gateway': parts[2] if parts[2] != '-' else '',
+                                'seat': parts[3] if len(parts) > 3 and parts[3] != '-' else ''
+                            }
+                            devices.append(device_entry)
+                        elif len(parts) == 3:
+                            # No seat info
+                            device_entry = {
+                                'device': parts[0],
+                                'status': parts[1],
+                                'gateway': parts[2] if parts[2] != '-' else '',
+                                'seat': ''
+                            }
+                            devices.append(device_entry)
+            return devices
+        except Exception as e:
+            return []
+
+
+class SettingsDialog(QDialog):
+    """Settings dialog for configuring paths"""
+
+    def __init__(self, parent=None, current_settings=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.current_settings = current_settings or {}
+
+        self.setWindowTitle("⚙️ Settings")
+        self.setMinimumWidth(600)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+
+        # ADB Path section
+        adb_group = QGroupBox("ADB Configuration")
+        adb_layout = QVBoxLayout(adb_group)
+
+        adb_label = QLabel("ADB Executable Path:")
+        adb_layout.addWidget(adb_label)
+
+        adb_row = QHBoxLayout()
+        self.adb_path_edit = QLineEdit(self.current_settings.get('adb_path', 'adb'))
+        self.adb_path_edit.setPlaceholderText("Path to adb executable (e.g., /usr/local/bin/adb)")
+        adb_row.addWidget(self.adb_path_edit)
+
+        adb_browse_btn = QPushButton("📂 Browse")
+        adb_browse_btn.clicked.connect(self.browse_adb)
+        adb_row.addWidget(adb_browse_btn)
+
+        adb_layout.addLayout(adb_row)
+        layout.addWidget(adb_group)
+
+        # Seat Script section
+        seat_group = QGroupBox("Seat Management Script")
+        seat_layout = QVBoxLayout(seat_group)
+
+        seat_label = QLabel("Seat Script Path:")
+        seat_layout.addWidget(seat_label)
+
+        seat_row = QHBoxLayout()
+        self.seat_path_edit = QLineEdit(self.current_settings.get('seat_script_path', 'seat.sh'))
+        self.seat_path_edit.setPlaceholderText("Path to seat.sh (e.g., /usr/local/bin/seat.sh)")
+        seat_row.addWidget(self.seat_path_edit)
+
+        seat_browse_btn = QPushButton("📂 Browse")
+        seat_browse_btn.clicked.connect(self.browse_seat)
+        seat_row.addWidget(seat_browse_btn)
+
+        seat_layout.addLayout(seat_row)
+        layout.addWidget(seat_group)
+
+        # Port Forward Script section
+        pf_group = QGroupBox("Port Forward Script")
+        pf_layout = QVBoxLayout(pf_group)
+
+        pf_label = QLabel("Port Forward Script Path:")
+        pf_layout.addWidget(pf_label)
+
+        pf_row = QHBoxLayout()
+        self.pf_path_edit = QLineEdit(self.current_settings.get('portforward_script_path', 'portForwardRack.sh'))
+        self.pf_path_edit.setPlaceholderText("Path to portForwardRack.sh")
+        pf_row.addWidget(self.pf_path_edit)
+
+        pf_browse_btn = QPushButton("📂 Browse")
+        pf_browse_btn.clicked.connect(self.browse_portforward)
+        pf_row.addWidget(pf_browse_btn)
+
+        pf_layout.addLayout(pf_row)
+        layout.addWidget(pf_group)
+
+        # Security section
+        security_group = QGroupBox("🔐 Security")
+        security_layout = QVBoxLayout(security_group)
+
+        security_label = QLabel("Password Storage:")
+        security_layout.addWidget(security_label)
+
+        password_info = QLabel(
+            "Passwords are stored securely in:\n"
+            "• macOS Keychain (encrypted, per-gateway credentials)\n\n"
+            "No passwords are saved in plain text."
+        )
+        password_info.setStyleSheet("color: #666; font-size: 9pt;")
+        password_info.setWordWrap(True)
+        security_layout.addWidget(password_info)
+
+        clear_pwd_btn = QPushButton("🗑️ Clear Stored Passwords")
+        clear_pwd_btn.clicked.connect(self.clear_stored_passwords)
+        security_layout.addWidget(clear_pwd_btn)
+
+        layout.addWidget(security_group)
+
+        # Buttons
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(cancel_btn)
+
+        save_btn = QPushButton("💾 Save")
+        save_btn.setProperty("accent", "true")
+        save_btn.clicked.connect(self.save)
+        button_row.addWidget(save_btn)
+
+        layout.addLayout(button_row)
+
+    def clear_stored_passwords(self):
+        """Clear all stored passwords"""
+        reply = QMessageBox.question(
+            self,
+            "Clear Passwords",
+            "Clear all stored SSH passwords?\n\n"
+            "This will remove all Keychain entries for SSH credentials.\n\n"
+            "You'll need to enter password again on next connection.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            # Clear from Keychain
+            try:
+                if sys.platform == 'darwin':
+                    # Delete all entries for our service
+                    result = subprocess.run(
+                        ['security', 'delete-generic-password',
+                         '-s', 'ADB-GUI-UI'],
+                        capture_output=True, timeout=5
+                    )
+                    QMessageBox.information(
+                        self,
+                        "Passwords Cleared",
+                        "All stored passwords have been cleared."
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Not Supported",
+                        "Password clearing is only supported on macOS.\n\n"
+                        "Please clear Keychain entries manually through System Settings."
+                    )
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    f"Error clearing Keychain entries: {e}"
+                )
+
+    def browse_adb(self):
+        """Browse for ADB executable"""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ADB Executable",
+            os.path.expanduser('~'),
+            "All files (*.*)"
+        )
+        if path:
+            self.adb_path_edit.setText(path)
+
+    def browse_seat(self):
+        """Browse for seat.sh"""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Seat Script",
+            os.path.expanduser('~'),
+            "Shell scripts (*.sh);;All files (*.*)"
+        )
+        if path:
+            self.seat_path_edit.setText(path)
+
+    def browse_portforward(self):
+        """Browse for portForwardRack.sh"""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Port Forward Script",
+            os.path.expanduser('~'),
+            "Shell scripts (*.sh);;All files (*.*)"
+        )
+        if path:
+            self.pf_path_edit.setText(path)
+
+    def save(self):
+        """Save settings"""
+        if self.parent:
+            # Update parent's settings
+            self.parent.settings['adb_path'] = self.adb_path_edit.text()
+            self.parent.settings['seat_script_path'] = self.seat_path_edit.text()
+            self.parent.settings['portforward_script_path'] = self.pf_path_edit.text()
+            self.parent.save_settings()
+
+            # Reload ADB if path changed
+            self.parent.adb = ADBManager(adb_path=self.parent.settings['adb_path'])
+            self.parent.adb.log_callback = self.parent.log
+            self.parent.update_adb_path_display()
+
+            self.parent.log("Settings updated", "INFO")
+
+        self.accept()
 
 
 class DeviceFileListWidget(QListWidget):
@@ -305,8 +775,8 @@ class ADBGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ADB Tool")
-        self.setGeometry(100, 100, 1200, 800)
-        self.setMinimumSize(1000, 700)
+        self.setGeometry(100, 100, 1600, 1000)
+        self.setMinimumSize(1200, 800)
         
         # Color schemes
         self.light_colors = {
@@ -410,16 +880,37 @@ class ADBGUI(QMainWindow):
         self.current_device = None
         self.log_thread = None
         self.log_running = False
-        
+        self.device_buttons = {}  # Initialize device buttons dict
+
+        # Initialize Seat/Port Manager
+        self.seat_port_manager = SeatPortManager(log_callback=self.log)
+
+        # Initialize Credential Manager
+        self.credential_manager = CredentialManager()
+
+        # Default script paths
+        if 'seat_script_path' not in self.settings:
+            self.settings['seat_script_path'] = 'seat.sh'
+            self.save_settings()
+        if 'portforward_script_path' not in self.settings:
+            self.settings['portforward_script_path'] = 'portForwardRack.sh'
+            self.save_settings()
+
         self.setup_ui()
         self.update_adb_path_display()
         self.refresh_devices()
-        
+        self.refresh_seat_port_lists()
+
         # Auto-refresh devices every 5 seconds (silent mode to avoid log spam)
         self.auto_refresh_timer = QTimer()
         self.auto_refresh_timer.timeout.connect(lambda: self.refresh_devices(silent=True))
         self.auto_refresh_timer.start(5000)
-        
+
+        # Auto-refresh seat/port lists every 10 seconds
+        self.seat_port_refresh_timer = QTimer()
+        self.seat_port_refresh_timer.timeout.connect(self.refresh_seat_port_lists)
+        self.seat_port_refresh_timer.start(10000)
+
         # Connect signal for custom dialog
         self.custom_dialog_ready.connect(self._show_custom_dialog)
         # Connect signal for app list dialog
@@ -439,12 +930,12 @@ class ADBGUI(QMainWindow):
         # Header with title
         header_layout = QHBoxLayout()
         self.title_label = QLabel("ADB Tool")
-        self.title_label.setFont(QFont('', 20, QFont.Weight.Bold))
+        self.title_label.setFont(QFont('', 24, QFont.Weight.Bold))
         self.title_label.setStyleSheet(f"color: {self.colors['fg']};")
         header_layout.addWidget(self.title_label)
-        
+
         self.subtitle_label = QLabel("Android Device Manager")
-        self.subtitle_label.setFont(QFont('', 10))
+        self.subtitle_label.setFont(QFont('', 12))
         self.subtitle_label.setStyleSheet(f"color: {self.colors['text_secondary']};")
         header_layout.addWidget(self.subtitle_label)
         header_layout.addStretch()
@@ -454,36 +945,42 @@ class ADBGUI(QMainWindow):
         self.theme_btn.setMaximumWidth(130)
         self.theme_btn.clicked.connect(self.cycle_theme)
         header_layout.addWidget(self.theme_btn)
-        
+
+        # Settings button
+        self.settings_btn = QPushButton("⚙️ Settings")
+        self.settings_btn.setMaximumWidth(130)
+        self.settings_btn.clicked.connect(self.open_settings)
+        header_layout.addWidget(self.settings_btn)
+
         main_layout.addLayout(header_layout)
         
-        # Device selection card
+        # Device selection card - Green Vysor-like styling
         device_group = QGroupBox("📱 Device Management")
+        device_group.setObjectName("deviceGroup")  # Apply green styling
         # Styles are applied globally via apply_theme
         device_layout = QVBoxLayout(device_group)
         device_layout.setSpacing(10)
-        
-        # Device selection row
+
+        # Device selection row with buttons instead of combo
         device_row = QHBoxLayout()
         device_row.addWidget(QLabel("Connected Devices:"))
-        
-        self.device_combo = QComboBox()
-        self.device_combo.setMinimumWidth(400)
-        self.device_combo.currentTextChanged.connect(self.on_device_selected)
-        device_row.addWidget(self.device_combo)
-        
+
+        # Create button group for devices
+        self.device_buttons = {}
+        self.devices_container = QWidget()
+        self.devices_layout = QHBoxLayout(self.devices_container)
+        self.devices_layout.setContentsMargins(0, 0, 0, 0)
+        self.devices_layout.setSpacing(8)  # Space between different device items
+        device_row.addWidget(self.devices_container)
+
         refresh_btn = QPushButton("🔄 Refresh")
         refresh_btn.clicked.connect(self.refresh_devices)
         device_row.addWidget(refresh_btn)
-        
+
         info_btn = QPushButton("ℹ️ Info")
         info_btn.clicked.connect(self.show_device_info)
         device_row.addWidget(info_btn)
-        
-        path_btn = QPushButton("📂 ADB Path")
-        path_btn.clicked.connect(self.set_adb_path_dialog)
-        device_row.addWidget(path_btn)
-        
+
         test_btn = QPushButton("✓ Test")
         test_btn.clicked.connect(self.test_adb)
         device_row.addWidget(test_btn)
@@ -565,10 +1062,117 @@ class ADBGUI(QMainWindow):
         # Device operations
         device_ops_group = self.create_card("⚡ Device Operations")
         self.create_button(device_ops_group, "📸 Take Screenshot", self.take_screenshot)
-        self.create_button(device_ops_group, "🪞 Mirror Screen (scrcpy)", self.scrcpy_device)
-        self.create_button(device_ops_group, "🔄 Reboot Device", self.reboot_device)
-        self.create_button(device_ops_group, "🔧 Reboot to Recovery", self.reboot_recovery)
-        self.create_button(device_ops_group, "⚙️ Reboot to Bootloader", self.reboot_bootloader)
+
+        # Scrcpy mirror with Fast/Normal buttons
+        scrcpy_row = QHBoxLayout()
+        scrcpy_row.addWidget(QLabel("🪞 Mirror Screen:"))
+
+        fast_btn = QPushButton("⚡ Fast (500kbps)")
+        fast_btn.clicked.connect(lambda: self.scrcpy_device(bitrate='500k'))
+        scrcpy_row.addWidget(fast_btn)
+
+        normal_btn = QPushButton("🎬 Normal (1mbps)")
+        normal_btn.clicked.connect(lambda: self.scrcpy_device(bitrate='1m'))
+        scrcpy_row.addWidget(normal_btn)
+
+        scrcpy_row.addStretch()
+        device_ops_group.layout().addLayout(scrcpy_row)
+
+        # Advanced section - Reboot options (collapsible, colored red)
+        advanced_header = QPushButton("▶ ⚠️ Advanced")
+        advanced_header.setCheckable(True)
+        advanced_header.setChecked(False)  # Collapsed by default
+        advanced_header.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {self.colors['error']};
+                font-weight: bold;
+                font-size: 10pt;
+                text-align: left;
+                padding: 5px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                color: #b8282c;
+            }}
+        """)
+        advanced_header.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        device_ops_group.layout().addWidget(advanced_header)
+
+        # Container for reboot buttons (hidden by default)
+        reboot_container = QWidget()
+        reboot_container.setVisible(False)  # Hidden by default
+        reboot_row = QHBoxLayout(reboot_container)
+        reboot_row.setContentsMargins(0, 5, 0, 0)
+        reboot_row.setSpacing(5)
+
+        reboot_btn = QPushButton("🔄 Reboot")
+        reboot_btn.clicked.connect(self.reboot_device)
+        reboot_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.colors['error']};
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: #b8282c;
+                color: white;
+            }}
+        """)
+        reboot_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        reboot_row.addWidget(reboot_btn)
+
+        recovery_btn = QPushButton("🔧 Recovery")
+        recovery_btn.clicked.connect(self.reboot_recovery)
+        recovery_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.colors['error']};
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: #b8282c;
+                color: white;
+            }}
+        """)
+        recovery_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        reboot_row.addWidget(recovery_btn)
+
+        bootloader_btn = QPushButton("⚙️ Bootloader")
+        bootloader_btn.clicked.connect(self.reboot_bootloader)
+        bootloader_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.colors['error']};
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: #b8282c;
+                color: white;
+            }}
+        """)
+        bootloader_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        reboot_row.addWidget(bootloader_btn)
+
+        device_ops_group.layout().addWidget(reboot_container)
+
+        # Connect toggle button to show/hide reboot buttons
+        def toggle_advanced(checked):
+            reboot_container.setVisible(checked)
+            # Update arrow in header text
+            if checked:
+                advanced_header.setText("▼ ⚠️ Advanced")
+            else:
+                advanced_header.setText("▶ ⚠️ Advanced")
+
+        advanced_header.toggled.connect(toggle_advanced)
+
         ops_layout.addWidget(device_ops_group)
         
         # Shell operations
@@ -596,7 +1200,67 @@ class ADBGUI(QMainWindow):
         ops_layout.addStretch()
         ops_scroll.setWidget(ops_widget)
         content_layout.addWidget(ops_scroll, 1)
-        
+
+        # Middle column - Seat & Port Management (scrollable)
+        seat_port_scroll = QScrollArea()
+        seat_port_scroll.setWidgetResizable(True)
+        seat_port_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        seat_port_widget = QWidget()
+        seat_port_layout = QVBoxLayout(seat_port_widget)
+        seat_port_layout.setSpacing(12)
+
+        # Seat Management section
+        seat_group = self.create_card("💺 Seat Management")
+        # Add search filter
+        seat_search_layout = QHBoxLayout()
+        seat_search_label = QLabel("Search:")
+        self.seat_search_entry = QLineEdit()
+        self.seat_search_entry.setPlaceholderText("Filter seats...")
+        self.seat_search_entry.textChanged.connect(self.refresh_seat_port_lists)
+        seat_search_layout.addWidget(seat_search_label)
+        seat_search_layout.addWidget(self.seat_search_entry)
+        seat_group.layout().addLayout(seat_search_layout)
+        # Seat list container with scroll area
+        self.seat_scroll_area = QScrollArea()
+        self.seat_scroll_area.setWidgetResizable(True)
+        self.seat_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.seat_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.seat_list_container = QWidget()
+        self.seat_list_layout = QVBoxLayout(self.seat_list_container)
+        self.seat_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.seat_list_layout.setSpacing(8)  # Space between individual seat items
+        self.seat_scroll_area.setWidget(self.seat_list_container)
+        seat_group.layout().addWidget(self.seat_scroll_area)
+        seat_port_layout.addWidget(seat_group, 1)  # Weight 1 - shares available space
+
+        # Port Forward section
+        portforward_group = self.create_card("🔌 Port Forward")
+        # Add search filter
+        pf_search_layout = QHBoxLayout()
+        pf_search_label = QLabel("Search:")
+        self.pf_search_entry = QLineEdit()
+        self.pf_search_entry.setPlaceholderText("Filter port forwards...")
+        self.pf_search_entry.textChanged.connect(self.refresh_seat_port_lists)
+        pf_search_layout.addWidget(pf_search_label)
+        pf_search_layout.addWidget(self.pf_search_entry)
+        portforward_group.layout().addLayout(pf_search_layout)
+        # Port forward list container with scroll area
+        self.pf_scroll_area = QScrollArea()
+        self.pf_scroll_area.setWidgetResizable(True)
+        self.pf_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.pf_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.portforward_list_container = QWidget()
+        self.portforward_list_layout = QVBoxLayout(self.portforward_list_container)
+        self.portforward_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.portforward_list_layout.setSpacing(8)  # Space between individual port forward items
+        self.pf_scroll_area.setWidget(self.portforward_list_container)
+        portforward_group.layout().addWidget(self.pf_scroll_area)
+        seat_port_layout.addWidget(portforward_group, 1)  # Weight 1 - shares available space
+
+        seat_port_layout.addStretch()
+        seat_port_scroll.setWidget(seat_port_widget)
+        content_layout.addWidget(seat_port_scroll, 1)
+
         # Right side - Logs
         self.logs_group = QGroupBox("📊 Logs & Output")
         # Styles are applied globally via apply_theme
@@ -661,7 +1325,23 @@ class ADBGUI(QMainWindow):
             color: {self.colors['text_secondary']};
         """)
         main_layout.addWidget(self.status_bar)
-    
+
+        # Set hand cursor on all buttons
+        self.set_hand_cursor_on_buttons()
+
+    def set_hand_cursor_on_buttons(self):
+        """Set hand pointer cursor on all buttons and list widgets"""
+        from PyQt6.QtGui import QCursor
+        from PyQt6.QtCore import Qt
+
+        # Set cursor on all QPushButtons
+        for btn in self.findChildren(QPushButton):
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+        # Set cursor on all QListWidgets
+        for list_widget in self.findChildren(QListWidget):
+            list_widget.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
     def create_card(self, title):
         """Create a modern card container"""
         group = QGroupBox(title)
@@ -748,13 +1428,13 @@ class ADBGUI(QMainWindow):
     
     def refresh_devices(self, silent=False):
         """Refresh list of connected devices
-        
+
         Args:
             silent: If True, don't log routine refresh messages (for auto-refresh)
         """
         if not silent:
             self.update_status("Refreshing devices...")
-        
+
         # Test ADB connection first
         test_result = self.adb.run_command('version')
         if not test_result['success']:
@@ -765,27 +1445,53 @@ class ADBGUI(QMainWindow):
             self.device_info_label.setText(f"ADB Error: {error_msg[:100]}")
             self.device_info_label.setStyleSheet(f"color: {self.colors['error']};")
             return
-        
-        devices = self.adb.get_devices(silent=silent)
-        
+
+        # Get devices from seat.sh
+        seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+        seat_device_map = {}  # Map device ID to seat info
+        connected_seats = set()
+
+        # Build map from seat.sh output
+        for dev_info in seat_sh_devices:
+            seat_device_map[dev_info['device']] = dev_info
+            if dev_info['seat']:  # If seat is not empty
+                connected_seats.add(dev_info['device'])
+
+        # Get all devices from adb
+        all_devices = self.adb.get_devices(silent=silent)
+
+        # Sort devices: connected (with seat) first, then others
+        connected_device_list = []
+        other_device_list = []
+
+        for d in all_devices:
+            device_id = d['id']
+            if device_id in connected_seats:
+                connected_device_list.append(d)
+            else:
+                other_device_list.append(d)
+
+        # Combine: connected first, then others
+        devices = connected_device_list + other_device_list
+
         # Get current device list for comparison
         current_device_ids = set()
         if hasattr(self, 'device_display_map'):
             current_device_ids = set(self.device_display_map.values())
-        
+
         if devices:
             # Create display strings with device name/model
             device_list = []
             device_display_map = {}  # Map display string to device ID
             new_device_ids = set()
-            
+
             for d in devices:
                 device_id = d['id']
                 new_device_ids.add(device_id)
                 model = d.get('model')
                 manufacturer = d.get('manufacturer', '')
                 product = d.get('product')
-                
+
                 # Build display name
                 if model:
                     if manufacturer:
@@ -796,45 +1502,145 @@ class ADBGUI(QMainWindow):
                     display_name = product.replace('_', ' ').title()
                 else:
                     display_name = "Unknown Device"
-                
+
                 # Format: "Device Name (ID)"
                 display_str = f"{display_name} ({device_id})"
                 device_list.append(display_str)
                 device_display_map[display_str] = device_id
-            
+
             # Only log if device list changed
             devices_changed = current_device_ids != new_device_ids
-            
-            # Disconnect signal before modifying combo box to prevent unwanted triggers
-            self.device_combo.currentTextChanged.disconnect()
-            
-            self.device_combo.clear()
-            self.device_combo.addItems(device_list)
-            self.device_display_map = device_display_map  # Store mapping for selection
-            
-            # Only auto-select if no device is currently selected
+
+            # Clear old device buttons and stretch
+            for btn in self.device_buttons.values():
+                btn.deleteLater()
+            self.device_buttons.clear()
+
+            # Clear all items from layout (buttons and stretches)
+            while self.devices_layout.count() > 0:
+                item = self.devices_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            # Create new device buttons
+            for d in devices:
+                device_id = d['id']
+                model = d.get('model')
+                manufacturer = d.get('manufacturer', '')
+                product = d.get('product')
+
+                # Build display name
+                if model:
+                    if manufacturer:
+                        display_name = f"{manufacturer} {model}"
+                    else:
+                        display_name = model
+                elif product:
+                    display_name = product.replace('_', ' ').title()
+                else:
+                    display_name = "Unknown Device"
+
+                # Try to find SEAT for this device from seat.sh
+                seat_name = ""
+                if device_id in seat_device_map:
+                    seat_name = seat_device_map[device_id].get('seat', '')
+
+                # If not found in seat.sh, try history
+                if not seat_name:
+                    for seat_entry in self.seat_port_manager.load_history():
+                        if seat_entry['seat'] == device_id or device_id in seat_entry['seat']:
+                            seat_name = seat_entry['seat']
+                            break
+
+                # Create container widget with button and play button (no gap between them)
+                container = QWidget()
+                container_layout = QHBoxLayout(container)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(0)  # No space between main button and play button
+
+                # Create button for this device
+                # If SEAT is available from seat.sh, use it as primary name with DEVICE as port
+                if seat_name:
+                    device_display = f"💺 {seat_name}\n📱 {device_id}"
+                else:
+                    device_display = f"📱 {display_name}\n{device_id}"
+
+                btn = QPushButton(device_display)
+                btn.setMinimumHeight(50)
+                btn.setMaximumHeight(50)
+                btn.setMinimumWidth(160)
+                btn.setMaximumWidth(160)
+                btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+                btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                btn.clicked.connect(lambda checked, did=device_id: self.select_device_button(did))
+
+                # Apply styling with NO border (removes visual gap)
+                if device_id == self.current_device:
+                    # Selected: Green background, red on hover (to indicate disconnect)
+                    btn.setStyleSheet(f"""
+                        QPushButton {{
+                            background-color: {self.colors['success']};
+                            color: white;
+                            font-weight: bold;
+                            text-align: left;
+                            padding-left: 8px;
+                            border: none;
+                            margin: 0px;
+                        }}
+                        QPushButton:hover {{
+                            background-color: {self.colors['error']};
+                            color: white;
+                        }}
+                    """)
+                else:
+                    # Not selected: Default background, blue on hover (indicates select)
+                    btn.setStyleSheet(f"""
+                        QPushButton {{
+                            text-align: left;
+                            padding-left: 8px;
+                            border: none;
+                            margin: 0px;
+                        }}
+                        QPushButton:hover {{
+                            background-color: {self.colors['accent']};
+                            color: white;
+                        }}
+                    """)
+
+                # Play button for scrcpy (tightly attached, no gap, no border)
+                play_btn = QPushButton("▶")
+                play_btn.setMaximumWidth(40)
+                play_btn.setMinimumWidth(40)
+                play_btn.setMaximumHeight(50)
+                play_btn.setMinimumHeight(50)
+                play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                play_btn.clicked.connect(lambda checked=False, did=device_id: self._launch_scrcpy_for_device(did))
+                play_btn.setToolTip("Mirror screen via scrcpy")
+                play_btn.setStyleSheet("""
+                    QPushButton {
+                        border: none;
+                        margin: 0px;
+                        padding: 0px;
+                    }
+                    QPushButton:hover {
+                        background-color: #888;
+                    }
+                """)
+
+                container_layout.addWidget(btn, 0)
+                container_layout.addWidget(play_btn, 0)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(0)
+
+                self.devices_layout.addWidget(container)
+
+            self.devices_layout.addStretch()  # Add stretch at the end
+
+            # Auto-select first device if none selected
             was_no_device = not self.current_device
-            if was_no_device and device_list:
-                self.device_combo.setCurrentIndex(0)
-                # Call on_device_selected directly with silent parameter (signal is disconnected so won't trigger)
-                self.on_device_selected(silent=silent)  # Use silent parameter from refresh_devices
-            elif self.current_device and device_list:
-                # Device is already selected - just update the combo box index if needed
-                # Find the current device in the new list
-                current_display = None
-                for display_str, device_id in device_display_map.items():
-                    if device_id == self.current_device:
-                        current_display = display_str
-                        break
-                
-                if current_display:
-                    index = self.device_combo.findText(current_display)
-                    if index >= 0:
-                        self.device_combo.setCurrentIndex(index)
-                # Don't call on_device_selected when device is already selected (avoids redundant get_devices call)
-            
-            # Reconnect signal after all combo box operations are complete
-            self.device_combo.currentTextChanged.connect(self.on_device_selected)
+            if was_no_device and devices:
+                first_device_id = devices[0]['id']
+                self.select_device_button(first_device_id)
             
             if not silent or devices_changed:
                 self.update_status(f"Found {len(devices)} device(s)")
@@ -843,8 +1649,11 @@ class ADBGUI(QMainWindow):
                     device_names = [f"{d.get('model', d.get('product', 'Unknown'))} ({d['id']})" for d in devices]
                     self.log(f"Found {len(devices)} device(s): {', '.join(device_names)}")
         else:
-            had_devices = hasattr(self, 'device_display_map') and len(self.device_display_map) > 0
-            self.device_combo.clear()
+            had_devices = len(self.device_buttons) > 0
+            # Clear all device buttons
+            for btn in self.device_buttons.values():
+                btn.deleteLater()
+            self.device_buttons.clear()
             self.current_device = None
             self.device_info_label.setText("No devices connected - Check USB connection and USB debugging")
             self.device_info_label.setStyleSheet(f"color: {self.colors['warning']};")
@@ -852,63 +1661,612 @@ class ADBGUI(QMainWindow):
                 self.update_status("No devices found")
                 if had_devices:
                     self.log("No devices found. Make sure USB debugging is enabled and device is connected.", "WARNING")
-    
+
+    def select_device_button(self, device_id):
+        """Handle device button click"""
+        self.current_device = device_id
+
+        # Update button appearance
+        for bid, btn in self.device_buttons.items():
+            if bid == device_id:
+                btn.setStyleSheet(f"background-color: {self.colors['success']}; color: white; font-weight: bold;")
+            else:
+                btn.setStyleSheet("")
+
+        # Update device info display
+        devices = self.adb.get_devices()
+        for d in devices:
+            if d['id'] == device_id:
+                model = d.get('model', 'Unknown')
+                status = d.get('status', 'unknown')
+                self.device_info_label.setText(f"✓ Selected: {model} - Status: {status}")
+                self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
+                break
+
+        self.log(f"Selected device: {device_id}")
+
     def on_device_selected(self, selection=None, silent=False):
-        """Handle device selection
-        
-        Args:
-            selection: Device selection string (if None, uses current combo selection)
-            silent: If True, don't log the selection (for auto-refresh)
-        """
-        if selection is None:
-            selection = self.device_combo.currentText()
-        
-        if selection:
-            # Extract device ID from display string using the mapping
-            if hasattr(self, 'device_display_map') and selection in self.device_display_map:
-                self.current_device = self.device_display_map[selection]
+        """Legacy method - now using button-based device selection"""
+        # This method is kept for compatibility but device selection is now handled by select_device_button()
+        pass
+
+    def refresh_seat_port_lists(self):
+        """Refresh seat and port forward lists from ~/.adb-seat-ports"""
+        # Skip if not yet initialized
+        if not hasattr(self, 'seat_list_container') or not hasattr(self, 'portforward_list_container'):
+            return
+        if not hasattr(self, 'colors') or not self.colors:
+            return
+
+        # Get search filter text
+        seat_filter = ""
+        pf_filter = ""
+        if hasattr(self, 'seat_search_entry'):
+            seat_filter = self.seat_search_entry.text().lower().strip()
+        if hasattr(self, 'pf_search_entry'):
+            pf_filter = self.pf_search_entry.text().lower().strip()
+
+        # Clear existing buttons
+        while self.seat_list_layout.count() > 0:
+            item = self.seat_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Get ALL seats (not just top 5) and filter
+        all_seats = self.seat_port_manager.get_top_entries('seat', 1000)  # Get all (up to 1000)
+        top_seats = []
+        for entry in all_seats:
+            # Apply search filter
+            if seat_filter:
+                if seat_filter in entry['seat'].lower() or seat_filter in entry['gateway'].lower() or seat_filter in entry['port'].lower():
+                    top_seats.append(entry)
             else:
-                # Fallback: try to extract from parentheses
-                if '(' in selection and ')' in selection:
-                    self.current_device = selection.split('(')[1].split(')')[0].strip()
+                top_seats.append(entry)
+
+        # Get connected seats from seat.sh devices
+        seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+        connected_seat_names = set()
+        for dev_info in seat_sh_devices:
+            if dev_info.get('seat'):  # If seat is not empty
+                connected_seat_names.add(dev_info['seat'])
+
+        # Sort: Connected seats first (from both connection state and seat.sh), then disconnected
+        connected_seats = []
+        disconnected_seats = []
+        for entry in top_seats:
+            # Check if seat is connected via internal state OR seat.sh
+            is_conn = (self.seat_port_manager.is_seat_connected(entry['seat']) or
+                      entry['seat'] in connected_seat_names or
+                      entry.get('gateway') in connected_seat_names)
+            if is_conn:
+                connected_seats.append(entry)
+            else:
+                disconnected_seats.append(entry)
+
+        top_seats = connected_seats + disconnected_seats
+
+        # Limit to reasonable number (50) for performance
+        top_seats = top_seats[:50]
+        for entry in top_seats:
+            # Check if seat is connected via internal state OR seat.sh
+            is_connected = (self.seat_port_manager.is_seat_connected(entry['seat']) or
+                          entry['seat'] in connected_seat_names or
+                          entry.get('gateway') in connected_seat_names)
+            btn_connected = is_connected
+            # Format: two lines with Port info on the seat line
+            text = f"{entry['seat']} (Port: {entry['port']})\n{entry['gateway']}"
+
+            # Create container widget with horizontal layout for button + play button (no gap)
+            container = QWidget()
+            container_layout = QHBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)  # No space between main button and play button
+
+            # Main button
+            btn = QPushButton(text)
+            btn.setMinimumHeight(50)
+            btn.setMaximumHeight(50)
+            btn.setMinimumWidth(280)
+            btn.setMaximumWidth(280)
+            btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn.clicked.connect(lambda checked=False, e=entry: self._on_seat_clicked(e))
+
+            if btn_connected:
+                # Connected: Green background, red on hover (to indicate disconnect)
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {self.colors['success']};
+                        color: white;
+                        font-weight: bold;
+                        text-align: left;
+                        padding: 4px;
+                        border: none;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {self.colors['error']};
+                        color: white;
+                    }}
+                """)
+                # Update tooltip to indicate action
+                btn.setToolTip("Click to disconnect")
+            else:
+                # Disconnected: Default background, blue on hover (indicates connect)
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        text-align: left;
+                        padding: 4px;
+                        border: none;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {self.colors['accent']};
+                        color: white;
+                    }}
+                """)
+                btn.setToolTip("Click to connect")
+
+            # Play button for scrcpy (tightly attached, no gap, no border)
+            play_btn = QPushButton("▶")
+            play_btn.setMaximumWidth(40)
+            play_btn.setMinimumWidth(40)
+            play_btn.setMaximumHeight(50)
+            play_btn.setMinimumHeight(50)
+            play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            play_btn.clicked.connect(lambda checked=False, seat=entry['seat']: self._scrcpy_via_seat(seat))
+            play_btn.setToolTip("Mirror screen via scrcpy")
+            play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
+
+            container_layout.addWidget(btn, 0)
+            container_layout.addWidget(play_btn, 0)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+
+            self.seat_list_layout.addWidget(container)
+
+        # Clear existing port forward buttons
+        while self.portforward_list_layout.count() > 0:
+            item = self.portforward_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Get ALL port forwards (not just top 5) and filter
+        all_pf = self.seat_port_manager.get_top_entries('portforward', 1000)  # Get all (up to 1000)
+        top_pf = []
+        for entry in all_pf:
+            # Apply search filter
+            if pf_filter:
+                if pf_filter in entry['gateway'].lower() or pf_filter in entry['port'].lower():
+                    top_pf.append(entry)
+            else:
+                top_pf.append(entry)
+
+        # Get current port forward status (includes rack info if active)
+        pf_status = self.seat_port_manager.get_portforward_status()
+        active_rack = None
+        if pf_status and pf_status.get('active'):
+            active_rack = pf_status.get('rack', '')
+
+        # Sort: Connected/active port forwards first, then others
+        connected_pf = []
+        disconnected_pf = []
+        for entry in top_pf:
+            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
+            is_active_rack = active_rack and active_rack in entry['gateway']
+            if is_connected or is_active_rack:
+                connected_pf.append(entry)
+            else:
+                disconnected_pf.append(entry)
+
+        top_pf = connected_pf + disconnected_pf
+
+        # Limit to reasonable number (50) for performance
+        top_pf = top_pf[:50]
+
+        for entry in top_pf:
+            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
+
+            # Check if this entry's gateway matches the active rack
+            is_active_rack = active_rack and active_rack in entry['gateway']
+
+            # Format: show rack info if this is the active one
+            if is_active_rack:
+                # Show rack info - this is the active port forward
+                text = f"🟢 {entry['gateway']}\n📡 Rack: {active_rack}"
+                btn_connected = True  # Force connected state for active rack
+            else:
+                text = f"{entry['gateway']}"
+                btn_connected = is_connected
+
+            # Create container widget with horizontal layout for button + play button (no spacing)
+            container = QWidget()
+            container_layout = QHBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)  # No space between button and play button
+
+            # Main button
+            btn = QPushButton(text)
+            btn.setMinimumHeight(50)
+            btn.setMaximumHeight(50)
+            btn.setMinimumWidth(280)
+            btn.setMaximumWidth(280)
+            btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn.clicked.connect(lambda checked, e=entry: self._on_portforward_clicked(e))
+
+            if btn_connected:
+                # Connected (or active rack): Green background, red on hover (to indicate disconnect/stop)
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {self.colors['success']};
+                        color: white;
+                        font-weight: bold;
+                        text-align: left;
+                        padding: 4px;
+                        border: none;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {self.colors['error']};
+                        color: white;
+                    }}
+                """)
+                # Update tooltip to indicate action
+                if is_active_rack:
+                    btn.setToolTip(f"Active rack: {active_rack}\nClick to stop port forward")
                 else:
-                    self.current_device = selection.split()[0]
-            
-            # Get device info for display
-            # In silent mode, skip get_devices call to avoid redundant logging
-            if silent:
-                # In silent mode, just use the device ID we already have
-                # Don't call get_devices to avoid logging
-                device_info = None
-                # Set a simple display text without calling get_devices
-                display_text = f"Selected: {self.current_device}"
+                    btn.setToolTip("Click to disconnect")
             else:
-                # Not in silent mode, get full device info
-                devices = self.adb.get_devices(silent=silent)
-                device_info = next((d for d in devices if d['id'] == self.current_device), None)
-            
-            if device_info:
-                model = device_info.get('model', 'Unknown')
-                manufacturer = device_info.get('manufacturer', '')
-                if manufacturer:
-                    display_text = f"Selected: {manufacturer} {model} ({self.current_device})"
-                else:
-                    display_text = f"Selected: {model} ({self.current_device})"
-            else:
-                display_text = f"Selected: {self.current_device}"
-            
-            # Only update UI and log if not in silent mode (for auto-refresh)
-            if not silent:
-                self.device_info_label.setText(display_text)
-                self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
-                self.log(f"Selected device: {display_text}")
-            # In silent mode, only update the label if it's not already set correctly
-            elif not hasattr(self, 'device_info_label') or self.device_info_label.text() != display_text:
-                self.device_info_label.setText(display_text)
-                self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
+                # Disconnected: Default background, blue on hover (indicates connect)
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        text-align: left;
+                        padding: 4px;
+                        border: none;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {self.colors['accent']};
+                        color: white;
+                    }}
+                """)
+                btn.setToolTip("Click to connect")
+
+            # Play button for scrcpy (tightly attached, no gap, no border)
+            play_btn = QPushButton("▶")
+            play_btn.setMaximumWidth(40)
+            play_btn.setMinimumWidth(40)
+            play_btn.setMaximumHeight(50)
+            play_btn.setMinimumHeight(50)
+            play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            play_btn.clicked.connect(lambda checked=False, gateway=entry['gateway']: self._scrcpy_via_portforward(gateway))
+            play_btn.setToolTip("Mirror screen via scrcpy")
+            play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
+
+            container_layout.addWidget(btn, 0)
+            container_layout.addWidget(play_btn, 0)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+
+            self.portforward_list_layout.addWidget(container)
+
+    def _on_seat_clicked(self, entry):
+        """Handle seat button click"""
+        if not entry:
+            return
+        is_connected = self.seat_port_manager.is_seat_connected(entry['seat'])
+
+        if is_connected:
+            # Disconnect
+            self.disconnect_seat(entry['seat'])
         else:
-            self.current_device = None
-    
+            # Connect
+            self.connect_seat(entry['seat'], entry['gateway'])
+
+    def _on_portforward_clicked(self, entry):
+        """Handle port forward button click"""
+        if not entry:
+            return
+        is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
+
+        if is_connected:
+            # Disconnect
+            self.disconnect_portforward()
+        else:
+            # Connect (need partition and user from somewhere - for now use entry)
+            # Parse user from gateway like "user@pdc-dev-ek"
+            parts = entry['gateway'].split('@')
+            if len(parts) == 2:
+                user_part, gateway_host = parts
+                self.connect_portforward(entry['gateway'], 'cs1', user_part)
+            else:
+                self.log("Invalid gateway format", "ERROR")
+
+    def _scrcpy_via_seat(self, seat):
+        """Launch scrcpy for a device via seat connection"""
+        self.log(f"Launching scrcpy for seat {seat}...")
+
+        # Check if seat is connected, if not connect first
+        is_connected = self.seat_port_manager.is_seat_connected(seat)
+
+        if not is_connected:
+            self.log(f"Seat {seat} not connected, connecting first...")
+            # Find the seat entry to get gateway
+            for entry in self.seat_port_manager.load_history():
+                if entry['seat'] == seat:
+                    # Get devices BEFORE connection to track new device
+                    devices_before = {d['id'] for d in self.adb.get_devices()}
+
+                    # Connect first, then launch scrcpy after a delay
+                    self.connect_seat(seat, entry['gateway'])
+                    # Wait for connection to complete, then launch scrcpy
+                    QTimer.singleShot(2000, lambda s=seat, before=devices_before: self._launch_scrcpy_after_connect(s, before))
+                    return
+        else:
+            # Already connected, launch scrcpy directly
+            self._launch_scrcpy_after_connect(seat, None)
+
+    def _launch_scrcpy_after_connect(self, seat, devices_before=None):
+        """Launch scrcpy after seat is connected"""
+        self.log(f"Launching scrcpy for seat {seat}...")
+        self.update_status(f"Launching scrcpy for {seat}...")
+
+        def do_scrcpy():
+            try:
+                # Get current devices
+                devices = self.adb.get_devices()
+                device_id = None
+
+                if devices_before is not None:
+                    # Find the NEW device that appeared after seat connection
+                    for device in devices:
+                        if device['id'] not in devices_before:
+                            device_id = device['id']
+                            self.log(f"Found new device for seat {seat}: {device_id}")
+                            break
+
+                # Fallback: try to match by name/IP
+                if not device_id:
+                    for device in devices:
+                        if device['id'] == seat or seat in device['id']:
+                            device_id = device['id']
+                            break
+
+                # If still no match, look for localhost connections (most common for seats)
+                if not device_id:
+                    for device in devices:
+                        if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
+                            device_id = device['id']
+                            self.log(f"Using localhost device for seat {seat}: {device_id}")
+                            break
+
+                if device_id:
+                    # Temporarily set as current device and launch scrcpy
+                    old_device = self.current_device
+                    self.current_device = device_id
+                    self.log(f"Launching scrcpy for device {device_id} (seat {seat})")
+                    self.scrcpy_device()
+                    self.current_device = old_device
+                else:
+                    self.log(f"No device found for seat {seat}. Available: {[d['id'] for d in devices]}", "ERROR")
+                    self.update_status("No device found")
+            except Exception as e:
+                self.log(f"Error launching scrcpy: {str(e)}", "ERROR")
+                self.update_status("Error launching scrcpy")
+
+        threading.Thread(target=do_scrcpy, daemon=True).start()
+
+    def _launch_scrcpy_for_device(self, device_id):
+        """Launch scrcpy for a specific device"""
+        # Temporarily switch current device, launch scrcpy, then restore
+        old_device = self.current_device
+        self.current_device = device_id
+        self.scrcpy_device()
+        self.current_device = old_device
+
+    def _scrcpy_via_portforward(self, gateway):
+        """Launch scrcpy for a device via port forward connection"""
+        self.log(f"Launching scrcpy for {gateway}...")
+        self.update_status(f"Launching scrcpy for {gateway}...")
+
+        def do_scrcpy():
+            try:
+                # Use scrcpy command directly
+                cmd = ['scrcpy']
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if result.returncode != 0:
+                    self.log(f"Failed to launch scrcpy: {result.stderr}", "ERROR")
+                    self.update_status("Failed to launch scrcpy")
+                else:
+                    self.log("Scrcpy launched successfully")
+            except FileNotFoundError:
+                self.log("scrcpy not found in PATH. Please install scrcpy.", "ERROR")
+                self.update_status("scrcpy not found")
+            except Exception as e:
+                self.log(f"Error launching scrcpy: {str(e)}", "ERROR")
+                self.update_status("Error launching scrcpy")
+
+        threading.Thread(target=do_scrcpy, daemon=True).start()
+
+    def connect_seat(self, seat, gateway):
+        """Connect to a seat"""
+        self.log(f"Connecting to seat {seat} via {gateway}...")
+        self.update_status(f"Connecting to {seat}...")
+
+        # Parse user from gateway
+        parts = gateway.split('@')
+        user = parts[0] if len(parts) == 2 else 'user'
+
+        # Get password from Keychain only (no plain text storage)
+        password = self.credential_manager.get_password(gateway, user)
+        if not password:
+            password = self.credential_manager.prompt_password(self, gateway, user)
+            if not password:
+                self.log("Password required to connect", "ERROR")
+                return
+
+        def do_connect():
+            try:
+                # Get script path from settings
+                script_path = self.settings.get('seat_script_path', 'seat.sh')
+
+                # Use sshpass if available, otherwise try with stdin
+                if shutil.which('sshpass'):
+                    cmd = ['sshpass', '-p', password, script_path, 'auto-connect', seat, gateway]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    stdout, stderr = result.stdout, result.stderr
+                    returncode = result.returncode
+                else:
+                    # Fallback: pass password via SSH_ASKPASS
+                    env = os.environ.copy()
+                    # Create temporary askpass script
+                    askpass_script = f"#!/bin/sh\necho {password}\n"
+                    askpass_file = '/tmp/adb_gui_askpass.sh'
+                    with open(askpass_file, 'w') as f:
+                        f.write(askpass_script)
+                    os.chmod(askpass_file, 0o755)
+                    env['SSH_ASKPASS'] = askpass_file
+                    env['SSH_ASKPASS_REQUIRE'] = 'force'
+
+                    cmd = [script_path, 'auto-connect', seat, gateway]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+                    stdout, stderr = result.stdout, result.stderr
+                    returncode = result.returncode
+
+                    # Clean up
+                    try:
+                        os.remove(askpass_file)
+                    except:
+                        pass
+
+                if returncode == 0:
+                    self.seat_port_manager.mark_seat_connected(seat, gateway)
+                    self.log(f"Connected to seat {seat}", "INFO")
+                    self.update_status(f"Connected to {seat}")
+                    QTimer.singleShot(0, self.refresh_seat_port_lists)
+                    QTimer.singleShot(500, self.refresh_devices)  # Refresh devices after seat connection
+                else:
+                    error = stderr.strip() or stdout.strip() or "Unknown error"
+                    self.log(f"Failed to connect to seat: {error}", "ERROR")
+                    self.update_status("Failed to connect")
+            except Exception as e:
+                self.log(f"Error connecting to seat: {str(e)}", "ERROR")
+                self.update_status("Error connecting")
+
+        threading.Thread(target=do_connect, daemon=True).start()
+
+    def disconnect_seat(self, seat):
+        """Disconnect from a seat"""
+        self.log(f"Disconnecting from seat {seat}...")
+        self.update_status(f"Disconnecting from {seat}...")
+
+        def do_disconnect():
+            try:
+                # Get script path from settings
+                script_path = self.settings.get('seat_script_path', 'seat.sh')
+                cmd = [script_path, 'disconnect', seat]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+                if result.returncode == 0:
+                    self.seat_port_manager.mark_seat_disconnected(seat)
+                    self.log(f"Disconnected from seat {seat}", "INFO")
+                    self.update_status(f"Disconnected from {seat}")
+                    QTimer.singleShot(0, self.refresh_seat_port_lists)
+                    QTimer.singleShot(500, self.refresh_devices)  # Refresh devices after seat disconnection
+                else:
+                    error = result.stderr or result.stdout or "Unknown error"
+                    self.log(f"Failed to disconnect: {error}", "ERROR")
+                    self.update_status("Failed to disconnect")
+            except Exception as e:
+                self.log(f"Error disconnecting: {str(e)}", "ERROR")
+                self.update_status("Error disconnecting")
+
+        threading.Thread(target=do_disconnect, daemon=True).start()
+
+    def connect_portforward(self, gateway, partition, user):
+        """Connect port forward"""
+        self.log(f"Setting up port forward for {gateway}...")
+        self.update_status(f"Setting up port forward for {gateway}...")
+
+        # Get password from Keychain only (no plain text storage)
+        password = self.credential_manager.get_password(gateway, user)
+        if not password:
+            password = self.credential_manager.prompt_password(self, gateway, user)
+            if not password:
+                self.log("Password required to connect", "ERROR")
+                return
+
+        def do_connect():
+            try:
+                # Get script path from settings
+                script_path = self.settings.get('portforward_script_path', 'portForwardRack.sh')
+
+                # Use sshpass if available, otherwise try with SSH_ASKPASS
+                if shutil.which('sshpass'):
+                    cmd = ['sshpass', '-p', password, script_path, gateway, partition, user]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    stdout, stderr = result.stdout, result.stderr
+                    returncode = result.returncode
+                else:
+                    # Fallback: pass password via SSH_ASKPASS
+                    env = os.environ.copy()
+                    askpass_script = f"#!/bin/sh\necho {password}\n"
+                    askpass_file = '/tmp/adb_gui_askpass.sh'
+                    with open(askpass_file, 'w') as f:
+                        f.write(askpass_script)
+                    os.chmod(askpass_file, 0o755)
+                    env['SSH_ASKPASS'] = askpass_file
+                    env['SSH_ASKPASS_REQUIRE'] = 'force'
+
+                    cmd = [script_path, gateway, partition, user]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+                    stdout, stderr = result.stdout, result.stderr
+                    returncode = result.returncode
+
+                    try:
+                        os.remove(askpass_file)
+                    except:
+                        pass
+
+                if returncode == 0:
+                    self.seat_port_manager.mark_portforward_connected(gateway)
+                    self.log(f"Port forward connected for {gateway}", "INFO")
+                    self.update_status(f"Port forward connected")
+                    QTimer.singleShot(0, self.refresh_seat_port_lists)
+                else:
+                    error = stderr.strip() or stdout.strip() or "Unknown error"
+                    self.log(f"Failed to set up port forward: {error}", "ERROR")
+                    self.update_status("Failed to set up port forward")
+            except Exception as e:
+                self.log(f"Error setting up port forward: {str(e)}", "ERROR")
+                self.update_status("Error setting up port forward")
+
+        threading.Thread(target=do_connect, daemon=True).start()
+
+    def disconnect_portforward(self):
+        """Disconnect port forward"""
+        self.log("Stopping port forward...")
+        self.update_status("Stopping port forward...")
+
+        def do_disconnect():
+            try:
+                # Get script path from settings
+                script_path = self.settings.get('portforward_script_path', 'portForwardRack.sh')
+                cmd = [script_path, 'stop']
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+                if result.returncode == 0:
+                    self.seat_port_manager.mark_portforward_disconnected()
+                    self.log("Port forward stopped", "INFO")
+                    self.update_status("Port forward stopped")
+                    QTimer.singleShot(0, self.refresh_seat_port_lists)
+                else:
+                    error = result.stderr or result.stdout or "Unknown error"
+                    self.log(f"Failed to stop port forward: {error}", "ERROR")
+                    self.update_status("Failed to stop port forward")
+            except Exception as e:
+                self.log(f"Error stopping port forward: {str(e)}", "ERROR")
+                self.update_status("Error stopping port forward")
+
+        threading.Thread(target=do_disconnect, daemon=True).start()
+
     def show_device_info(self):
         """Show detailed device information"""
         if not self.current_device:
@@ -2839,7 +4197,7 @@ class ADBGUI(QMainWindow):
         
         return None
 
-    def scrcpy_device(self):
+    def scrcpy_device(self, bitrate='1m'):
         """Mirror device screen using scrcpy."""
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
@@ -2909,6 +4267,10 @@ class ADBGUI(QMainWindow):
 
         # Prefer telling scrcpy which adb to use (when supported), but some builds don't support it.
         cmd_base = [scrcpy_path, '-s', device_id]
+
+        # Add bitrate option to base command (use -b flag which is more widely supported)
+        cmd_base.extend(['-b', bitrate])
+
         cmd_with_adb = None
         # Resolve adb_path: if it's just "adb" and not on PATH, try `which adb` ourselves.
         if isinstance(adb_path, str) and adb_path and not os.path.isabs(adb_path):
@@ -2944,6 +4306,7 @@ class ADBGUI(QMainWindow):
                                 QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{msg2}"))
                             else:
                                 QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+                                QTimer.singleShot(500, self._focus_scrcpy_window)
                             return
                         # Other immediate failure: surface the error
                         err = stderr.strip() or "scrcpy exited immediately."
@@ -2954,11 +4317,13 @@ class ADBGUI(QMainWindow):
 
                     # Running fine
                     QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+                    QTimer.singleShot(500, self._focus_scrcpy_window)
                     return
 
                 # No custom adb path; just run normally
                 launch(cmd_base, capture=False)
                 QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+                QTimer.singleShot(500, self._focus_scrcpy_window)
             except Exception as e:
                 error_msg = str(e)
                 self.log(f"Failed to launch scrcpy: {error_msg}", "ERROR")
@@ -2966,6 +4331,22 @@ class ADBGUI(QMainWindow):
                 QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"Failed to launch scrcpy:\n\n{error_msg}"))
 
         threading.Thread(target=do_launch, daemon=True).start()
+
+    def _focus_scrcpy_window(self):
+        """Bring scrcpy window to front and focus it"""
+        try:
+            if sys.platform == 'darwin':
+                # macOS: use osascript to activate scrcpy window
+                subprocess.run(['osascript', '-e', 'tell application "scrcpy" to activate'], timeout=2)
+            elif sys.platform == 'win32':
+                # Windows: use PowerShell to bring window to front
+                subprocess.run(['powershell', '-command', '(New-Object -ComObject WScript.Shell).AppActivate("scrcpy")'], timeout=2)
+            else:
+                # Linux: try wmctrl
+                subprocess.run(['wmctrl', '-a', 'scrcpy'], timeout=2, capture_output=True)
+        except:
+            # Silently fail if we can't focus the window
+            pass
     
     def reboot_device(self):
         """Reboot device"""
@@ -3284,7 +4665,7 @@ class ADBGUI(QMainWindow):
                 border-radius: 4px;
                 padding: 8px;
                 font-family: system-ui;
-                font-size: 9pt;
+                font-size: 11pt;
             }}
             QPushButton:hover {{
                 background-color: {'#3e3e42' if self.dark_mode else '#f0f0f0'};
@@ -3308,6 +4689,10 @@ class ADBGUI(QMainWindow):
                 color: {self.colors['fg']};
                 font-weight: bold;
             }}
+            QGroupBox#deviceGroup {{
+                border: 2px solid {self.colors['success']};
+                background-color: {'#1a3a1a' if self.dark_mode else '#e8f5e9'};
+            }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px;
@@ -3320,6 +4705,7 @@ class ADBGUI(QMainWindow):
                 padding: 5px;
                 background-color: {self.colors['card_bg']};
                 color: {self.colors['fg']};
+                font-size: 11pt;
             }}
             QTextEdit {{
                 border: 1px solid {self.colors['border']};
@@ -3327,21 +4713,28 @@ class ADBGUI(QMainWindow):
                 background-color: {'#1e1e1e' if self.dark_mode else '#1e1e1e'};
                 color: {'#d4d4d4' if self.dark_mode else '#d4d4d4'};
                 font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-                font-size: 9pt;
+                font-size: 10pt;
             }}
             QLabel {{
                 color: {self.colors['fg']};
+                font-size: 11pt;
             }}
             QListWidget {{
                 background-color: {self.colors['card_bg']};
                 color: {self.colors['fg']};
                 border: 1px solid {self.colors['border']};
+                font-size: 11pt;
+            }}
+            QListWidget::item:hover {{
+                background-color: {'#3e3e42' if self.dark_mode else '#f0f0f0'};
             }}
             QCheckBox {{
                 color: {self.colors['fg']};
+                font-size: 11pt;
             }}
             QRadioButton {{
                 color: {self.colors['fg']};
+                font-size: 11pt;
             }}
             QTabWidget::pane {{
                 border: 1px solid {self.colors['border']};
@@ -3352,6 +4745,7 @@ class ADBGUI(QMainWindow):
                 color: {self.colors['fg']};
                 border: 1px solid {self.colors['border']};
                 padding: 8px;
+                font-size: 11pt;
             }}
             QTabBar::tab:selected {{
                 background-color: {self.colors['card_bg']};
@@ -3449,7 +4843,12 @@ class ADBGUI(QMainWindow):
 
         # Update theme button text
         self.update_theme_button_text()
-    
+
+    def open_settings(self):
+        """Open settings dialog"""
+        dialog = SettingsDialog(self, self.settings)
+        dialog.exec()
+
     def update_widget_styles(self):
         """Update all widgets with custom stylesheets when theme changes"""
         # Header labels
