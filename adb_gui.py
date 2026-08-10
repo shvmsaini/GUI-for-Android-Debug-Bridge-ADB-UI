@@ -7,7 +7,15 @@ import tempfile
 import json
 import shutil
 import time
+import re
 from datetime import datetime
+
+# Platform-specific imports
+if sys.platform == 'win32':
+    try:
+        import winreg
+    except ImportError:
+        import _winreg as winreg
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -348,11 +356,14 @@ class ADBGUI(QMainWindow):
         self.settings_file = os.path.join(project_dir, 'settings.json')
         self.settings = self.load_settings()
         
-        # Load dark mode preference
-        self.dark_mode = self.settings.get('dark_mode', False)
-        
+        # Load theme preference: 'light', 'dark', or 'system'
+        self.theme_mode = self.settings.get('theme_mode', 'system')
+
         # Apply theme based on preference
         self.apply_theme()
+
+        # Update theme button text
+        self.update_theme_button_text()
         
         # Check for saved ADB path in settings
         saved_adb_path = self.settings.get('adb_path', None)
@@ -438,11 +449,11 @@ class ADBGUI(QMainWindow):
         header_layout.addWidget(self.subtitle_label)
         header_layout.addStretch()
         
-        # Dark mode toggle button
-        self.dark_mode_btn = QPushButton("🌙 Dark Mode" if not self.dark_mode else "☀️ Light Mode")
-        self.dark_mode_btn.setMaximumWidth(120)
-        self.dark_mode_btn.clicked.connect(self.toggle_dark_mode)
-        header_layout.addWidget(self.dark_mode_btn)
+        # Theme selection button
+        self.theme_btn = QPushButton("🎨 System Theme")
+        self.theme_btn.setMaximumWidth(130)
+        self.theme_btn.clicked.connect(self.cycle_theme)
+        header_layout.addWidget(self.theme_btn)
         
         main_layout.addLayout(header_layout)
         
@@ -519,8 +530,17 @@ class ADBGUI(QMainWindow):
         
         # App operations
         app_group = self.create_card("📱 App Management")
-        self.create_button(app_group, "📦 Install APK", self.install_apk)
-        self.create_button(app_group, "🗑️ Uninstall App", self.uninstall_app)
+
+        # Install and uninstall in a single row (like push/pull)
+        app_actions_row = QHBoxLayout()
+        install_btn = QPushButton("📦 Install APK")
+        install_btn.clicked.connect(self.install_apk)
+        uninstall_btn = QPushButton("🗑️ Uninstall App")
+        uninstall_btn.clicked.connect(self.uninstall_app)
+        app_actions_row.addWidget(install_btn)
+        app_actions_row.addWidget(uninstall_btn)
+        app_group.layout().addLayout(app_actions_row)
+
         self.create_button(app_group, "♻️ Reinstall for User", self.reinstall_for_user)
         self.create_button(app_group, "📋 List Installed Apps", self.list_apps)
         self.create_button(app_group, "📂 Open APKs Folder", self.open_apks_folder)
@@ -581,25 +601,54 @@ class ADBGUI(QMainWindow):
         self.logs_group = QGroupBox("📊 Logs & Output")
         # Styles are applied globally via apply_theme
         logs_layout = QVBoxLayout(self.logs_group)
-        
-        # Logcat controls
+
+        # Log controls
         log_controls = QHBoxLayout()
-        self.log_button = QPushButton("▶️ Start Logcat")
-        self.log_button.clicked.connect(self.toggle_logcat)
-        log_controls.addWidget(self.log_button)
-        
+
+        # Toggle between App Logs and Logcat
+        self.log_view_button = QPushButton("📱 Show Logcat")
+        self.log_view_button.clicked.connect(self.toggle_log_view)
+        log_controls.addWidget(self.log_view_button)
+
+        self.logcat_button = QPushButton("▶️ Start")
+        self.logcat_button.clicked.connect(self.toggle_logcat)
+        self.logcat_button.setVisible(False)  # Hidden by default, shown when in logcat view
+        log_controls.addWidget(self.logcat_button)
+
+        # Logcat filter (hidden by default)
+        self.logcat_filter_label = QLabel("Filter:")
+        self.logcat_filter_label.setVisible(False)
+        log_controls.addWidget(self.logcat_filter_label)
+
+        self.logcat_filter_entry = QLineEdit()
+        self.logcat_filter_entry.setPlaceholderText("e.g., *:E")
+        self.logcat_filter_entry.setMaximumWidth(100)
+        self.logcat_filter_entry.setVisible(False)
+        log_controls.addWidget(self.logcat_filter_entry)
+
         clear_btn = QPushButton("🗑️ Clear")
-        clear_btn.clicked.connect(self.clear_output)
+        clear_btn.clicked.connect(self.clear_current_log)
         log_controls.addWidget(clear_btn)
+
         log_controls.addStretch()
         logs_layout.addLayout(log_controls)
-        
-        # Output text area
+
+        # Output text area (shared between app logs and logcat)
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setFont(QFont('Consolas', 9))
         logs_layout.addWidget(self.output_text)
-        
+
+        # Logcat text area (hidden by default)
+        self.logcat_text = QTextEdit()
+        self.logcat_text.setReadOnly(True)
+        self.logcat_text.setFont(QFont('Consolas', 9))
+        self.logcat_text.setVisible(False)
+        logs_layout.addWidget(self.logcat_text)
+
+        # Track current view
+        self.showing_logcat = False
+
         content_layout.addWidget(self.logs_group, 2)
         main_layout.addLayout(content_layout, 1)
         
@@ -640,8 +689,49 @@ class ADBGUI(QMainWindow):
         scrollbar.setValue(scrollbar.maximum())
     
     def clear_output(self):
-        """Clear output text"""
+        """Clear app logs output text"""
         self.output_text.clear()
+
+    def clear_logcat(self):
+        """Clear logcat output text"""
+        self.logcat_text.clear()
+
+    def clear_current_log(self):
+        """Clear the currently visible log area"""
+        if self.showing_logcat:
+            self.logcat_text.clear()
+        else:
+            self.output_text.clear()
+
+    def toggle_log_view(self):
+        """Toggle between App Logs and Logcat view"""
+        self.showing_logcat = not self.showing_logcat
+
+        if self.showing_logcat:
+            # Switch to Logcat view
+            self.output_text.setVisible(False)
+            self.logcat_text.setVisible(True)
+            self.log_view_button.setText("📋 Show Logs")
+            self.logcat_button.setVisible(True)
+            self.logcat_filter_label.setVisible(True)
+            self.logcat_filter_entry.setVisible(True)
+        else:
+            # Switch to App Logs view
+            self.output_text.setVisible(True)
+            self.logcat_text.setVisible(False)
+            self.log_view_button.setText("📱 Show Logcat")
+            self.logcat_button.setVisible(False)
+            self.logcat_filter_label.setVisible(False)
+            self.logcat_filter_entry.setVisible(False)
+
+    def log_to_logcat(self, message):
+        """Add message to logcat output area"""
+        # Debug: log to app logs too
+        self.log(f"[LOGCAT] {message[:100]}{'...' if len(message) > 100 else ''}")
+        self.logcat_text.append(message)
+        # Auto-scroll to bottom
+        scrollbar = self.logcat_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
     
     def update_status(self, message):
         """Update status bar"""
@@ -1763,6 +1853,7 @@ class ADBGUI(QMainWindow):
         self.update_status("Fetching apps...")
         
         def do_list():
+            # Get list of packages first
             result = self.adb.run_command(f"{self.get_device_flag()} shell pm list packages")
             if result['success']:
                 apps = result['stdout'].strip().split('\n')
@@ -1770,7 +1861,8 @@ class ADBGUI(QMainWindow):
                 self.log(f"Found {len(apps)} installed apps")
                 self.update_status(f"Found {len(apps)} apps")
                 
-                # Show in an interactive window (thread-safe via signal)
+                # Show apps immediately with empty versions
+                # Versions will be fetched asynchronously after the window is shown
                 self.app_list_ready.emit(sorted(apps))
             else:
                 error_msg = result.get('stderr', 'Unknown error')
@@ -1786,7 +1878,7 @@ class ADBGUI(QMainWindow):
         """Show interactive app list window with uninstall/reinstall buttons"""
         app_window = QDialog(self)
         app_window.setWindowTitle("Installed Apps")
-        app_window.setMinimumSize(700, 500)
+        app_window.setMinimumSize(800, 500)
         app_window.setModal(True)
         
         layout = QVBoxLayout(app_window)
@@ -1795,7 +1887,7 @@ class ADBGUI(QMainWindow):
         
         # Search frame
         search_layout = QHBoxLayout()
-        search_label = QLabel("Search (by app name or package):")
+        search_label = QLabel("Search (by app name, package, or version):")
         search_layout.addWidget(search_label)
         
         search_entry = QLineEdit()
@@ -1813,6 +1905,9 @@ class ADBGUI(QMainWindow):
         
         # Store original apps list in window attribute so refresh can access it
         app_window.original_apps = apps.copy()
+        
+        # Store app versions (will be populated asynchronously)
+        app_window.app_versions = {}
         
         # Store app labels (package_name -> app_label)
         app_window.app_labels = {}
@@ -1844,19 +1939,25 @@ class ADBGUI(QMainWindow):
                 # Check if app is disabled
                 is_disabled = app_window.app_status.get(app, False)
                 
+                # Get app version
+                app_version = app_window.app_versions.get(app, '')
+                
                 # Apply disabled filter
                 if filter_disabled and not is_disabled:
                     continue
                 
-                # Check if search term matches app name or package name
+                # Check if search term matches app name, package name, or version
                 matches = False
                 if not search_term:
                     matches = True
-                elif search_term in app_label.lower() or search_term in app.lower():
+                elif search_term in app_label.lower() or search_term in app.lower() or search_term in app_version.lower():
                     matches = True
                 
                 if matches:
                     display_name = display_label
+                    # Add version if available
+                    if app_version:
+                        display_name += f" v{app_version}"
                     if is_disabled:
                         display_name += " [DISABLED]"
                     listbox.addItem(display_name)
@@ -1887,11 +1988,44 @@ class ADBGUI(QMainWindow):
                 self.log("Warning: No app labels found. Labels may be stored as resource IDs.", "WARNING")
             QTimer.singleShot(0, lambda: update_list())
         
+        # Load app versions in background
+        def load_app_versions():
+            """Load app versions for all apps asynchronously"""
+            self.log("Loading app versions...")
+            versions_found = 0
+            for i, package in enumerate(apps):
+                if i % 50 == 0:
+                    self.log(f"Loading versions {i}/{len(apps)}...")
+                    self.update_status(f"Loading versions {i}/{len(apps)}...")
+                
+                # Get version name using dumpsys package
+                version_result = self.adb.run_command(f"{self.get_device_flag()} shell dumpsys package {package}")
+                if version_result['success'] and version_result['stdout']:
+                    output = version_result['stdout']
+                    # Look for versionName in the output
+                    for line in output.split('\n'):
+                        line_stripped = line.strip()
+                        if line_stripped.startswith('versionName='):
+                            version = line_stripped.split('=', 1)[1].strip()
+                            if version:
+                                app_window.app_versions[package] = version
+                                versions_found += 1
+                                # Update the list every 10 versions to show progress
+                                if versions_found % 10 == 0:
+                                    QTimer.singleShot(0, lambda: update_list())
+                                break
+            
+            self.log(f"Loaded versions for {versions_found}/{len(apps)} apps")
+            self.update_status(f"Found {len(apps)} apps")
+            # Final update to show all versions
+            QTimer.singleShot(0, lambda: update_list())
+        
         search_entry.textChanged.connect(update_list)
         filter_checkbox.stateChanged.connect(lambda: update_list())
         
-        # Start loading labels in background
+        # Start loading labels and versions in background
         threading.Thread(target=load_app_labels, daemon=True).start()
+        threading.Thread(target=load_app_versions, daemon=True).start()
         
         # Initial list (will show package names until labels load)
         update_list()
@@ -1900,13 +2034,15 @@ class ADBGUI(QMainWindow):
         button_layout = QHBoxLayout()
         
         def get_selected_package():
-            """Extract package name from listbox selection (handles app name and [DISABLED] marker)"""
+            """Extract package name from listbox selection (handles app name, version, and [DISABLED] marker)"""
             current_item = listbox.currentItem()
             if not current_item:
                 return None
             display_text = current_item.text()
             # Remove [DISABLED] marker if present
             display_text = display_text.replace(' [DISABLED]', '').strip()
+            # Remove version string like " v1.0.0" if present
+            display_text = re.sub(r'\s+v[\d.]+$', '', display_text).strip()
             # Extract package name from format "App Name (package.name)"
             if '(' in display_text and ')' in display_text:
                 package_name = display_text.split('(')[-1].rstrip(')').strip()
@@ -2742,15 +2878,44 @@ class ADBGUI(QMainWindow):
         adb_path = getattr(self.adb, 'adb_path', 'adb') if hasattr(self, 'adb') else 'adb'
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
 
+        # Resolve adb_path to an absolute path so we can pass it to scrcpy via --adb or $ADB.
+        if isinstance(adb_path, str) and adb_path and not os.path.isabs(adb_path):
+            resolved = shutil.which(adb_path)
+            if resolved:
+                adb_path = resolved
+            else:
+                for p in ('/opt/homebrew/bin/adb', '/usr/local/bin/adb', '/usr/bin/adb'):
+                    if os.path.exists(p):
+                        adb_path = p
+                        break
+
         def launch(cmd, capture=False):
+            # Ensure scrcpy subprocess can find adb even when the GUI was launched
+            # from a non-interactive shell that didn't source .zshrc / .bashrc.
+            env = os.environ.copy()
+            extra_paths = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']
+            current = env.get('PATH', '')
+            for p in extra_paths:
+                if p not in current.split(':'):
+                    env['PATH'] = p + ':' + current
+            # Some scrcpy versions ship their own minimal PATH that ignores the
+            # parent env. Set the ADB env var to the absolute path so scrcpy's
+            # own "Command not found: [adb]" branch never fires.
+            if isinstance(adb_path, str) and adb_path and os.path.isabs(adb_path) and os.path.exists(adb_path):
+                env['ADB'] = adb_path
             if capture:
-                return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', creationflags=creationflags)
-            return subprocess.Popen(cmd, creationflags=creationflags)
+                return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', creationflags=creationflags, env=env)
+            return subprocess.Popen(cmd, creationflags=creationflags, env=env)
 
         # Prefer telling scrcpy which adb to use (when supported), but some builds don't support it.
         cmd_base = [scrcpy_path, '-s', device_id]
         cmd_with_adb = None
-        if isinstance(adb_path, str) and os.path.exists(adb_path):
+        # Resolve adb_path: if it's just "adb" and not on PATH, try `which adb` ourselves.
+        if isinstance(adb_path, str) and adb_path and not os.path.isabs(adb_path):
+            resolved = shutil.which(adb_path)
+            if resolved:
+                adb_path = resolved
+        if isinstance(adb_path, str) and adb_path and os.path.exists(adb_path):
             # scrcpy uses "--adb <path>" (not "--adb=<path>") on many versions
             cmd_with_adb = cmd_base + ['--adb', adb_path]
 
@@ -2768,8 +2933,17 @@ class ADBGUI(QMainWindow):
                         if 'unrecognized option' in stderr.lower() and '--adb' in stderr:
                             self.log("scrcpy does not support '--adb'. Launching without it.", "WARNING")
                             QTimer.singleShot(0, lambda: self.update_status("Launching scrcpy (fallback)..."))
-                            launch(cmd_base, capture=False)
-                            QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+                            # Capture stderr on the fallback too so we don't fail silently.
+                            p2 = launch(cmd_base, capture=True)
+                            time.sleep(0.5)
+                            if p2.poll() is not None:
+                                err2 = (p2.stderr.read() if p2.stderr else '') or ''
+                                msg2 = err2.strip() or "scrcpy exited immediately."
+                                self.log(f"scrcpy failed to start: {msg2}", "ERROR")
+                                QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
+                                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{msg2}"))
+                            else:
+                                QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
                             return
                         # Other immediate failure: surface the error
                         err = stderr.strip() or "scrcpy exited immediately."
@@ -2943,88 +3117,102 @@ class ADBGUI(QMainWindow):
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
-        
+
         if self.log_running:
             self.log_running = False
-            self.log_button.setText("▶️ Start Logcat")
+            self.logcat_button.setText("▶️ Start")
             self.log("Logcat stopped")
             self.update_status("Logcat stopped")
         else:
             self.log_running = True
-            self.log_button.setText("⏹️ Stop Logcat")
+            self.logcat_button.setText("⏹️ Stop")
             self.log("Starting logcat...")
             self.update_status("Logcat running...")
-            
+
+            # Switch to logcat view automatically
+            if not self.showing_logcat:
+                self.toggle_log_view()
+
             def run_logcat():
                 try:
                     # Store device ID for thread safety
                     device_id = self.current_device
-                    
+
+                    # Get filter from entry
+                    logcat_filter = self.logcat_filter_entry.text().strip()
+
+                    # Build logcat command
+                    cmd = [self.adb.adb_path, '-s', device_id, 'logcat']
+                    if logcat_filter:
+                        cmd.append(logcat_filter)
+
+                    self.log(f"Running logcat command: {' '.join(cmd)}")
+                    QTimer.singleShot(0, lambda: self.log_to_logcat(f"[COMMAND] {' '.join(cmd)}"))
+
                     process = subprocess.Popen(
-                        [self.adb.adb_path, '-s', device_id, 'logcat'],
+                        cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
                         encoding='utf-8',
                         errors='replace',
-                        bufsize=1,
+                        universal_newlines=True,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                     )
-                    
-                    # Check if process started successfully
-                    if process.poll() is not None:
-                        # Process already terminated
-                        stderr_output = process.stderr.read()
-                        error_msg = f"Logcat process failed to start: {stderr_output}"
-                        QTimer.singleShot(0, lambda: self.log(error_msg, "ERROR"))
-                        QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Logcat Error", error_msg))
-                        self.log_running = False
-                        QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
-                        return
-                    
-                    # Log that logcat started successfully
-                    QTimer.singleShot(0, lambda: self.log("Logcat process started, waiting for output...", "INFO"))
-                    
-                    # Read output line by line
+
+                    self.log(f"Logcat process started with PID: {process.pid}")
+                    QTimer.singleShot(0, lambda: self.log_to_logcat(f"[STARTED] Logcat running for device {device_id}..."))
+
+                    # Read output line by line using simple blocking read
                     while self.log_running:
-                        line = process.stdout.readline()
-                        if line:
-                            # Use a closure to capture the line value properly
-                            line_text = line.strip()
-                            if line_text:  # Only log non-empty lines
-                                QTimer.singleShot(0, lambda l=line_text: self.log(l, "LOGCAT"))
-                        elif process.poll() is not None:
-                            # Process ended
+                        try:
+                            # Check if process is still running
+                            if process.poll() is not None:
+                                self.log("Logcat process ended")
+                                break
+
+                            # Try to read a line
+                            line = process.stdout.readline()
+                            if line:
+                                line_text = line.rstrip('\n\r')
+                                if line_text:
+                                    # Use QTimer to safely update UI from another thread
+                                    QTimer.singleShot(0, lambda l=line_text: self.log_to_logcat(l))
+                            else:
+                                # No data available, check if process ended
+                                if process.poll() is not None:
+                                    self.log("Logcat process ended (no more output)")
+                                    break
+                                # Small sleep to prevent busy waiting
+                                time.sleep(0.01)
+                        except Exception as read_err:
+                            self.log(f"Error reading logcat: {read_err}", "ERROR")
                             break
-                    
-                    # Clean up
+
+                    # Clean up process
                     if process.poll() is None:
+                        self.log("Terminating logcat process...")
                         process.terminate()
                         try:
                             process.wait(timeout=2)
                         except subprocess.TimeoutExpired:
+                            self.log("Force killing logcat process...")
                             process.kill()
-                    
-                    if self.log_running:
-                        # Process ended unexpectedly
-                        stderr_output = process.stderr.read()
-                        if stderr_output:
-                            QTimer.singleShot(0, lambda: self.log(f"Logcat process ended: {stderr_output}", "ERROR"))
-                        else:
-                            QTimer.singleShot(0, lambda: self.log("Logcat process ended unexpectedly", "WARNING"))
-                        self.log_running = False
-                        QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
-                        
+
+                    self.log_running = False
+                    QTimer.singleShot(0, lambda: self.logcat_button.setText("▶️ Start"))
+                    QTimer.singleShot(0, lambda: self.log_to_logcat("[STOPPED] Logcat stopped"))
+
                 except Exception as e:
                     error_msg = f"Logcat error: {str(e)}"
+                    self.log(error_msg, "ERROR")
                     QTimer.singleShot(0, lambda: self.log(error_msg, "ERROR"))
                     QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Logcat Error", error_msg))
                     self.log_running = False
-                    QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
+                    QTimer.singleShot(0, lambda: self.logcat_button.setText("▶️ Start"))
                     import traceback
-                    QTimer.singleShot(0, lambda: self.log(f"Traceback: {traceback.format_exc()}", "ERROR"))
-            
-            self.current_device = self.current_device  # Store for logcat thread
+                    self.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+
             threading.Thread(target=run_logcat, daemon=True).start()
     
     def load_settings(self):
@@ -3065,6 +3253,15 @@ class ADBGUI(QMainWindow):
     
     def apply_theme(self):
         """Apply light or dark theme"""
+        # Determine if dark mode should be active
+        if self.theme_mode == 'system':
+            # Use system preference
+            self.dark_mode = self.is_system_dark_mode()
+        elif self.theme_mode == 'dark':
+            self.dark_mode = True
+        else:  # 'light'
+            self.dark_mode = False
+
         if self.dark_mode:
             self.colors = self.dark_colors.copy()
         else:
@@ -3175,19 +3372,83 @@ class ADBGUI(QMainWindow):
         if hasattr(self, 'adb_path_label'):
             self.adb_path_label.setStyleSheet(f"color: {self.colors['text_tertiary']};")
     
-    def toggle_dark_mode(self):
-        """Toggle dark mode on/off"""
-        self.dark_mode = not self.dark_mode
-        self.settings['dark_mode'] = self.dark_mode
+    def is_system_dark_mode(self):
+        """Check if the system is in dark mode"""
+        try:
+            if sys.platform == 'darwin':
+                # macOS: Check for `defaults read -g AppleInterfaceStyle`
+                # Returns "Dark" if dark mode is enabled
+                result = subprocess.run(['defaults', 'read', '-g', 'AppleInterfaceStyle'],
+                                      capture_output=True, text=True)
+                return result.stdout.strip() == 'Dark'
+            elif sys.platform == 'win32':
+                # Windows: Check registry
+                try:
+                    winreg_module = sys.modules.get('winreg')
+                    if winreg_module:
+                        winreg = winreg_module
+                    else:
+                        import winreg
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                       r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize')
+                    value, _ = winreg.QueryValueEx(key, 'AppsUseLightTheme')
+                    winreg.CloseKey(key)
+                    return value == 0  # 0 = dark, 1 = light
+                except:
+                    return False
+            elif sys.platform.startswith('linux'):
+                # Linux: Check for common environment variables
+                return os.environ.get('GTK_THEME', '').lower().find('dark') != -1
+            return False
+        except:
+            return False
+
+    def update_theme_button_text(self):
+        """Update the theme button text based on current theme mode"""
+        if hasattr(self, 'theme_btn'):
+            if self.theme_mode == 'system':
+                mode_name = 'System'
+            elif self.theme_mode == 'light':
+                mode_name = 'Light'
+            else:
+                mode_name = 'Dark'
+            self.theme_btn.setText(f"🎨 {mode_name} Theme")
+
+    def cycle_theme(self):
+        """Cycle through theme modes: system -> light -> dark -> system"""
+        modes = ['system', 'light', 'dark']
+        current_index = modes.index(self.theme_mode)
+        self.theme_mode = modes[(current_index + 1) % len(modes)]
+
+        self.settings['theme_mode'] = self.theme_mode
         self.save_settings()
         self.apply_theme()
-        
+
         # Update all UI elements that have custom styles
         self.update_widget_styles()
-        
-        # Update dark mode button text
-        if hasattr(self, 'dark_mode_btn'):
-            self.dark_mode_btn.setText("🌙 Dark Mode" if not self.dark_mode else "☀️ Light Mode")
+
+        # Update theme button text
+        self.update_theme_button_text()
+
+    def toggle_dark_mode(self):
+        """Deprecated: Toggle dark mode on/off (use cycle_theme instead)"""
+        # Convert old theme to new theme mode
+        if self.theme_mode == 'system':
+            self.theme_mode = 'dark'
+        elif self.theme_mode == 'light':
+            self.theme_mode = 'dark'
+        else:  # dark
+            self.theme_mode = 'light'
+
+        self.settings['theme_mode'] = self.theme_mode
+        self.save_settings()
+        self.apply_theme()
+
+        # Update all UI elements that have custom styles
+        self.update_widget_styles()
+
+        # Update theme button text
+        self.update_theme_button_text()
     
     def update_widget_styles(self):
         """Update all widgets with custom stylesheets when theme changes"""
