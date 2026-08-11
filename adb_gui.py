@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QDialog, QListWidget, QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup, QTabWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
 
 
 class CredentialManager:
@@ -227,7 +227,20 @@ class SeatPortManager:
 
     def get_portforward_status(self):
         """Get current port forward status from script
-        Returns dict with 'active', 'rack', 'headend', 'user', 'pid' or None
+        Returns dict with 'active', 'rack', 'headend', 'user', 'pid', 'ports' or None
+
+        Expected script output (when active):
+            Port forwarding is ACTIVE.
+            Rack: <hostname>
+            Headend: <partition>
+            User: <username>
+            Ports:
+              80 ✓
+              443 ✓
+              ...
+
+        When inactive:
+            Port forwarding is NOT ACTIVE.
         """
         try:
             script_path = self.log_callback.__self__.settings.get('portforward_script_path', 'portForwardRack.sh') if hasattr(self.log_callback, '__self__') else 'portForwardRack.sh'
@@ -235,25 +248,48 @@ class SeatPortManager:
                 [script_path, 'status'],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode == 0:
-                status = {'active': True, 'raw': result.stdout}
-                # Parse the output
-                for line in result.stdout.split('\n'):
-                    line = line.strip()
-                    if line.startswith('Rack:'):
-                        status['rack'] = line.split(':', 1)[1].strip()
-                    elif line.startswith('Headend:'):
-                        status['headend'] = line.split(':', 1)[1].strip()
-                    elif line.startswith('User:'):
-                        status['user'] = line.split(':', 1)[1].strip()
-                    elif line.startswith('PID:'):
-                        try:
-                            status['pid'] = int(line.split(':', 1)[1].strip())
-                        except:
-                            pass
-                return status
-            else:
-                return {'active': False, 'raw': result.stdout + result.stderr}
+            raw = (result.stdout or '') + (result.stderr or '')
+
+            # The script exits 0 in BOTH active and inactive states, so we have
+            # to look at the first line to decide.
+            status = {'active': False, 'raw': raw}
+            in_ports_section = False
+            ports = []
+            for line in raw.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                lower = line.lower()
+                if 'port forwarding is active' in lower and 'not active' not in lower:
+                    status['active'] = True
+                elif 'port forwarding is not active' in lower:
+                    status['active'] = False
+                elif line.startswith('Rack:'):
+                    status['rack'] = line.split(':', 1)[1].strip()
+                elif line.startswith('Headend:'):
+                    status['headend'] = line.split(':', 1)[1].strip()
+                elif line.startswith('User:'):
+                    status['user'] = line.split(':', 1)[1].strip()
+                elif line.startswith('PID:'):
+                    try:
+                        status['pid'] = int(line.split(':', 1)[1].strip())
+                    except Exception:
+                        pass
+                elif line.startswith('Ports:'):
+                    in_ports_section = True
+                elif in_ports_section and line:
+                    # Each entry looks like "80 ✓" or "443 ✗"
+                    parts = line.split()
+                    if parts:
+                        ports.append({
+                            'port': parts[0],
+                            'ok': '✓' in line or 'ok' in lower,
+                        })
+
+            if ports:
+                status['ports'] = ports
+
+            return status
         except Exception as e:
             return {'active': False, 'error': str(e)}
 
@@ -543,6 +579,18 @@ class SettingsDialog(QDialog):
         snippet_label = QLabel("Bash Command Snippet:")
         layout.addWidget(snippet_label)
 
+        variables_hint = QLabel(
+            "Available variables (substituted before running):\n"
+            "  $SELECTED_SEAT          — currently connected seat\n"
+            "  $SELECTED_PORTFORWARD   — currently connected port-forward gateway\n"
+            "  $CURRENT_DEVICE         — currently selected ADB device id\n"
+            "  $DEVICE_SERIAL          — alias for $CURRENT_DEVICE\n"
+            "  $ADB_PATH               — configured adb executable path"
+        )
+        variables_hint.setStyleSheet("color: #666; font-size: 9pt; font-family: Consolas, monospace;")
+        variables_hint.setWordWrap(True)
+        layout.addWidget(variables_hint)
+
         snippet_edit = QTextEdit()
         snippet_edit.setPlaceholderText("e.g., adb kill-server && adb start-server\nor: adb shell getprop | grep model")
         snippet_edit.setMinimumHeight(200)
@@ -606,6 +654,18 @@ class SettingsDialog(QDialog):
         # Snippet
         snippet_label = QLabel("Bash Command Snippet:")
         layout.addWidget(snippet_label)
+
+        variables_hint = QLabel(
+            "Available variables (substituted before running):\n"
+            "  $SELECTED_SEAT          — currently connected seat\n"
+            "  $SELECTED_PORTFORWARD   — currently connected port-forward gateway\n"
+            "  $CURRENT_DEVICE         — currently selected ADB device id\n"
+            "  $DEVICE_SERIAL          — alias for $CURRENT_DEVICE\n"
+            "  $ADB_PATH               — configured adb executable path"
+        )
+        variables_hint.setStyleSheet("color: #666; font-size: 9pt; font-family: Consolas, monospace;")
+        variables_hint.setWordWrap(True)
+        layout.addWidget(variables_hint)
 
         snippet_edit = QTextEdit()
         snippet_edit.setPlainText(cmd.get('snippet', ''))
@@ -961,7 +1021,7 @@ class ADBGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("ADB Tool")
         self.setGeometry(100, 100, 1600, 1000)
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(1250, 800)
         
         # Color schemes
         self.light_colors = {
@@ -1066,6 +1126,15 @@ class ADBGUI(QMainWindow):
         self.log_thread = None
         self.log_running = False
         self.device_buttons = {}  # Initialize device buttons dict
+        # Cache of the most recent device list from `adb devices -l`. Avoids
+        # running adb again when the user just clicks an already-known device.
+        self.cached_devices = []
+        # Active scrcpy processes, keyed by device id, so we can refuse
+        # duplicate launches and clean up if the GUI exits.
+        self.scrcpy_procs = {}
+
+        # Thread-safe UI caller (used to marshal UI updates from background threads)
+        self._ui_caller = _UICaller(self)
 
         # Initialize Seat/Port Manager
         self.seat_port_manager = SeatPortManager(log_callback=self.log)
@@ -1167,7 +1236,7 @@ class ADBGUI(QMainWindow):
 
         # Device selection row with buttons instead of combo
         device_row = QHBoxLayout()
-        device_row.addWidget(QLabel("Connected Devices:"))
+        device_row.addWidget(QLabel("Connected \nDevices:"))
 
         # Create button group for devices
         self.device_buttons = {}
@@ -1612,11 +1681,49 @@ class ADBGUI(QMainWindow):
         """Add message to logcat output area"""
         # Debug: log to app logs too
         self.log(f"[LOGCAT] {message[:100]}{'...' if len(message) > 100 else ''}")
-        self.logcat_text.append(message)
+        # Ensure widget is visible (in case toggle happened after start)
+        if not self.logcat_text.isVisible():
+            self.logcat_text.setVisible(True)
+            self.logcat_text.show()
+        # Use insertPlainText for better control (PyQt6 uses MoveOperation enum)
+        self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
+        self.logcat_text.insertPlainText(message + "\n")
         # Auto-scroll to bottom
         scrollbar = self.logcat_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-    
+        # Force immediate update of the widget
+        self.logcat_text.update()
+        self.logcat_text.repaint()
+
+    def _append_logcat_batch(self, lines):
+        """Append a batch of logcat lines in one UI update to avoid stutter."""
+        if not lines:
+            return
+        # Ensure widget is visible
+        if not self.logcat_text.isVisible():
+            self.logcat_text.setVisible(True)
+            self.logcat_text.show()
+        # Move cursor to end once, then insert the whole batch
+        self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
+        # Join with newlines; one trailing newline so each line breaks
+        self.logcat_text.insertPlainText("\n".join(lines) + "\n")
+        scrollbar = self.logcat_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        # Cap memory: keep only the last ~5000 lines to avoid the widget
+        # growing unbounded during long logcat sessions.
+        doc = self.logcat_text.document()
+        max_blocks = 5000
+        if doc.blockCount() > max_blocks:
+            cursor = self.logcat_text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.Down,
+                QTextCursor.MoveMode.KeepAnchor,
+                doc.blockCount() - max_blocks,
+            )
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # remove the leftover newline
+
     def update_status(self, message):
         """Update status bar"""
         self.status_bar.setText(message)
@@ -1677,6 +1784,10 @@ class ADBGUI(QMainWindow):
 
         # Combine: connected first, then others
         devices = connected_device_list + other_device_list
+
+        # Cache for instant device-info lookups from the UI thread (avoids
+        # running `adb devices -l` again on every button click).
+        self.cached_devices = list(devices)
 
         # Get current device list for comparison
         current_device_ids = set()
@@ -1746,14 +1857,22 @@ class ADBGUI(QMainWindow):
 
                 # Try to find SEAT for this device from seat.sh
                 seat_name = ""
+                gateway_name = ""
                 if device_id in seat_device_map:
                     seat_name = seat_device_map[device_id].get('seat', '')
+                    gateway_name = seat_device_map[device_id].get('gateway', '')
 
                 # If not found in seat.sh, try history
                 if not seat_name:
                     for seat_entry in self.seat_port_manager.load_history():
                         if seat_entry['seat'] == device_id or device_id in seat_entry['seat']:
                             seat_name = seat_entry['seat']
+                            # Gateway may include user@host; show only the host
+                            gw = seat_entry.get('gateway', '')
+                            if '@' in gw:
+                                gateway_name = gw.split('@', 1)[1]
+                            else:
+                                gateway_name = gw
                             break
 
                 # Create container widget with button and play button (no gap between them)
@@ -1765,13 +1884,16 @@ class ADBGUI(QMainWindow):
                 # Create button for this device
                 # If SEAT is available from seat.sh, use it as primary name with DEVICE as port
                 if seat_name:
-                    device_display = f"💺 {seat_name}\n📱 {device_id}"
+                    if gateway_name:
+                        device_display = f"💺 {seat_name}\n📡 {gateway_name}\n📱 {device_id}"
+                    else:
+                        device_display = f"💺 {seat_name}\n📱 {device_id}"
                 else:
                     device_display = f"📱 {display_name}\n{device_id}"
 
                 btn = QPushButton(device_display)
-                btn.setMinimumHeight(50)
-                btn.setMaximumHeight(50)
+                btn.setMinimumHeight(60)
+                btn.setMaximumHeight(60)
                 btn.setMinimumWidth(160)
                 btn.setMaximumWidth(160)
                 btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
@@ -1815,8 +1937,8 @@ class ADBGUI(QMainWindow):
                 play_btn = QPushButton("▶")
                 play_btn.setMaximumWidth(40)
                 play_btn.setMinimumWidth(40)
-                play_btn.setMaximumHeight(50)
-                play_btn.setMinimumHeight(50)
+                play_btn.setMaximumHeight(60)
+                play_btn.setMinimumHeight(60)
                 play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
                 play_btn.clicked.connect(lambda checked=False, did=device_id: self._launch_scrcpy_for_device(did))
                 play_btn.setToolTip("Mirror screen via scrcpy")
@@ -1877,15 +1999,30 @@ class ADBGUI(QMainWindow):
             else:
                 btn.setStyleSheet("")
 
-        # Update device info display
-        devices = self.adb.get_devices()
-        for d in devices:
-            if d['id'] == device_id:
-                model = d.get('model', 'Unknown')
-                status = d.get('status', 'unknown')
-                self.device_info_label.setText(f"✓ Selected: {model} - Status: {status}")
-                self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
+        # Look up device info from the cache we built during refresh_devices,
+        # so a click is instant. If we don't know the device yet, fall back
+        # to a synchronous adb query — better than blocking the UI thread
+        # every single time.
+        model = 'Unknown'
+        status = 'unknown'
+        for d in getattr(self, 'cached_devices', []):
+            if d.get('id') == device_id:
+                model = d.get('model') or 'Unknown'
+                status = d.get('status') or 'unknown'
                 break
+        else:
+            # Fallback: cache miss. Run a single, short adb query.
+            try:
+                for d in self.adb.get_devices(silent=True):
+                    if d.get('id') == device_id:
+                        model = d.get('model') or 'Unknown'
+                        status = d.get('status') or 'unknown'
+                        break
+            except Exception:
+                pass
+
+        self.device_info_label.setText(f"✓ Selected: {model} - Status: {status}")
+        self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
 
         self.log(f"Selected device: {device_id}")
 
@@ -2392,11 +2529,26 @@ class ADBGUI(QMainWindow):
         threading.Thread(target=do_disconnect, daemon=True).start()
 
     def connect_portforward(self, gateway, partition, user):
-        """Connect port forward"""
+        """Connect port forward.
+
+        `gateway` may be stored as either "host" or "user@host". The
+        portForwardRack.sh script typically does `ssh ${user}@${gateway}`
+        internally, so we have to hand it just the bare host — otherwise
+        we'd end up trying to ssh into "user@user@host".
+        """
         self.log(f"Setting up port forward for {gateway}...")
         self.update_status(f"Setting up port forward for {gateway}...")
 
+        # Strip any user@ prefix from the gateway so the script sees a bare
+        # hostname. The user is passed separately.
+        if '@' in gateway:
+            gateway_host = gateway.split('@', 1)[1]
+        else:
+            gateway_host = gateway
+
         # Get password from Keychain only (no plain text storage)
+        # Keychain is keyed by the original (possibly user@host) gateway so
+        # we still look up the right credential.
         password = self.credential_manager.get_password(gateway, user)
         if not password:
             password = self.credential_manager.prompt_password(self, gateway, user)
@@ -2411,7 +2563,7 @@ class ADBGUI(QMainWindow):
 
                 # Use sshpass if available, otherwise try with SSH_ASKPASS
                 if shutil.which('sshpass'):
-                    cmd = ['sshpass', '-p', password, script_path, gateway, partition, user]
+                    cmd = ['sshpass', '-p', password, script_path, gateway_host, partition, user]
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                     stdout, stderr = result.stdout, result.stderr
                     returncode = result.returncode
@@ -2426,7 +2578,7 @@ class ADBGUI(QMainWindow):
                     env['SSH_ASKPASS'] = askpass_file
                     env['SSH_ASKPASS_REQUIRE'] = 'force'
 
-                    cmd = [script_path, gateway, partition, user]
+                    cmd = [script_path, gateway_host, partition, user]
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
                     stdout, stderr = result.stdout, result.stderr
                     returncode = result.returncode
@@ -4413,7 +4565,20 @@ class ADBGUI(QMainWindow):
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
-        
+
+        # Refuse duplicate scrcpy for the same device. If one is already
+        # running, just bring its window to the front.
+        device_id = self.current_device
+        existing = self.scrcpy_procs.get(device_id)
+        if existing is not None:
+            if existing.poll() is None:
+                self.log(f"scrcpy is already running for {device_id}; focusing existing window")
+                self.update_status(f"scrcpy already running for {device_id}")
+                QTimer.singleShot(0, self._focus_scrcpy_window)
+                return
+            # Process died but we never cleaned up the entry
+            self.scrcpy_procs.pop(device_id, None)
+
         scrcpy_path = self.find_scrcpy()
         if not scrcpy_path:
             msg = (
@@ -4442,8 +4607,7 @@ class ADBGUI(QMainWindow):
         
         if not scrcpy_path:
             return
-        
-        device_id = self.current_device
+
         adb_path = getattr(self.adb, 'adb_path', 'adb') if hasattr(self, 'adb') else 'adb'
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
 
@@ -4495,6 +4659,23 @@ class ADBGUI(QMainWindow):
         self.log(f"Launching scrcpy for {device_id}...")
         self.update_status("Launching scrcpy...")
 
+        def register_proc(p):
+            """Track the scrcpy process so duplicates can be blocked later."""
+            self.scrcpy_procs[device_id] = p
+            # When scrcpy exits, drop it from the registry so the user can
+            # launch again without restarting the app.
+            def _on_exit():
+                if self.scrcpy_procs.get(device_id) is p:
+                    self.scrcpy_procs.pop(device_id, None)
+            try:
+                import threading as _threading
+                def _watch():
+                    p.wait()
+                    QTimer.singleShot(0, _on_exit)
+                _threading.Thread(target=_watch, daemon=True).start()
+            except Exception:
+                pass
+
         def do_launch():
             try:
                 if cmd_with_adb:
@@ -4516,6 +4697,7 @@ class ADBGUI(QMainWindow):
                                 QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
                                 QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{msg2}"))
                             else:
+                                register_proc(p2)
                                 QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
                                 QTimer.singleShot(500, self._focus_scrcpy_window)
                             return
@@ -4527,12 +4709,16 @@ class ADBGUI(QMainWindow):
                         return
 
                     # Running fine
+                    register_proc(p)
                     QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
                     QTimer.singleShot(500, self._focus_scrcpy_window)
                     return
 
                 # No custom adb path; just run normally
-                launch(cmd_base, capture=False)
+                # We still capture=False so scrcpy inherits the GUI's stdout,
+                # but we still get the Popen handle back so we can dedupe.
+                p = launch(cmd_base, capture=False)
+                register_proc(p)
                 QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
                 QTimer.singleShot(500, self._focus_scrcpy_window)
             except Exception as e:
@@ -4726,6 +4912,12 @@ class ADBGUI(QMainWindow):
                 self.toggle_log_view()
 
             def run_logcat():
+                process = None
+                # Batch lines so we don't flood the UI thread with one emit per line
+                pending_lines = []
+                last_flush = time.time()
+                FLUSH_INTERVAL = 0.1  # seconds
+                MAX_BATCH = 200  # max lines per batch
                 try:
                     # Store device ID for thread safety
                     device_id = self.current_device
@@ -4733,13 +4925,24 @@ class ADBGUI(QMainWindow):
                     # Get filter from entry
                     logcat_filter = self.logcat_filter_entry.text().strip()
 
-                    # Build logcat command
+                    # Build logcat command.
+                    # `adb logcat` accepts filter specs (tag:priority) as positional
+                    # arguments, but options like `-t 100` / `-d` are real flags. We
+                    # detect if the user typed something starting with `-` and pass it
+                    # through as a flag instead of a positional filter spec.
                     cmd = [self.adb.adb_path, '-s', device_id, 'logcat']
                     if logcat_filter:
-                        cmd.append(logcat_filter)
+                        if logcat_filter.startswith('-'):
+                            # Looks like a flag (e.g. "-t 100", "-d"); split on whitespace
+                            cmd.extend(shlex.split(logcat_filter))
+                        else:
+                            # Treat as filter spec(s). Multiple specs are space- or
+                            # comma-separated; adb accepts them as separate args.
+                            specs = [s for s in re.split(r'[\s,]+', logcat_filter) if s]
+                            cmd.extend(specs)
 
                     self.log(f"Running logcat command: {' '.join(cmd)}")
-                    QTimer.singleShot(0, lambda: self.log_to_logcat(f"[COMMAND] {' '.join(cmd)}"))
+                    self._ui_caller.call.emit(lambda: self.log_to_logcat(f"[COMMAND] {' '.join(cmd)}"))
 
                     process = subprocess.Popen(
                         cmd,
@@ -4749,13 +4952,31 @@ class ADBGUI(QMainWindow):
                         encoding='utf-8',
                         errors='replace',
                         universal_newlines=True,
+                        bufsize=1,  # Line-buffered for live output (text mode)
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                     )
 
                     self.log(f"Logcat process started with PID: {process.pid}")
-                    QTimer.singleShot(0, lambda: self.log_to_logcat(f"[STARTED] Logcat running for device {device_id}..."))
+                    self._ui_caller.call.emit(lambda: self.log_to_logcat(f"[STARTED] Logcat running for device {device_id}..."))
 
-                    # Read output line by line using simple blocking read
+                    def flush_batch():
+                        """Send accumulated lines to the UI thread in one shot."""
+                        nonlocal pending_lines
+                        if not pending_lines:
+                            return
+                        batch, pending_lines = pending_lines, []
+                        # Capture by value for the lambda
+                        self._ui_caller.call.emit(lambda b=batch: self._append_logcat_batch(b))
+
+                    def append_line(line_text):
+                        nonlocal pending_lines, last_flush
+                        pending_lines.append(line_text)
+                        now = time.time()
+                        if len(pending_lines) >= MAX_BATCH or (now - last_flush) >= FLUSH_INTERVAL:
+                            last_flush = now
+                            flush_batch()
+
+                    # Read output line by line using non-blocking approach
                     while self.log_running:
                         try:
                             # Check if process is still running
@@ -4763,26 +4984,51 @@ class ADBGUI(QMainWindow):
                                 self.log("Logcat process ended")
                                 break
 
-                            # Try to read a line
+                            # Try to read with a non-blocking approach
+                            # On Unix, use select; on Windows, we need different approach
+                            if sys.platform != 'win32':
+                                import select
+                                # Also check stderr in case of errors
+                                readable, _, _ = select.select(
+                                    [process.stdout, process.stderr], [], [], 0.1
+                                )
+                                # Check stderr first
+                                if process.stderr in readable:
+                                    err_line = process.stderr.readline()
+                                    if err_line:
+                                        err_text = err_line.rstrip('\n\r')
+                                        if err_text:
+                                            self.log(f"Logcat stderr: {err_text}", "ERROR")
+                                            append_line(f"[STDERR] {err_text}")
+                                        continue
+
+                                if process.stdout not in readable:
+                                    # No data — flush whatever batch we have so the
+                                    # user still sees timely updates while idle.
+                                    flush_batch()
+                                    continue
+
+                            # Read a line
                             line = process.stdout.readline()
                             if line:
                                 line_text = line.rstrip('\n\r')
                                 if line_text:
-                                    # Use QTimer to safely update UI from another thread
-                                    QTimer.singleShot(0, lambda l=line_text: self.log_to_logcat(l))
+                                    append_line(line_text)
                             else:
-                                # No data available, check if process ended
+                                # EOF or no data - check if process ended
                                 if process.poll() is not None:
                                     self.log("Logcat process ended (no more output)")
                                     break
-                                # Small sleep to prevent busy waiting
-                                time.sleep(0.01)
+                                time.sleep(0.05)  # Small sleep to prevent tight loop
                         except Exception as read_err:
                             self.log(f"Error reading logcat: {read_err}", "ERROR")
-                            break
+                            time.sleep(0.1)  # Prevent tight loop on error
+
+                    # Flush any remaining lines before tearing down
+                    flush_batch()
 
                     # Clean up process
-                    if process.poll() is None:
+                    if process is not None and process.poll() is None:
                         self.log("Terminating logcat process...")
                         process.terminate()
                         try:
@@ -4792,16 +5038,15 @@ class ADBGUI(QMainWindow):
                             process.kill()
 
                     self.log_running = False
-                    QTimer.singleShot(0, lambda: self.logcat_button.setText("▶️ Start"))
-                    QTimer.singleShot(0, lambda: self.log_to_logcat("[STOPPED] Logcat stopped"))
+                    self._ui_caller.call.emit(lambda: self.logcat_button.setText("▶️ Start"))
+                    self._ui_caller.call.emit(lambda: self.log_to_logcat("[STOPPED] Logcat stopped"))
 
                 except Exception as e:
                     error_msg = f"Logcat error: {str(e)}"
                     self.log(error_msg, "ERROR")
-                    QTimer.singleShot(0, lambda: self.log(error_msg, "ERROR"))
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Logcat Error", error_msg))
+                    self._ui_caller.call.emit(lambda: QMessageBox.critical(self, "Logcat Error", error_msg))
                     self.log_running = False
-                    QTimer.singleShot(0, lambda: self.logcat_button.setText("▶️ Start"))
+                    self._ui_caller.call.emit(lambda: self.logcat_button.setText("▶️ Start"))
                     import traceback
                     self.log(f"Traceback: {traceback.format_exc()}", "ERROR")
 
@@ -5086,15 +5331,57 @@ class ADBGUI(QMainWindow):
         return btn
 
     def execute_template_command(self, title, snippet):
-        """Execute a template command in a separate thread"""
+        """Execute a template command in a separate thread.
+
+        The snippet may reference these variables, which are substituted
+        before running:
+          $SELECTED_SEAT          — the seat the user is connected to (if any)
+          $SELECTED_PORTFORWARD   — the gateway the user is connected to (if any)
+          $CURRENT_DEVICE         — the currently selected ADB device id (if any)
+          $ADB_PATH               — the configured adb executable path
+          $DEVICE_SERIAL          — same as $CURRENT_DEVICE
+        """
+        # Capture the values on the UI thread so the worker doesn't touch
+        # GUI state directly.
+        device_id = self.current_device or ''
+        adb_path = self.adb.adb_path if (hasattr(self, 'adb') and self.adb) else 'adb'
+        seat = ''
+        gateway = ''
+        try:
+            for s, g in (self.seat_port_manager.connected_seats or {}).items():
+                seat = s
+                gateway = g
+                break
+        except Exception:
+            pass
+
+        # Resolve variables. Use ${VAR} or $VAR — but avoid clobbering shell
+        # variables like $HOME. We do an explicit replace of the exact tokens
+        # (followed by a non-identifier char) so $HOME stays intact.
+        substitutions = {
+            '$SELECTED_SEAT': seat,
+            '${SELECTED_SEAT}': seat,
+            '$SELECTED_PORTFORWARD': gateway,
+            '${SELECTED_PORTFORWARD}': gateway,
+            '$CURRENT_DEVICE': device_id,
+            '${CURRENT_DEVICE}': device_id,
+            '$DEVICE_SERIAL': device_id,
+            '${DEVICE_SERIAL}': device_id,
+            '$ADB_PATH': adb_path,
+            '${ADB_PATH}': adb_path,
+        }
+        expanded = snippet
+        for token, value in substitutions.items():
+            expanded = expanded.replace(token, value)
+
         self.log(f"Executing template command: {title}")
         self.update_status(f"Running: {title}...")
 
         def run_command():
             try:
-                self.log(f"Command: {snippet}", "DEBUG")
+                self.log(f"Command: {expanded}", "DEBUG")
                 result = subprocess.run(
-                    snippet,
+                    expanded,
                     shell=True,
                     capture_output=True,
                     text=True,
