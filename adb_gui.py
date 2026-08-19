@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sys
 import subprocess
 import threading
@@ -23,7 +24,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QInputDialog, QFrame, QScrollArea, QGroupBox, QSizePolicy,
     QDialog, QListWidget, QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup, QTabWidget
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStandardPaths
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
 
 
@@ -117,11 +118,30 @@ class CredentialManager:
 class SeatPortManager:
     """Manage seat connections and port forwards from ~/.adb-seat-ports"""
 
-    def __init__(self, log_callback=None):
+    def __init__(self, log_callback=None, settings=None):
         self.log_callback = log_callback
+        self.settings = settings or {}
         self.history_file = os.path.expanduser("~/.adb-seat-ports")
         self.connected_seats = {}  # {seat: gateway}
         self.connected_portforward = None  # gateway or None
+
+    def _get_script_env(self):
+        """Build environment with adb in PATH so external scripts can find it"""
+        env = os.environ.copy()
+        adb_path = self.settings.get('adb_path', '')
+        if adb_path:
+            adb_dir = os.path.dirname(adb_path)
+            if adb_dir:
+                env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
+        return env
+
+    def _get_seat_script_path(self):
+        """Get the configured seat.sh script path"""
+        return self.settings.get('seat_script_path', 'seat.sh')
+
+    def _get_portforward_script_path(self):
+        """Get the configured portforward script path"""
+        return self.settings.get('portforward_script_path', '')
 
     def load_history(self):
         """Load connection history from ~/.adb-seat-ports"""
@@ -243,10 +263,14 @@ class SeatPortManager:
             Port forwarding is NOT ACTIVE.
         """
         try:
-            script_path = self.log_callback.__self__.settings.get('portforward_script_path', 'portForwardRack.sh') if hasattr(self.log_callback, '__self__') else 'portForwardRack.sh'
+            script_path = self._get_portforward_script_path()
+            if not script_path or not os.path.exists(script_path):
+                return {'active': False, 'error': 'Port forward script not configured'}
+
+            env = self._get_script_env()
             result = subprocess.run(
                 [script_path, 'status'],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10, env=env
             )
             raw = (result.stdout or '') + (result.stderr or '')
 
@@ -299,9 +323,11 @@ class SeatPortManager:
         """
         devices = []
         try:
+            script_path = self._get_seat_script_path()
+            env = self._get_script_env()
             result = subprocess.run(
-                ['seat.sh', 'devices'],
-                capture_output=True, text=True, timeout=10
+                [script_path, 'devices'],
+                capture_output=True, text=True, timeout=10, env=env
             )
             if result.returncode == 0:
                 lines = result.stdout.strip().split('\n')
@@ -394,8 +420,8 @@ class SettingsDialog(QDialog):
         pf_layout.addWidget(pf_label)
 
         pf_row = QHBoxLayout()
-        self.pf_path_edit = QLineEdit(self.current_settings.get('portforward_script_path', 'portForwardRack.sh'))
-        self.pf_path_edit.setPlaceholderText("Path to portForwardRack.sh")
+        self.pf_path_edit = QLineEdit(self.current_settings.get('portforward_script_path', ''))
+        self.pf_path_edit.setPlaceholderText("Path to port forwarding script (optional)")
         pf_row.addWidget(self.pf_path_edit)
 
         pf_browse_btn = QPushButton("📂 Browse")
@@ -537,10 +563,10 @@ class SettingsDialog(QDialog):
             self.seat_path_edit.setText(path)
 
     def browse_portforward(self):
-        """Browse for portForwardRack.sh"""
+        """Browse for port forwarding script"""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Port Forward Script",
+            "Select Port Forward Script (Optional)",
             os.path.expanduser('~'),
             "Shell scripts (*.sh);;All files (*.*)"
         )
@@ -554,7 +580,7 @@ class SettingsDialog(QDialog):
             title = cmd.get('title', 'Untitled')
             snippet = cmd.get('snippet', '')
             preview = snippet[:50] + '...' if len(snippet) > 50 else snippet
-            self.template_list.addItem(f"{title} — {preview}")
+            self.template_list.addItem(f"{title} - {preview}")
 
     def _show_add_template_dialog(self):
         """Show dialog to add a new template command"""
@@ -581,11 +607,11 @@ class SettingsDialog(QDialog):
 
         variables_hint = QLabel(
             "Available variables (substituted before running):\n"
-            "  $SELECTED_SEAT          — currently connected seat\n"
-            "  $SELECTED_PORTFORWARD   — currently connected port-forward gateway\n"
-            "  $CURRENT_DEVICE         — currently selected ADB device id\n"
-            "  $DEVICE_SERIAL          — alias for $CURRENT_DEVICE\n"
-            "  $ADB_PATH               — configured adb executable path"
+            "  $SELECTED_SEAT          - currently connected seat\n"
+            "  $SELECTED_PORTFORWARD   - currently connected port-forward gateway\n"
+            "  $CURRENT_DEVICE         - currently selected ADB device id\n"
+            "  $DEVICE_SERIAL          - alias for $CURRENT_DEVICE\n"
+            "  $ADB_PATH               - configured adb executable path"
         )
         variables_hint.setStyleSheet("color: #666; font-size: 9pt; font-family: Consolas, monospace;")
         variables_hint.setWordWrap(True)
@@ -657,11 +683,11 @@ class SettingsDialog(QDialog):
 
         variables_hint = QLabel(
             "Available variables (substituted before running):\n"
-            "  $SELECTED_SEAT          — currently connected seat\n"
-            "  $SELECTED_PORTFORWARD   — currently connected port-forward gateway\n"
-            "  $CURRENT_DEVICE         — currently selected ADB device id\n"
-            "  $DEVICE_SERIAL          — alias for $CURRENT_DEVICE\n"
-            "  $ADB_PATH               — configured adb executable path"
+            "  $SELECTED_SEAT          - currently connected seat\n"
+            "  $SELECTED_PORTFORWARD   - currently connected port-forward gateway\n"
+            "  $CURRENT_DEVICE         - currently selected ADB device id\n"
+            "  $DEVICE_SERIAL          - alias for $CURRENT_DEVICE\n"
+            "  $ADB_PATH               - configured adb executable path"
         )
         variables_hint.setStyleSheet("color: #666; font-size: 9pt; font-family: Consolas, monospace;")
         variables_hint.setWordWrap(True)
@@ -733,6 +759,9 @@ class SettingsDialog(QDialog):
             self.parent.adb = ADBManager(adb_path=self.parent.settings['adb_path'])
             self.parent.adb.log_callback = self.parent.log
             self.parent.update_adb_path_display()
+
+            # Keep SeatPortManager settings in sync
+            self.parent.seat_port_manager.settings = self.parent.settings
 
             # Refresh template buttons in header
             self.parent.refresh_template_commands_ui()
@@ -1062,14 +1091,37 @@ class ADBGUI(QMainWindow):
         else:
             # Running as script
             project_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # DeGoogle state storage
+
+        # Settings storage - use user-writable location via QStandardPaths
+        # This ensures settings persist correctly when running from /Applications
+        app_name = "ADB-GUI-UI"
+        if sys.platform == 'darwin':
+            # macOS: ~/Library/Application Support/ADB-GUI-UI
+            settings_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not settings_dir:
+                # Fallback if QStandardPaths returns empty
+                settings_dir = os.path.expanduser("~/Library/Application Support/ADB-GUI-UI")
+        elif sys.platform == 'win32':
+            # Windows: %APPDATA%/ADB-GUI-UI
+            settings_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not settings_dir:
+                settings_dir = os.path.join(os.environ.get('APPDATA', ''), 'ADB-GUI-UI')
+        else:
+            # Linux: ~/.config/ADB-GUI-UI
+            settings_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not settings_dir:
+                settings_dir = os.path.expanduser("~/.config/ADB-GUI-UI")
+
+        # Create settings directory if it doesn't exist
+        os.makedirs(settings_dir, exist_ok=True)
+
+        self.settings_file = os.path.join(settings_dir, 'settings.json')
+        self.settings = self.load_settings()
+
+        # For degoogle state, keep it in the project directory for now
+        # (so it's checked in with the repo for offline mode state)
         self.degoogle_state_file = os.path.join(project_dir, 'degoogle_state.json')
         self.degoogle_state = self.load_degoogle_state()
-        
-        # Settings storage
-        self.settings_file = os.path.join(project_dir, 'settings.json')
-        self.settings = self.load_settings()
         
         # Load theme preference: 'light', 'dark', or 'system'
         self.theme_mode = self.settings.get('theme_mode', 'system')
@@ -1137,7 +1189,7 @@ class ADBGUI(QMainWindow):
         self._ui_caller = _UICaller(self)
 
         # Initialize Seat/Port Manager
-        self.seat_port_manager = SeatPortManager(log_callback=self.log)
+        self.seat_port_manager = SeatPortManager(log_callback=self.log, settings=self.settings)
 
         # Initialize Credential Manager
         self.credential_manager = CredentialManager()
@@ -1147,7 +1199,7 @@ class ADBGUI(QMainWindow):
             self.settings['seat_script_path'] = 'seat.sh'
             self.save_settings()
         if 'portforward_script_path' not in self.settings:
-            self.settings['portforward_script_path'] = 'portForwardRack.sh'
+            self.settings['portforward_script_path'] = ''
             self.save_settings()
 
         self.setup_ui()
@@ -1320,16 +1372,17 @@ class ADBGUI(QMainWindow):
         self.separator.setFrameShape(QFrame.Shape.HLine)
         self.separator.setStyleSheet(f"color: {self.colors['border']};")
         app_group.layout().addWidget(self.separator)
-        
-        degoogle_row = QHBoxLayout()
-        degoogle_btn = QPushButton("🚫 DeGoogle")
-        degoogle_btn.clicked.connect(self.degoogle_device)
-        degoogle_btn.setProperty("accent", "true")
-        undo_degoogle_btn = QPushButton("↩️ Undo DeGoogle")
-        undo_degoogle_btn.clicked.connect(self.undo_degoogle)
-        degoogle_row.addWidget(degoogle_btn)
-        degoogle_row.addWidget(undo_degoogle_btn)
-        app_group.layout().addLayout(degoogle_row)
+
+        # DeGoogle buttons are hidden
+        # degoogle_row = QHBoxLayout()
+        # degoogle_btn = QPushButton("🚫 DeGoogle")
+        # degoogle_btn.clicked.connect(self.degoogle_device)
+        # degoogle_btn.setProperty("accent", "true")
+        # undo_degoogle_btn = QPushButton("↩️ Undo DeGoogle")
+        # undo_degoogle_btn.clicked.connect(self.undo_degoogle)
+        # degoogle_row.addWidget(degoogle_btn)
+        # degoogle_row.addWidget(undo_degoogle_btn)
+        # app_group.layout().addLayout(degoogle_row)
         ops_layout.addWidget(app_group)
         
         # Device operations
@@ -1489,7 +1542,12 @@ class ADBGUI(QMainWindow):
         seat_search_label = QLabel("Search:")
         self.seat_search_entry = QLineEdit()
         self.seat_search_entry.setPlaceholderText("Filter seats...")
-        self.seat_search_entry.textChanged.connect(self.refresh_seat_port_lists)
+        # Debounce search to avoid lag - only refresh 300ms after user stops typing
+        self._seat_search_timer = QTimer()
+        self._seat_search_timer.setSingleShot(True)
+        self._seat_search_timer.setInterval(300)
+        self._seat_search_timer.timeout.connect(lambda: self.refresh_seat_port_lists(refetch=False))
+        self.seat_search_entry.textChanged.connect(self._seat_search_timer.start)
         seat_search_layout.addWidget(seat_search_label)
         seat_search_layout.addWidget(self.seat_search_entry)
         seat_group.layout().addLayout(seat_search_layout)
@@ -1513,7 +1571,12 @@ class ADBGUI(QMainWindow):
         pf_search_label = QLabel("Search:")
         self.pf_search_entry = QLineEdit()
         self.pf_search_entry.setPlaceholderText("Filter port forwards...")
-        self.pf_search_entry.textChanged.connect(self.refresh_seat_port_lists)
+        # Debounce search to avoid lag - only refresh 300ms after user stops typing
+        self._pf_search_timer = QTimer()
+        self._pf_search_timer.setSingleShot(True)
+        self._pf_search_timer.setInterval(300)
+        self._pf_search_timer.timeout.connect(lambda: self.refresh_seat_port_lists(refetch=False))
+        self.pf_search_entry.textChanged.connect(self._pf_search_timer.start)
         pf_search_layout.addWidget(pf_search_label)
         pf_search_layout.addWidget(self.pf_search_entry)
         portforward_group.layout().addLayout(pf_search_layout)
@@ -2031,8 +2094,13 @@ class ADBGUI(QMainWindow):
         # This method is kept for compatibility but device selection is now handled by select_device_button()
         pass
 
-    def refresh_seat_port_lists(self):
-        """Refresh seat and port forward lists from ~/.adb-seat-ports"""
+    def refresh_seat_port_lists(self, refetch=True):
+        """Refresh seat and port forward lists from ~/.adb-seat-ports
+
+        Args:
+            refetch: If True, re-run external scripts (seat.sh devices, portforward status).
+                     If False, reuse cached data (for fast search filtering).
+        """
         # Skip if not yet initialized
         if not hasattr(self, 'seat_list_container') or not hasattr(self, 'portforward_list_container'):
             return
@@ -2046,6 +2114,15 @@ class ADBGUI(QMainWindow):
             seat_filter = self.seat_search_entry.text().lower().strip()
         if hasattr(self, 'pf_search_entry'):
             pf_filter = self.pf_search_entry.text().lower().strip()
+
+        # Fetch data from external sources only if refetch=True or no cache exists
+        if refetch or not hasattr(self, '_cached_seat_sh_devices'):
+            self._cached_seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+        if refetch or not hasattr(self, '_cached_pf_status'):
+            self._cached_pf_status = self.seat_port_manager.get_portforward_status()
+
+        seat_sh_devices = self._cached_seat_sh_devices
+        pf_status = self._cached_pf_status
 
         # Clear existing buttons
         while self.seat_list_layout.count() > 0:
@@ -2064,21 +2141,44 @@ class ADBGUI(QMainWindow):
             else:
                 top_seats.append(entry)
 
-        # Get connected seats from seat.sh devices
-        seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+        # Get connected seats from seat.sh devices (using cached data)
         connected_seat_names = set()
+        connected_ports = set()
         for dev_info in seat_sh_devices:
             if dev_info.get('seat'):  # If seat is not empty
                 connected_seat_names.add(dev_info['seat'])
+            # Extract port from device string (e.g., "localhost:64491" -> "64491")
+            device = dev_info.get('device', '')
+            if ':' in device:
+                connected_ports.add(device.split(':')[-1])
+
+        # Add connected seats from seat.sh that aren't in the history file
+        existing_seat_keys = set((e['seat'], e['gateway']) for e in top_seats)
+        for dev_info in seat_sh_devices:
+            seat_name = dev_info.get('seat', '')
+            gateway = dev_info.get('gateway', '')
+            device = dev_info.get('device', '')
+            if seat_name and gateway:
+                key = (seat_name, gateway)
+                if key not in existing_seat_keys:
+                    # Extract port from device string (e.g., "localhost:64491" -> "64491")
+                    port = device.split(':')[-1] if ':' in device else ''
+                    top_seats.append({
+                        'seat': seat_name,
+                        'port': port,
+                        'gateway': gateway,
+                        'timestamp': 0  # No timestamp for pre-connected
+                    })
+                    existing_seat_keys.add(key)
 
         # Sort: Connected seats first (from both connection state and seat.sh), then disconnected
         connected_seats = []
         disconnected_seats = []
         for entry in top_seats:
-            # Check if seat is connected via internal state OR seat.sh
+            # Check if seat is connected via internal state OR seat.sh (match by seat name or port)
             is_conn = (self.seat_port_manager.is_seat_connected(entry['seat']) or
                       entry['seat'] in connected_seat_names or
-                      entry.get('gateway') in connected_seat_names)
+                      entry.get('port', '') in connected_ports)
             if is_conn:
                 connected_seats.append(entry)
             else:
@@ -2089,10 +2189,10 @@ class ADBGUI(QMainWindow):
         # Limit to reasonable number (50) for performance
         top_seats = top_seats[:50]
         for entry in top_seats:
-            # Check if seat is connected via internal state OR seat.sh
+            # Check if seat is connected via internal state OR seat.sh (match by seat name or port)
             is_connected = (self.seat_port_manager.is_seat_connected(entry['seat']) or
                           entry['seat'] in connected_seat_names or
-                          entry.get('gateway') in connected_seat_names)
+                          entry.get('port', '') in connected_ports)
             btn_connected = is_connected
             # Format: two lines with Port info on the seat line
             text = f"{entry['seat']} (Port: {entry['port']})\n{entry['gateway']}"
@@ -2181,17 +2281,20 @@ class ADBGUI(QMainWindow):
             else:
                 top_pf.append(entry)
 
-        # Get current port forward status (includes rack info if active)
-        pf_status = self.seat_port_manager.get_portforward_status()
+        # Get current port forward status (using cached data)
         active_rack = None
         if pf_status and pf_status.get('active'):
             active_rack = pf_status.get('rack', '')
+
+        # Also check connected ports from seat.sh for pre-connected port forwards
+        connected_pf_ports = set(connected_ports)
 
         # Sort: Connected/active port forwards first, then others
         connected_pf = []
         disconnected_pf = []
         for entry in top_pf:
-            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
+            is_connected = (self.seat_port_manager.is_portforward_connected(entry['gateway']) or
+                          entry.get('port', '') in connected_pf_ports)
             is_active_rack = active_rack and active_rack in entry['gateway']
             if is_connected or is_active_rack:
                 connected_pf.append(entry)
@@ -2204,7 +2307,8 @@ class ADBGUI(QMainWindow):
         top_pf = top_pf[:50]
 
         for entry in top_pf:
-            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
+            is_connected = (self.seat_port_manager.is_portforward_connected(entry['gateway']) or
+                          entry.get('port', '') in connected_pf_ports)
 
             # Check if this entry's gateway matches the active rack
             is_active_rack = active_rack and active_rack in entry['gateway']
@@ -2390,7 +2494,7 @@ class ADBGUI(QMainWindow):
                     old_device = self.current_device
                     self.current_device = device_id
                     self.log(f"Launching scrcpy for device {device_id} (seat {seat})")
-                    self.scrcpy_device()
+                    self.scrcpy_device(bitrate='1m')
                     self.current_device = old_device
                 else:
                     self.log(f"No device found for seat {seat}. Available: {[d['id'] for d in devices]}", "ERROR")
@@ -2406,7 +2510,7 @@ class ADBGUI(QMainWindow):
         # Temporarily switch current device, launch scrcpy, then restore
         old_device = self.current_device
         self.current_device = device_id
-        self.scrcpy_device()
+        self.scrcpy_device(bitrate='1m')
         self.current_device = old_device
 
     def _scrcpy_via_portforward(self, gateway):
@@ -2455,16 +2559,22 @@ class ADBGUI(QMainWindow):
                 # Get script path from settings
                 script_path = self.settings.get('seat_script_path', 'seat.sh')
 
+                # Build environment with adb in PATH so the script can find it
+                env = os.environ.copy()
+                adb_path = self.settings.get('adb_path', '')
+                if adb_path:
+                    adb_dir = os.path.dirname(adb_path)
+                    if adb_dir:
+                        env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
+
                 # Use sshpass if available, otherwise try with stdin
                 if shutil.which('sshpass'):
                     cmd = ['sshpass', '-p', password, script_path, 'auto-connect', seat, gateway]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
                     stdout, stderr = result.stdout, result.stderr
                     returncode = result.returncode
                 else:
                     # Fallback: pass password via SSH_ASKPASS
-                    env = os.environ.copy()
-                    # Create temporary askpass script
                     askpass_script = f"#!/bin/sh\necho {password}\n"
                     askpass_file = '/tmp/adb_gui_askpass.sh'
                     with open(askpass_file, 'w') as f:
@@ -2509,8 +2619,17 @@ class ADBGUI(QMainWindow):
             try:
                 # Get script path from settings
                 script_path = self.settings.get('seat_script_path', 'seat.sh')
+
+                # Build environment with adb in PATH so the script can find it
+                env = os.environ.copy()
+                adb_path = self.settings.get('adb_path', '')
+                if adb_path:
+                    adb_dir = os.path.dirname(adb_path)
+                    if adb_dir:
+                        env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
+
                 cmd = [script_path, 'disconnect', seat]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
 
                 if result.returncode == 0:
                     self.seat_port_manager.mark_seat_disconnected(seat)
@@ -2529,13 +2648,7 @@ class ADBGUI(QMainWindow):
         threading.Thread(target=do_disconnect, daemon=True).start()
 
     def connect_portforward(self, gateway, partition, user):
-        """Connect port forward.
-
-        `gateway` may be stored as either "host" or "user@host". The
-        portForwardRack.sh script typically does `ssh ${user}@${gateway}`
-        internally, so we have to hand it just the bare host — otherwise
-        we'd end up trying to ssh into "user@user@host".
-        """
+        """Connect port forward using the configured portforward_script_path."""
         self.log(f"Setting up port forward for {gateway}...")
         self.update_status(f"Setting up port forward for {gateway}...")
 
@@ -2559,17 +2672,31 @@ class ADBGUI(QMainWindow):
         def do_connect():
             try:
                 # Get script path from settings
-                script_path = self.settings.get('portforward_script_path', 'portForwardRack.sh')
+                script_path = self.settings.get('portforward_script_path', '')
+
+                # Check if script exists
+                if not os.path.exists(script_path):
+                    self.log(f"Port forward script not found: {script_path}", "ERROR")
+                    self.log("Please configure the correct path via Settings > Advanced", "ERROR")
+                    self.update_status("Port forward script not found")
+                    return
+
+                # Build environment with adb in PATH so the script can find it
+                env = os.environ.copy()
+                adb_path = self.settings.get('adb_path', '')
+                if adb_path:
+                    adb_dir = os.path.dirname(adb_path)
+                    if adb_dir:
+                        env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
 
                 # Use sshpass if available, otherwise try with SSH_ASKPASS
                 if shutil.which('sshpass'):
                     cmd = ['sshpass', '-p', password, script_path, gateway_host, partition, user]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
                     stdout, stderr = result.stdout, result.stderr
                     returncode = result.returncode
                 else:
                     # Fallback: pass password via SSH_ASKPASS
-                    env = os.environ.copy()
                     askpass_script = f"#!/bin/sh\necho {password}\n"
                     askpass_file = '/tmp/adb_gui_askpass.sh'
                     with open(askpass_file, 'w') as f:
@@ -2595,8 +2722,47 @@ class ADBGUI(QMainWindow):
                     QTimer.singleShot(0, self.refresh_seat_port_lists)
                 else:
                     error = stderr.strip() or stdout.strip() or "Unknown error"
-                    self.log(f"Failed to set up port forward: {error}", "ERROR")
-                    self.update_status("Failed to set up port forward")
+
+                    # Check if error is due to ports already in use - if so, stop existing and retry
+                    if "Address already in use" in error or "cannot listen to port" in error:
+                        self.log("Ports already in use - stopping existing port forward...", "WARNING")
+
+                        # Stop existing port forward
+                        stop_cmd = [script_path, 'stop']
+                        stop_result = subprocess.run(stop_cmd, capture_output=True, text=True, timeout=30, env=env)
+
+                        if stop_result.returncode == 0:
+                            self.log("Previous port forward stopped, retrying...", "INFO")
+                            self.seat_port_manager.mark_portforward_disconnected()
+
+                            # Wait a moment for ports to be released
+                            time.sleep(1)
+
+                            # Retry the connection
+                            if shutil.which('sshpass'):
+                                retry_cmd = ['sshpass', '-p', password, script_path, gateway_host, partition, user]
+                                retry_result = subprocess.run(retry_cmd, capture_output=True, text=True, timeout=30, env=env)
+                            else:
+                                retry_cmd = [script_path, gateway_host, partition, user]
+                                retry_result = subprocess.run(retry_cmd, capture_output=True, text=True, timeout=30, env=env)
+
+                            if retry_result.returncode == 0:
+                                self.seat_port_manager.mark_portforward_connected(gateway)
+                                self.log(f"Port forward connected for {gateway}", "INFO")
+                                self.update_status(f"Port forward connected")
+                                QTimer.singleShot(0, self.refresh_seat_port_lists)
+                                return
+                            else:
+                                retry_error = retry_result.stderr.strip() or retry_result.stdout.strip() or "Unknown error"
+                                self.log(f"Failed to set up port forward after retry: {retry_error}", "ERROR")
+                                self.update_status("Failed to set up port forward")
+                        else:
+                            self.log("Failed to stop existing port forward", "ERROR")
+                            self.log(f"Failed to set up port forward: {error}", "ERROR")
+                            self.update_status("Failed to set up port forward")
+                    else:
+                        self.log(f"Failed to set up port forward: {error}", "ERROR")
+                        self.update_status("Failed to set up port forward")
             except Exception as e:
                 self.log(f"Error setting up port forward: {str(e)}", "ERROR")
                 self.update_status("Error setting up port forward")
@@ -2611,9 +2777,23 @@ class ADBGUI(QMainWindow):
         def do_disconnect():
             try:
                 # Get script path from settings
-                script_path = self.settings.get('portforward_script_path', 'portForwardRack.sh')
+                script_path = self.settings.get('portforward_script_path', '')
+
+                # Check if script exists
+                if not os.path.exists(script_path):
+                    self.log(f"Port forward script not found: {script_path}", "ERROR")
+                    return
+
+                # Build environment with adb in PATH so the script can find it
+                env = os.environ.copy()
+                adb_path = self.settings.get('adb_path', '')
+                if adb_path:
+                    adb_dir = os.path.dirname(adb_path)
+                    if adb_dir:
+                        env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
+
                 cmd = [script_path, 'stop']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
 
                 if result.returncode == 0:
                     self.seat_port_manager.mark_portforward_disconnected()
@@ -4574,7 +4754,7 @@ class ADBGUI(QMainWindow):
             if existing.poll() is None:
                 self.log(f"scrcpy is already running for {device_id}; focusing existing window")
                 self.update_status(f"scrcpy already running for {device_id}")
-                QTimer.singleShot(0, self._focus_scrcpy_window)
+                self._focus_scrcpy_window()
                 return
             # Process died but we never cleaned up the entry
             self.scrcpy_procs.pop(device_id, None)
@@ -4699,7 +4879,7 @@ class ADBGUI(QMainWindow):
                             else:
                                 register_proc(p2)
                                 QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
-                                QTimer.singleShot(500, self._focus_scrcpy_window)
+                                self._focus_scrcpy_window()
                             return
                         # Other immediate failure: surface the error
                         err = stderr.strip() or "scrcpy exited immediately."
@@ -4711,7 +4891,7 @@ class ADBGUI(QMainWindow):
                     # Running fine
                     register_proc(p)
                     QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
-                    QTimer.singleShot(500, self._focus_scrcpy_window)
+                    self._focus_scrcpy_window()
                     return
 
                 # No custom adb path; just run normally
@@ -4720,7 +4900,7 @@ class ADBGUI(QMainWindow):
                 p = launch(cmd_base, capture=False)
                 register_proc(p)
                 QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
-                QTimer.singleShot(500, self._focus_scrcpy_window)
+                self._focus_scrcpy_window()
             except Exception as e:
                 error_msg = str(e)
                 self.log(f"Failed to launch scrcpy: {error_msg}", "ERROR")
@@ -4730,20 +4910,67 @@ class ADBGUI(QMainWindow):
         threading.Thread(target=do_launch, daemon=True).start()
 
     def _focus_scrcpy_window(self):
-        """Bring scrcpy window to front and focus it"""
-        try:
-            if sys.platform == 'darwin':
-                # macOS: use osascript to activate scrcpy window
-                subprocess.run(['osascript', '-e', 'tell application "scrcpy" to activate'], timeout=2)
-            elif sys.platform == 'win32':
+        """Bring scrcpy window to front and focus it with retry logic"""
+        def do_focus():
+            max_retries = 5
+            retry_delay = 500  # milliseconds
+
+            if sys.platform == 'darwin':  # pragma: no cover
+                # macOS: Try multiple methods to focus scrcpy window
+                for attempt in range(max_retries):
+                    try:
+                        # Method 1: Try by application name "scrcpy"
+                        result = subprocess.run(
+                            ['osascript', '-e', 'tell application "scrcpy" to activate'],
+                            timeout=2,
+                            capture_output=True,
+                            text=True
+                        )
+                        if result.returncode == 0:
+                            break
+
+                        # Method 2: Try by window title (scrcpy shows device ID in title)
+                        # Use System Events to find window containing "scrcpy" or device ID
+                        script = '''
+                        tell application "System Events"
+                            set frontmost of first process whose name contains "scrcpy" to true
+                        end tell
+                        '''
+                        result2 = subprocess.run(
+                            ['osascript', '-e', script],
+                            timeout=2,
+                            capture_output=True,
+                            text=True
+                        )
+                        if result2.returncode == 0:
+                            break
+
+                        # Still failed, wait and retry
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay / 1000.0)
+                    except Exception:
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay / 1000.0)
+            elif sys.platform == 'win32':  # pragma: no cover
                 # Windows: use PowerShell to bring window to front
-                subprocess.run(['powershell', '-command', '(New-Object -ComObject WScript.Shell).AppActivate("scrcpy")'], timeout=2)
-            else:
+                try:
+                    subprocess.run(
+                        ['powershell', '-command', '(New-Object -ComObject WScript.Shell).AppActivate("scrcpy")'],
+                        timeout=2,
+                        capture_output=True
+                    )
+                except Exception:
+                    pass
+            else:  # pragma: no cover
                 # Linux: try wmctrl
-                subprocess.run(['wmctrl', '-a', 'scrcpy'], timeout=2, capture_output=True)
-        except:
-            # Silently fail if we can't focus the window
-            pass
+                try:
+                    subprocess.run(['wmctrl', '-a', 'scrcpy'], timeout=2, capture_output=True)
+                except Exception:
+                    pass
+
+        # Run focus logic in background thread to avoid blocking
+        threading.Thread(target=do_focus, daemon=True).start()
+
     
     def reboot_device(self):
         """Reboot device"""
@@ -5105,116 +5332,75 @@ class ADBGUI(QMainWindow):
             self.colors = self.light_colors.copy()
         
         # Apply stylesheet
-        self.setStyleSheet(f"""
-            QMainWindow {{
-                background-color: {self.colors['bg']};
-                color: {self.colors['fg']};
-            }}
-            QWidget {{
-                background-color: {self.colors['bg']};
-                color: {self.colors['fg']};
-            }}
-            QPushButton {{
-                background-color: {self.colors['card_bg']};
-                color: {self.colors['fg']};
-                border: 1px solid {self.colors['border']};
-                border-radius: 4px;
-                padding: 8px;
-                font-family: system-ui;
-                font-size: 11pt;
-            }}
-            QPushButton:hover {{
-                background-color: {'#3e3e42' if self.dark_mode else '#f0f0f0'};
-            }}
-            QPushButton:pressed {{
-                background-color: {'#2d2d30' if self.dark_mode else '#e0e0e0'};
-            }}
-            QPushButton[accent="true"] {{
-                background-color: {self.colors['accent']};
-                color: white;
-            }}
-            QPushButton[accent="true"]:hover {{
-                background-color: {self.colors['accent_hover']};
-            }}
-            QGroupBox {{
-                border: 1px solid {self.colors['border']};
-                border-radius: 4px;
-                margin-top: 10px;
-                padding-top: 10px;
-                background-color: {self.colors['card_bg']};
-                color: {self.colors['fg']};
-                font-weight: bold;
-            }}
-            QGroupBox#deviceGroup {{
-                border: 2px solid {self.colors['success']};
-                background-color: {'#1a3a1a' if self.dark_mode else '#e8f5e9'};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                color: {self.colors['fg']};
-            }}
-            QLineEdit, QComboBox {{
-                border: 1px solid {self.colors['border']};
-                border-radius: 4px;
-                padding: 5px;
-                background-color: {self.colors['card_bg']};
-                color: {self.colors['fg']};
-                font-size: 11pt;
-            }}
-            QTextEdit {{
-                border: 1px solid {self.colors['border']};
-                border-radius: 4px;
-                background-color: {'#1e1e1e' if self.dark_mode else '#1e1e1e'};
-                color: {'#d4d4d4' if self.dark_mode else '#d4d4d4'};
-                font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-                font-size: 10pt;
-            }}
-            QLabel {{
-                color: {self.colors['fg']};
-                font-size: 11pt;
-            }}
-            QListWidget {{
-                background-color: {self.colors['card_bg']};
-                color: {self.colors['fg']};
-                border: 1px solid {self.colors['border']};
-                font-size: 11pt;
-            }}
-            QListWidget::item:hover {{
-                background-color: {'#3e3e42' if self.dark_mode else '#f0f0f0'};
-            }}
-            QCheckBox {{
-                color: {self.colors['fg']};
-                font-size: 11pt;
-            }}
-            QRadioButton {{
-                color: {self.colors['fg']};
-                font-size: 11pt;
-            }}
-            QTabWidget::pane {{
-                border: 1px solid {self.colors['border']};
-                background-color: {self.colors['card_bg']};
-            }}
-            QTabBar::tab {{
-                background-color: {self.colors['bg']};
-                color: {self.colors['fg']};
-                border: 1px solid {self.colors['border']};
-                padding: 8px;
-                font-size: 11pt;
-            }}
-            QTabBar::tab:selected {{
-                background-color: {self.colors['card_bg']};
-            }}
-            QScrollArea {{
-                background-color: {self.colors['card_bg']};
-                border: 1px solid {self.colors['border']};
-            }}
-            QDialog {{
-                background-color: {self.colors['bg']};
-                color: {self.colors['fg']};
-            }}
-        """)
+        # Build stylesheet piece by piece to avoid syntax highlighting issues
+        bg = self.colors['bg']
+        fg = self.colors['fg']
+        card_bg = self.colors['card_bg']
+        border_color = self.colors['border']
+        accent = self.colors['accent']
+        accent_hover = self.colors['accent_hover']
+        success = self.colors['success']
+
+        # Conditional colors based on theme
+        button_hover_color = '#3e3e42' if self.dark_mode else '#f0f0f0'
+        button_pressed_color = '#2d2d30' if self.dark_mode else '#e0e0e0'
+        device_group_bg = '#1a3a1a' if self.dark_mode else '#e8f5e9'
+
+        # Build stylesheet as a list of strings, then join
+        # Using chr(112) for 'p' to avoid syntax issues with 'px'
+        p = chr(112)  # 'p' character
+        x = chr(120)  # 'x' character
+
+        # Helper to create CSS values
+        def px(val):
+            return str(val) + p + x
+
+        # Build stylesheet components
+        border_1px = px(1) + ' solid ' + border_color
+        border_2px = px(2) + ' solid ' + success
+        radius_4 = px(4)
+        pad_5 = px(5)
+        pad_8 = px(8)
+        pad_10 = px(10)
+
+        stylesheet = ""
+        stylesheet += "QMainWindow { background-color: " + bg + "; color: " + fg + "; } "
+        stylesheet += "QWidget { background-color: " + bg + "; color: " + fg + "; } "
+        stylesheet += "QPushButton { background-color: " + card_bg + "; color: " + fg + "; "
+        stylesheet += "border: " + border_1px + "; border-radius: " + radius_4 + "; padding: " + pad_8 + "; "
+        stylesheet += "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; "
+        stylesheet += "font-size: 11pt; } "
+        stylesheet += "QPushButton:hover { background-color: " + button_hover_color + "; } "
+        stylesheet += "QPushButton:pressed { background-color: " + button_pressed_color + "; } "
+        stylesheet += 'QPushButton[accent="true"] { background-color: ' + accent + '; color: white; } '
+        stylesheet += 'QPushButton[accent="true"]:hover { background-color: ' + accent_hover + '; } '
+        stylesheet += "QGroupBox { border: " + border_1px + "; border-radius: " + radius_4 + "; "
+        stylesheet += "margin-top: " + pad_10 + "; padding-top: " + pad_10 + "; background-color: " + card_bg + "; "
+        stylesheet += "color: " + fg + "; font-weight: bold; } "
+        stylesheet += "QGroupBox#deviceGroup { border: " + border_2px + "; "
+        stylesheet += "background-color: " + device_group_bg + "; } "
+        stylesheet += "QGroupBox::title { subcontrol-origin: margin; left: " + pad_10 + "; "
+        stylesheet += "padding: 0 " + pad_5 + "; color: " + fg + "; } "
+        stylesheet += "QLineEdit, QComboBox { border: " + border_1px + "; border-radius: " + radius_4 + "; "
+        stylesheet += "padding: " + pad_5 + "; background-color: " + card_bg + "; color: " + fg + "; font-size: 11pt; } "
+        stylesheet += "QTextEdit { border: " + border_1px + "; border-radius: " + radius_4 + "; "
+        stylesheet += "background-color: #1e1e1e; color: #d4d4d4; "
+        stylesheet += "font-family: Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; "
+        stylesheet += "font-size: 10pt; } "
+        stylesheet += "QLabel { color: " + fg + "; font-size: 11pt; } "
+        stylesheet += "QListWidget { background-color: " + card_bg + "; color: " + fg + "; "
+        stylesheet += "border: " + border_1px + "; font-size: 11pt; } "
+        stylesheet += "QListWidget::item:hover { background-color: " + button_hover_color + "; } "
+        stylesheet += "QCheckBox { color: " + fg + "; font-size: 11pt; } "
+        stylesheet += "QRadioButton { color: " + fg + "; font-size: 11pt; } "
+        stylesheet += "QTabWidget::pane { border: " + border_1px + "; background-color: " + card_bg + "; } "
+        stylesheet += "QTabBar::tab { background-color: " + bg + "; color: " + fg + "; "
+        stylesheet += "border: " + border_1px + "; padding: " + pad_8 + "; font-size: 11pt; } "
+        stylesheet += "QTabBar::tab:selected { background-color: " + card_bg + "; } "
+        stylesheet += "QScrollArea { background-color: " + card_bg + "; border: " + border_1px + "; } "
+        stylesheet += "QDialog { background-color: " + bg + "; color: " + fg + "; }"
+
+        self.setStyleSheet(stylesheet)
         
         # Update existing UI elements if they exist
         if hasattr(self, 'device_info_label'):
@@ -5335,11 +5521,11 @@ class ADBGUI(QMainWindow):
 
         The snippet may reference these variables, which are substituted
         before running:
-          $SELECTED_SEAT          — the seat the user is connected to (if any)
-          $SELECTED_PORTFORWARD   — the gateway the user is connected to (if any)
-          $CURRENT_DEVICE         — the currently selected ADB device id (if any)
-          $ADB_PATH               — the configured adb executable path
-          $DEVICE_SERIAL          — same as $CURRENT_DEVICE
+          $SELECTED_SEAT          - the seat the user is connected to (if any)
+          $SELECTED_PORTFORWARD   - the gateway the user is connected to (if any)
+          $CURRENT_DEVICE         - the currently selected ADB device id (if any)
+          $ADB_PATH               - the configured adb executable path
+          $DEVICE_SERIAL          - same as $CURRENT_DEVICE
         """
         # Capture the values on the UI thread so the worker doesn't touch
         # GUI state directly.
@@ -5355,7 +5541,7 @@ class ADBGUI(QMainWindow):
         except Exception:
             pass
 
-        # Resolve variables. Use ${VAR} or $VAR — but avoid clobbering shell
+        # Resolve variables. Use ${VAR} or $VAR - but avoid clobbering shell
         # variables like $HOME. We do an explicit replace of the exact tokens
         # (followed by a non-identifier char) so $HOME stays intact.
         substitutions = {
@@ -5434,12 +5620,15 @@ class ADBGUI(QMainWindow):
         
         # Status bar
         if hasattr(self, 'status_bar'):
-            self.status_bar.setStyleSheet(f"""
-                background-color: {self.colors['card_bg']};
-                border: 1px solid {self.colors['border']};
-                padding: 8px 15px;
-                color: {self.colors['text_secondary']};
-            """)
+            # Use string concatenation to avoid '1px' being parsed as decimal literal
+            border_1px_status = chr(49) + chr(112) + chr(120) + ' solid ' + self.colors['border']
+            status_style = (
+                "background-color: " + self.colors['card_bg'] + "; "
+                "border: " + border_1px_status + "; "
+                "padding: 8px 15px; "
+                "color: " + self.colors['text_secondary'] + ";"
+            )
+            self.status_bar.setStyleSheet(status_style)
         
         # Force refresh of all widgets to apply new stylesheet
         # This ensures the global stylesheet is reapplied to all widgets
@@ -5462,7 +5651,7 @@ class ADBGUI(QMainWindow):
             return
         
         # Safe Google apps to disable (won't break functionality)
-        # LIST 1 — SAFE TO REMOVE
+        # LIST 1 - SAFE TO REMOVE
         # A. Google Apps (Safe to Remove)
         safe_google_apps = [
             'com.google.android.youtube',
@@ -6583,16 +6772,28 @@ def main():
     app.setOrganizationName("ADB GUI")
 
     # App/window icon: prefer bundled icon files, otherwise use a built-in Qt icon
+    # When running as a macOS .app bundle, icons live in Contents/Resources/
     if getattr(sys, 'frozen', False):
-        base_dir = os.path.dirname(sys.executable)
+        # sys.executable for .app is at Contents/MacOS/<exe>
+        # Go up to Contents/ and check Resources/
+        contents_dir = os.path.dirname(os.path.dirname(sys.executable))
+        search_dirs = [
+            os.path.join(contents_dir, 'Resources'),  # macOS .app bundle
+            os.path.dirname(sys.executable),          # other frozen layouts
+            os.path.dirname(os.path.abspath(__file__)),  # running as script
+        ]
     else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        search_dirs = [os.path.dirname(os.path.abspath(__file__))]
 
     icon = None
-    for name in ("icon.icns", "icon.png", "icon.jpg", "icon.jpeg"):
-        p = os.path.join(base_dir, name)
-        if os.path.exists(p):
-            icon = QIcon(p)
+    icon_names = ("icon.icns", "icon.png", "icon.jpg", "icon.jpeg")
+    for search_dir in search_dirs:
+        for name in icon_names:
+            p = os.path.join(search_dir, name)
+            if os.path.exists(p):
+                icon = QIcon(p)
+                break
+        if icon is not None and not icon.isNull():
             break
 
     if icon is None or icon.isNull():
