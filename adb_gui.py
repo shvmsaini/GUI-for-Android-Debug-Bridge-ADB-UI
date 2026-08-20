@@ -577,21 +577,77 @@ class SettingsDialog(QDialog):
         """Refresh the template commands list display"""
         self.template_list.clear()
         for cmd in self.template_commands:
+            emoji = cmd.get('emoji', '📱')
             title = cmd.get('title', 'Untitled')
             snippet = cmd.get('snippet', '')
             preview = snippet[:50] + '...' if len(snippet) > 50 else snippet
-            self.template_list.addItem(f"{title} - {preview}")
+            self.template_list.addItem(f"{emoji} {title} - {preview}")
+
+    def _add_emoji_buttons_to_layout(self, layout, emojis):
+        """Add emoji buttons to a layout"""
+        for emoji in emojis:
+            btn = QPushButton(emoji)
+            btn.setFixedSize(40, 40)
+            btn.setFont(QFont('', 16))
+            btn.clicked.connect(lambda checked, e=emoji: self._select_emoji(e))
+            layout.addWidget(btn)
+
+    def _select_emoji(self, emoji):
+        """Handle emoji selection"""
+        self.emoji_selected.setText(emoji)
+        # Highlight the selected emoji button
+        for btn in getattr(self, 'emoji_buttons', []):
+            if btn.text() == emoji:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: %s;
+                        border: 2px solid #007AFF;
+                        border-radius: 6px;
+                    }
+                """ % self.colors['accent'])
+            else:
+                btn.setStyleSheet("")
 
     def _show_add_template_dialog(self):
         """Show dialog to add a new template command"""
         dialog = QDialog(self)
         dialog.setWindowTitle("Add Template Command")
         dialog.setMinimumWidth(600)
-        dialog.setMinimumHeight(400)
+        dialog.setMinimumHeight(450)
         dialog.setModal(True)
 
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
+
+        # Emoji selector
+        emoji_label = QLabel("Emoji Icon:")
+        layout.addWidget(emoji_label)
+
+        emoji_row = QHBoxLayout()
+
+        # Common emojis for quick selection
+        common_emojis = ["📱", "🔧", "⚙️", "🔄", "📦", "🗑️", "📋", "💾", "🔍", "📊",
+                        "🚀", "⚡", "🔥", "💻", "🖥️", "🔌", "📡", "🪞", "📸", "🎨"]
+
+        self._add_emoji_buttons_to_layout(emoji_row, common_emojis)
+
+        emoji_row.addStretch()
+        layout.addLayout(emoji_row)
+
+        # Currently selected emoji display
+        self.emoji_selected = QLabel("📱")
+        self.emoji_selected.setFont(QFont('', 24))
+        self.emoji_selected.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.emoji_selected.setStyleSheet(f"""
+            QLabel {{
+                background-color: {self.colors['card_bg']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 8px;
+                padding: 10px;
+                min-width: 60px;
+            }}
+        """)
+        layout.addWidget(self.emoji_selected, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Title
         title_label = QLabel("Command Title:")
@@ -636,12 +692,13 @@ class SettingsDialog(QDialog):
         def on_add():
             title = title_edit.text().strip()
             snippet = snippet_edit.toPlainText().strip()
+            emoji = self.emoji_selected.text()
 
             if not title or not snippet:
                 QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
                 return
 
-            self.template_commands.append({"title": title, "snippet": snippet})
+            self.template_commands.append({"title": title, "snippet": snippet, "emoji": emoji})
             self._refresh_template_list()
             dialog.accept()
 
@@ -663,11 +720,55 @@ class SettingsDialog(QDialog):
         dialog = QDialog(self)
         dialog.setWindowTitle("Edit Template Command")
         dialog.setMinimumWidth(600)
-        dialog.setMinimumHeight(400)
+        dialog.setMinimumHeight(450)
         dialog.setModal(True)
 
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
+
+        # Emoji selector
+        emoji_label = QLabel("Emoji Icon:")
+        layout.addWidget(emoji_label)
+
+        emoji_row = QHBoxLayout()
+
+        # Common emojis for quick selection
+        common_emojis = ["📱", "🔧", "⚙️", "🔄", "📦", "🗑️", "📋", "💾", "🔍", "📊",
+                        "🚀", "⚡", "🔥", "💻", "🖥️", "🔌", "📡", "🪞", "📸", "🎨"]
+
+        current_emoji = cmd.get('emoji', '📱')
+
+        # Create edit emoji selection (using dialog-local state)
+        edit_emoji_selected = QLabel(current_emoji)
+        edit_emoji_selected.setFont(QFont('', 24))
+        edit_emoji_selected.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        edit_emoji_selected.setStyleSheet(f"""
+            QLabel {{
+                background-color: {self.colors['card_bg']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 8px;
+                padding: 10px;
+                min-width: 60px;
+            }}
+        """)
+
+        edit_emoji_buttons = []
+        for emoji in common_emojis:
+            btn = QPushButton(emoji)
+            btn.setFixedSize(40, 40)
+            btn.setFont(QFont('', 16))
+            btn.clicked.connect(lambda checked, e=emoji, sel_label=edit_emoji_selected, btns=edit_emoji_buttons: (
+                sel_label.setText(e),
+                [b.setStyleSheet("") for b in btns],
+                btn.setStyleSheet(f"border: 2px solid {self.colors['accent']}; border-radius: 6px;")
+            ))
+            emoji_row.addWidget(btn)
+            edit_emoji_buttons.append(btn)
+
+        emoji_row.addStretch()
+        layout.addLayout(emoji_row)
+
+        layout.addWidget(edit_emoji_selected, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Title
         title_label = QLabel("Command Title:")
@@ -712,12 +813,13 @@ class SettingsDialog(QDialog):
         def on_save():
             title = title_edit.text().strip()
             snippet = snippet_edit.toPlainText().strip()
+            emoji = edit_emoji_selected.text()
 
             if not title or not snippet:
                 QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
                 return
 
-            self.template_commands[current_row] = {"title": title, "snippet": snippet}
+            self.template_commands[current_row] = {"title": title, "snippet": snippet, "emoji": emoji}
             self._refresh_template_list()
             dialog.accept()
 
@@ -1194,6 +1296,9 @@ class ADBGUI(QMainWindow):
         # Initialize Credential Manager
         self.credential_manager = CredentialManager()
 
+        # Cached logcat text for filtering
+        self._logcat_full_text = ""
+
         # Default script paths
         if 'seat_script_path' not in self.settings:
             self.settings['seat_script_path'] = 'seat.sh'
@@ -1624,6 +1729,7 @@ class ADBGUI(QMainWindow):
         self.logcat_filter_entry.setPlaceholderText("e.g., *:E")
         self.logcat_filter_entry.setMaximumWidth(100)
         self.logcat_filter_entry.setVisible(False)
+        self.logcat_filter_entry.textChanged.connect(self._filter_logcat)
         log_controls.addWidget(self.logcat_filter_entry)
 
         clear_btn = QPushButton("🗑️ Clear")
@@ -1711,6 +1817,7 @@ class ADBGUI(QMainWindow):
     def clear_logcat(self):
         """Clear logcat output text"""
         self.logcat_text.clear()
+        self._logcat_full_text = ""
 
     def clear_current_log(self):
         """Clear the currently visible log area"""
@@ -1751,6 +1858,8 @@ class ADBGUI(QMainWindow):
         # Use insertPlainText for better control (PyQt6 uses MoveOperation enum)
         self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
         self.logcat_text.insertPlainText(message + "\n")
+        # Update cached text for filtering
+        self._logcat_full_text = self.logcat_text.toPlainText()
         # Auto-scroll to bottom
         scrollbar = self.logcat_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -1770,6 +1879,8 @@ class ADBGUI(QMainWindow):
         self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
         # Join with newlines; one trailing newline so each line breaks
         self.logcat_text.insertPlainText("\n".join(lines) + "\n")
+        # Update cached text for filtering
+        self._logcat_full_text = self.logcat_text.toPlainText()
         scrollbar = self.logcat_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
         # Cap memory: keep only the last ~5000 lines to avoid the widget
@@ -1786,6 +1897,55 @@ class ADBGUI(QMainWindow):
             )
             cursor.removeSelectedText()
             cursor.deleteChar()  # remove the leftover newline
+            # Update cached text after trimming
+            self._logcat_full_text = self.logcat_text.toPlainText()
+
+    def _filter_logcat(self):
+        """Filter logcat output based on the filter text.
+
+        This uses an efficient approach:
+        - Caches the full logcat text when new lines are added
+        - Filters from the cached text instead of re-reading
+        - Uses QTextCursor to efficiently replace content
+        """
+        filter_text = self.logcat_filter_entry.text().strip()
+
+        # Store current scroll position
+        scrollbar = self.logcat_text.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+
+        # Use cached text when available (updated on append)
+        # Fall back to reading from widget if cache is empty
+        full_text = self._logcat_full_text if self._logcat_full_text else self.logcat_text.toPlainText()
+
+        if not filter_text:
+            # Clear filter - restore all text
+            if self._logcat_full_text:
+                # Restore from cache
+                cursor = QTextCursor(self.logcat_text.document())
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+                cursor.insertText(self._logcat_full_text)
+            return
+
+        # Filter lines from the text
+        lines = full_text.split('\n')
+        filtered_lines = [line for line in lines if filter_text.lower() in line.lower()]
+
+        # Use QTextCursor for efficient replacement
+        cursor = QTextCursor(self.logcat_text.document())
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+
+        # Replace with filtered content
+        if filtered_lines:
+            cursor.insertText('\n'.join(filtered_lines) + '\n')
+        else:
+            cursor.insertText('')
+
+        # Restore scroll position
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
     def update_status(self, message):
         """Update status bar"""
@@ -2664,7 +2824,7 @@ class ADBGUI(QMainWindow):
         # we still look up the right credential.
         password = self.credential_manager.get_password(gateway, user)
         if not password:
-            password = self.credential_manager.prompt_password(self, gateway, user)
+            password = self.credential_manager.prompt_password(self, gateway_host, user)
             if not password:
                 self.log("Password required to connect", "ERROR")
                 return
@@ -5506,12 +5666,13 @@ class ADBGUI(QMainWindow):
         for cmd in template_commands:
             title = cmd.get('title', 'Command')
             snippet = cmd.get('snippet', '')
-            btn = self._create_template_button(title, snippet)
+            emoji = cmd.get('emoji', '📱')
+            btn = self._create_template_button(title, snippet, emoji)
             self.template_commands_layout.addWidget(btn)
 
-    def _create_template_button(self, title, snippet):
+    def _create_template_button(self, title, snippet, emoji="📱"):
         """Create a styled button for a template command"""
-        btn = QPushButton(f"📝 {title}")
+        btn = QPushButton(f"{emoji} {title}")
         btn.setMaximumWidth(200)
         btn.clicked.connect(lambda: self.execute_template_command(title, snippet))
         return btn
@@ -5566,6 +5727,13 @@ class ADBGUI(QMainWindow):
         def run_command():
             try:
                 self.log(f"Command: {expanded}", "DEBUG")
+                # Build environment with ADB in PATH
+                env = os.environ.copy()
+                adb_dir = os.path.dirname(adb_path) if os.path.isfile(adb_path) else adb_path
+                if adb_dir and os.path.isdir(adb_dir):
+                    # Prepend ADB directory to PATH
+                    env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
+
                 result = subprocess.run(
                     expanded,
                     shell=True,
@@ -5573,7 +5741,8 @@ class ADBGUI(QMainWindow):
                     text=True,
                     encoding='utf-8',
                     errors='replace',
-                    timeout=30
+                    timeout=30,
+                    env=env
                 )
 
                 if result.returncode == 0:
