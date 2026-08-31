@@ -366,6 +366,10 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.parent = parent
         self.current_settings = current_settings or {}
+        # Mirror the parent's color scheme so template dialogs stay themed
+        self.colors = getattr(parent, 'colors', None) or {
+            'card_bg': '#ffffff', 'border': '#e1e1e1', 'accent': '#0078d4'
+        }
 
         self.setWindowTitle("⚙️ Settings")
         self.setMinimumWidth(600)
@@ -2012,6 +2016,17 @@ class ADBGUI(QMainWindow):
         # running `adb devices -l` again on every button click).
         self.cached_devices = list(devices)
 
+        # Reconcile seat connection state against actual adb devices.
+        # A seat whose device (e.g. localhost:64491) is no longer in
+        # `adb devices -l` has dropped in the background; clear it so
+        # the seat panel stops highlighting it.
+        live_device_ids = {d['id'] for d in devices}
+        for dev_info in seat_sh_devices:
+            seat = dev_info.get('seat')
+            device = dev_info.get('device')
+            if seat and device and device not in live_device_ids:
+                self.seat_port_manager.connected_seats.pop(seat, None)
+
         # Get current device list for comparison
         current_device_ids = set()
         if hasattr(self, 'device_display_map'):
@@ -2212,7 +2227,18 @@ class ADBGUI(QMainWindow):
                     self.log("No devices found. Make sure USB debugging is enabled and device is connected.", "WARNING")
 
     def select_device_button(self, device_id):
-        """Handle device button click"""
+        """Handle device button click. Clicking the already-selected device
+        deselects it, matching the red-on-hover styling."""
+        # Toggle: clicking the already-selected device clears the selection.
+        if self.current_device == device_id:
+            self.current_device = None
+            self.device_info_label.setText("No device selected")
+            self.device_info_label.setStyleSheet(f"color: {self.colors['text_secondary']};")
+            for btn in self.device_buttons.values():
+                btn.setStyleSheet("")
+            self.log("Deselected device")
+            return
+
         self.current_device = device_id
 
         # Update button appearance
@@ -2284,6 +2310,15 @@ class ADBGUI(QMainWindow):
         seat_sh_devices = self._cached_seat_sh_devices
         pf_status = self._cached_pf_status
 
+        # Reconcile internal connection state against seat.sh output.
+        # A seat that we previously marked connected (via the click handler)
+        # but no longer appears in `seat.sh devices` has dropped in the
+        # background — clear our internal flag so the highlight goes away.
+        current_seat_names = {d['seat'] for d in seat_sh_devices if d.get('seat')}
+        for seat in list(self.seat_port_manager.connected_seats.keys()):
+            if seat not in current_seat_names:
+                self.seat_port_manager.connected_seats.pop(seat, None)
+
         # Clear existing buttons
         while self.seat_list_layout.count() > 0:
             item = self.seat_list_layout.takeAt(0)
@@ -2302,15 +2337,13 @@ class ADBGUI(QMainWindow):
                 top_seats.append(entry)
 
         # Get connected seats from seat.sh devices (using cached data)
+        # Note: we only use the seat-name here — the port is intentionally NOT
+        # added to a shared set, because seats and port forwards use the same
+        # adb port range and would falsely cross-highlight each other.
         connected_seat_names = set()
-        connected_ports = set()
         for dev_info in seat_sh_devices:
             if dev_info.get('seat'):  # If seat is not empty
                 connected_seat_names.add(dev_info['seat'])
-            # Extract port from device string (e.g., "localhost:64491" -> "64491")
-            device = dev_info.get('device', '')
-            if ':' in device:
-                connected_ports.add(device.split(':')[-1])
 
         # Add connected seats from seat.sh that aren't in the history file
         existing_seat_keys = set((e['seat'], e['gateway']) for e in top_seats)
@@ -2335,10 +2368,16 @@ class ADBGUI(QMainWindow):
         connected_seats = []
         disconnected_seats = []
         for entry in top_seats:
-            # Check if seat is connected via internal state OR seat.sh (match by seat name or port)
-            is_conn = (self.seat_port_manager.is_seat_connected(entry['seat']) or
-                      entry['seat'] in connected_seat_names or
-                      entry.get('port', '') in connected_ports)
+            # A seat is connected only if:
+            #  - internal state marks it connected AND the gateway matches, OR
+            #  - seat.sh devices currently lists this seat as connected.
+            # Note: do NOT use port fallback — ports are shared between seat entries
+            # and would incorrectly highlight unrelated seats.
+            is_conn = (
+                (self.seat_port_manager.is_seat_connected(entry['seat']) and
+                 self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
+                or entry['seat'] in connected_seat_names
+            )
             if is_conn:
                 connected_seats.append(entry)
             else:
@@ -2349,10 +2388,12 @@ class ADBGUI(QMainWindow):
         # Limit to reasonable number (50) for performance
         top_seats = top_seats[:50]
         for entry in top_seats:
-            # Check if seat is connected via internal state OR seat.sh (match by seat name or port)
-            is_connected = (self.seat_port_manager.is_seat_connected(entry['seat']) or
-                          entry['seat'] in connected_seat_names or
-                          entry.get('port', '') in connected_ports)
+            # Same rule as above for the actual highlight
+            is_connected = (
+                (self.seat_port_manager.is_seat_connected(entry['seat']) and
+                 self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
+                or entry['seat'] in connected_seat_names
+            )
             btn_connected = is_connected
             # Format: two lines with Port info on the seat line
             text = f"{entry['seat']} (Port: {entry['port']})\n{entry['gateway']}"
@@ -2443,19 +2484,28 @@ class ADBGUI(QMainWindow):
 
         # Get current port forward status (using cached data)
         active_rack = None
+        active_rack_host = None
         if pf_status and pf_status.get('active'):
             active_rack = pf_status.get('rack', '')
-
-        # Also check connected ports from seat.sh for pre-connected port forwards
-        connected_pf_ports = set(connected_ports)
+            # Normalize to a hostname we can match against gateway entries
+            # (gateway entries are typically "user@host" or bare hostnames).
+            active_rack_host = active_rack.split('@', 1)[-1].strip() if active_rack else ''
 
         # Sort: Connected/active port forwards first, then others
         connected_pf = []
         disconnected_pf = []
         for entry in top_pf:
-            is_connected = (self.seat_port_manager.is_portforward_connected(entry['gateway']) or
-                          entry.get('port', '') in connected_pf_ports)
-            is_active_rack = active_rack and active_rack in entry['gateway']
+            # A port forward is connected only if:
+            #  - the internal state machine says this gateway is connected, OR
+            #  - this gateway matches the active rack reported by the script.
+            # Do NOT use seat-sh port fallback — those ports belong to seats,
+            # not port forwards, and cross-highlighting caused false positives.
+            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
+            is_active_rack = bool(active_rack_host) and (
+                active_rack_host == entry['gateway']
+                or entry['gateway'].endswith('@' + active_rack_host)
+                or active_rack_host in entry['gateway'].split('@', 1)[-1]
+            )
             if is_connected or is_active_rack:
                 connected_pf.append(entry)
             else:
@@ -2467,11 +2517,14 @@ class ADBGUI(QMainWindow):
         top_pf = top_pf[:50]
 
         for entry in top_pf:
-            is_connected = (self.seat_port_manager.is_portforward_connected(entry['gateway']) or
-                          entry.get('port', '') in connected_pf_ports)
+            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
 
             # Check if this entry's gateway matches the active rack
-            is_active_rack = active_rack and active_rack in entry['gateway']
+            is_active_rack = bool(active_rack_host) and (
+                active_rack_host == entry['gateway']
+                or entry['gateway'].endswith('@' + active_rack_host)
+                or active_rack_host in entry['gateway'].split('@', 1)[-1]
+            )
 
             # Format: show rack info if this is the active one
             if is_active_rack:
@@ -2533,7 +2586,13 @@ class ADBGUI(QMainWindow):
         """Handle seat button click"""
         if not entry:
             return
-        is_connected = self.seat_port_manager.is_seat_connected(entry['seat'])
+        # Treat as connected only when the seat is connected to *this* gateway,
+        # otherwise the same seat name on a different gateway would silently
+        # route to the disconnect path.
+        is_connected = (
+            self.seat_port_manager.is_seat_connected(entry['seat'])
+            and self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway']
+        )
 
         if is_connected:
             # Disconnect
@@ -4985,6 +5044,12 @@ class ADBGUI(QMainWindow):
 
         # Add bitrate option to base command (use -b flag which is more widely supported)
         cmd_base.extend(['-b', bitrate])
+
+        # Cap the longer side at 1024px (preserves aspect ratio) to keep
+        # bandwidth and CPU low by default. -m is widely supported; if a
+        # scrcpy build rejects it, the launch code below detects the
+        # "unrecognized option" error and falls back.
+        cmd_base.extend(['-m', '1024'])
 
         cmd_with_adb = None
         # Resolve adb_path: if it's just "adb" and not on PATH, try `which adb` ourselves.
