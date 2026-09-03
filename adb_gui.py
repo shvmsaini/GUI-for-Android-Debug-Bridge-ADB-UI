@@ -28,6 +28,15 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStanda
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
 
 
+class _SignalEmitter(QObject):
+    """Thread-safe signal emitter for marshaling calls from background threads."""
+    call = pyqtSignal(object)
+
+
+# For backward compatibility - some code uses _UICaller
+_UICaller = _SignalEmitter
+
+
 class CredentialManager:
     """Manage SSH passwords using OS credential managers"""
 
@@ -1338,7 +1347,56 @@ class ADBGUI(QMainWindow):
         self.custom_dialog_ready.connect(self._show_custom_dialog)
         # Connect signal for app list dialog
         self.app_list_ready.connect(self.show_app_list_window)
-    
+
+    def closeEvent(self, event):
+        """Clean up resources on window close to prevent memory leaks."""
+        # Stop all timers first
+        if hasattr(self, 'auto_refresh_timer') and self.auto_refresh_timer.isActive():
+            self.auto_refresh_timer.stop()
+        if hasattr(self, 'seat_port_refresh_timer') and self.seat_port_refresh_timer.isActive():
+            self.seat_port_refresh_timer.stop()
+        if hasattr(self, 'pf_status_timer') and self.pf_status_timer.isActive():
+            self.pf_status_timer.stop()
+        if hasattr(self, '_seat_search_timer') and self._seat_search_timer.isActive():
+            self._seat_search_timer.stop()
+        if hasattr(self, '_pf_search_timer') and self._pf_search_timer.isActive():
+            self._pf_search_timer.stop()
+
+        # Stop logcat if running
+        if hasattr(self, 'log_running') and self.log_running:
+            self.log_running = False
+
+        # Kill scrcpy processes
+        if hasattr(self, 'scrcpy_procs'):
+            for device_id, proc in list(self.scrcpy_procs.items()):
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+            self.scrcpy_procs.clear()
+
+        # Clear cached data to release memory
+        if hasattr(self, '_logcat_full_text'):
+            self._logcat_full_text = ""
+        if hasattr(self, '_cached_seat_sh_devices'):
+            self._cached_seat_sh_devices = []
+        if hasattr(self, '_cached_pf_status'):
+            self._cached_pf_status = {}
+
+        # Clear logcat widgets
+        if hasattr(self, 'logcat_text'):
+            self.logcat_text.clear()
+        if hasattr(self, 'output_text'):
+            self.output_text.clear()
+
+        # Accept the close event
+        event.accept()
+
     def setup_ui(self):
         """Setup the modern user interface"""
         # Central widget
@@ -1862,14 +1920,26 @@ class ADBGUI(QMainWindow):
         # Use insertPlainText for better control (PyQt6 uses MoveOperation enum)
         self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
         self.logcat_text.insertPlainText(message + "\n")
-        # Update cached text for filtering
-        self._logcat_full_text = self.logcat_text.toPlainText()
+        # Trim if too many lines (memory safeguard)
+        self._trim_logcat_if_needed()
         # Auto-scroll to bottom
         scrollbar = self.logcat_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-        # Force immediate update of the widget
-        self.logcat_text.update()
-        self.logcat_text.repaint()
+
+    def _trim_logcat_if_needed(self):
+        """Trim logcat content to prevent unbounded memory growth."""
+        max_blocks = 3000  # Reduced from 5000 for better memory control
+        doc = self.logcat_text.document()
+        if doc.blockCount() > max_blocks:
+            cursor = self.logcat_text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.Down,
+                QTextCursor.MoveMode.KeepAnchor,
+                doc.blockCount() - max_blocks,
+            )
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # remove the leftover newline
 
     def _append_logcat_batch(self, lines):
         """Append a batch of logcat lines in one UI update to avoid stutter."""
@@ -1883,33 +1953,17 @@ class ADBGUI(QMainWindow):
         self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
         # Join with newlines; one trailing newline so each line breaks
         self.logcat_text.insertPlainText("\n".join(lines) + "\n")
-        # Update cached text for filtering
-        self._logcat_full_text = self.logcat_text.toPlainText()
+        # Cap memory: keep only the last ~3000 lines
+        self._trim_logcat_if_needed()
+        # Auto-scroll to bottom
         scrollbar = self.logcat_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-        # Cap memory: keep only the last ~5000 lines to avoid the widget
-        # growing unbounded during long logcat sessions.
-        doc = self.logcat_text.document()
-        max_blocks = 5000
-        if doc.blockCount() > max_blocks:
-            cursor = self.logcat_text.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.Start)
-            cursor.movePosition(
-                QTextCursor.MoveOperation.Down,
-                QTextCursor.MoveMode.KeepAnchor,
-                doc.blockCount() - max_blocks,
-            )
-            cursor.removeSelectedText()
-            cursor.deleteChar()  # remove the leftover newline
-            # Update cached text after trimming
-            self._logcat_full_text = self.logcat_text.toPlainText()
 
     def _filter_logcat(self):
         """Filter logcat output based on the filter text.
 
         This uses an efficient approach:
-        - Caches the full logcat text when new lines are added
-        - Filters from the cached text instead of re-reading
+        - Reads directly from the QTextEdit document instead of maintaining a separate cache
         - Uses QTextCursor to efficiently replace content
         """
         filter_text = self.logcat_filter_entry.text().strip()
@@ -1918,21 +1972,13 @@ class ADBGUI(QMainWindow):
         scrollbar = self.logcat_text.verticalScrollBar()
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
 
-        # Use cached text when available (updated on append)
-        # Fall back to reading from widget if cache is empty
-        full_text = self._logcat_full_text if self._logcat_full_text else self.logcat_text.toPlainText()
+        # Read current text from widget (avoid duplicating content in memory)
+        full_text = self.logcat_text.toPlainText()
 
         if not filter_text:
-            # Clear filter - restore all text
-            if self._logcat_full_text:
-                # Restore from cache
-                cursor = QTextCursor(self.logcat_text.document())
-                cursor.movePosition(QTextCursor.MoveOperation.Start)
-                cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
-                cursor.insertText(self._logcat_full_text)
-            return
+            return  # No filter - nothing to do, text is already in widget
 
-        # Filter lines from the text
+        # Filter lines from the text - use list comprehension for efficiency
         lines = full_text.split('\n')
         filtered_lines = [line for line in lines if filter_text.lower() in line.lower()]
 
@@ -3292,7 +3338,7 @@ class ADBGUI(QMainWindow):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # File list (drop enabled)
+        # File list (use DeviceFileListWidget to support drag-and-drop file uploads)
         listbox = DeviceFileListWidget()
         layout.addWidget(listbox, 1)
 
@@ -3548,7 +3594,7 @@ class ADBGUI(QMainWindow):
                         err = res.get("stderr") or res.get("stdout") or "Unknown error"
                         self.log(f"Delete failed for {t}: {err}", "ERROR")
 
-                QTimer.singleShot(0, refresh_listing)
+                ui.call.emit(refresh_listing)
                 ui.call.emit(lambda: self.update_status("Delete complete"))
                 ui.call.emit(lambda: QMessageBox.information(self, "Delete complete", f"Deleted: {ok}\nFailed: {failed}"))
 
@@ -5137,8 +5183,15 @@ class ADBGUI(QMainWindow):
     def _focus_scrcpy_window(self):
         """Bring scrcpy window to front and focus it with retry logic"""
         def do_focus():
-            max_retries = 5
+            # On a fresh launch, scrcpy's window takes a moment to actually
+            # appear — the GUI logs "Launching scrcpy…" immediately, but the
+            # Popen may not yet have spawned its first window by the time
+            # the focus loop starts. Wait up to ~6s for the window to exist
+            # before giving up, so the user doesn't have to click twice.
+            max_retries = 12
             retry_delay = 500  # milliseconds
+            initial_wait_ms = 800
+            time.sleep(initial_wait_ms / 1000.0)
 
             if sys.platform == 'darwin':  # pragma: no cover
                 # macOS: Try multiple methods to focus scrcpy window
