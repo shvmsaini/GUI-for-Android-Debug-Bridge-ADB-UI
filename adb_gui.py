@@ -3655,11 +3655,11 @@ class ADBGUI(QMainWindow):
             if result['success']:
                 self.log("APK installed successfully")
                 self.update_status("APK installed successfully")
-                QMessageBox.information(self, "Success", "APK installed successfully")
+                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", "APK installed successfully"))
             else:
                 self.log(f"Error: {result['stderr']}", "ERROR")
                 self.update_status("Failed to install APK")
-                QMessageBox.critical(self, "Error", f"Failed to install APK:\n{result['stderr']}")
+                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to install APK:\n{result['stderr']}"))
         
         threading.Thread(target=do_install, daemon=True).start()
     
