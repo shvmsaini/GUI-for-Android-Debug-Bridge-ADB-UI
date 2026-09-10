@@ -27,6 +27,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStandardPaths
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
 
+# Optional: embedded scrcpy mirror window (lazy-imported when first opened
+# so the app still runs if py_scrcpy_sdk isn't installed).
+try:
+    from scrcpy_mirror import ScrcpyMirrorWindow, _check_deps as _check_embedded_mirror
+except ImportError:
+    ScrcpyMirrorWindow = None
+    _check_embedded_mirror = None
+
 
 class _SignalEmitter(QObject):
     """Thread-safe signal emitter for marshaling calls from background threads."""
@@ -444,6 +452,40 @@ class SettingsDialog(QDialog):
         pf_layout.addLayout(pf_row)
         layout.addWidget(pf_group)
 
+        # Screenshots section
+        screenshots_group = QGroupBox("📸 Screenshots")
+        screenshots_layout = QVBoxLayout(screenshots_group)
+
+        screenshots_label = QLabel("Screenshot Save Location:")
+        screenshots_layout.addWidget(screenshots_label)
+
+        screenshots_row = QHBoxLayout()
+        # Default to Desktop if it exists
+        default_screenshot_path = self.current_settings.get('screenshot_path', '')
+        if not default_screenshot_path:
+            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+            if os.path.exists(desktop):
+                default_screenshot_path = desktop
+        self.screenshot_path_edit = QLineEdit(default_screenshot_path)
+        self.screenshot_path_edit.setPlaceholderText("Leave empty to use Desktop (or project folder if no Desktop)")
+        screenshots_row.addWidget(self.screenshot_path_edit)
+
+        screenshot_browse_btn = QPushButton("📂 Browse")
+        screenshot_browse_btn.clicked.connect(self.browse_screenshot_path)
+        screenshots_row.addWidget(screenshot_browse_btn)
+
+        screenshots_layout.addLayout(screenshots_row)
+
+        screenshot_info = QLabel(
+            "Screenshots will be saved to this folder as PNG files with timestamps.\n"
+            "If left empty, screenshots go to ~/Desktop (if it exists)."
+        )
+        screenshot_info.setStyleSheet("color: #666; font-size: 9pt;")
+        screenshot_info.setWordWrap(True)
+        screenshots_layout.addWidget(screenshot_info)
+
+        layout.addWidget(screenshots_group)
+
         # Security section
         security_group = QGroupBox("🔐 Security")
         security_layout = QVBoxLayout(security_group)
@@ -585,6 +627,16 @@ class SettingsDialog(QDialog):
         )
         if path:
             self.pf_path_edit.setText(path)
+
+    def browse_screenshot_path(self):
+        """Browse for screenshot save directory"""
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Screenshot Save Directory",
+            os.path.expanduser('~')
+        )
+        if path:
+            self.screenshot_path_edit.setText(path)
 
     def _refresh_template_list(self):
         """Refresh the template commands list display"""
@@ -1571,6 +1623,62 @@ class ADBGUI(QMainWindow):
         scrcpy_row.addStretch()
         device_ops_group.layout().addLayout(scrcpy_row)
 
+        # Navigation buttons for use during a scrcpy session
+        # These send keyevents over ADB so they work with the native
+        # scrcpy window on any Android version (no extra deps required).
+        # Stacked vertically so they don't stretch the row horizontally.
+        nav_label_row = QHBoxLayout()
+        nav_label_row.addWidget(QLabel("📱 Nav (while scrcpy running):"))
+        nav_label_row.addStretch()
+        device_ops_group.layout().addLayout(nav_label_row)
+
+        nav_row = QVBoxLayout()
+        nav_row.setSpacing(4)
+
+        def _make_nav_row():
+            """Helper: build a horizontal row of nav buttons."""
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            return row
+
+        # Row 1: Back, Home, Recent
+        nav_row1 = _make_nav_row()
+        nav_back = QPushButton("◀ Back")
+        nav_back.setToolTip("Send KEYCODE_BACK to the device (4)")
+        nav_back.clicked.connect(lambda: self._send_keyevent(4, "Back"))
+        nav_row1.addWidget(nav_back)
+
+        nav_home = QPushButton("⬛ Home")
+        nav_home.setToolTip("Send KEYCODE_HOME to the device (3)")
+        nav_home.clicked.connect(lambda: self._send_keyevent(3, "Home"))
+        nav_row1.addWidget(nav_home)
+
+        nav_recent = QPushButton("▢ Recent")
+        nav_recent.setToolTip("Send KEYCODE_APP_SWITCH to the device (187)")
+        nav_recent.clicked.connect(lambda: self._send_keyevent(187, "Recent"))
+        nav_row1.addWidget(nav_recent)
+        nav_row.addLayout(nav_row1)
+
+        # Row 2: Power, Menu, Notif
+        nav_row2 = _make_nav_row()
+        nav_power = QPushButton("🔌 Power")
+        nav_power.setToolTip("Send KEYCODE_POWER to the device (26)")
+        nav_power.clicked.connect(lambda: self._send_keyevent(26, "Power"))
+        nav_row2.addWidget(nav_power)
+
+        nav_menu = QPushButton("📋 Menu")
+        nav_menu.setToolTip("Send KEYCODE_MENU to the device (82)")
+        nav_menu.clicked.connect(lambda: self._send_keyevent(82, "Menu"))
+        nav_row2.addWidget(nav_menu)
+
+        nav_notif = QPushButton("🔔 Notif")
+        nav_notif.setToolTip("Expand notification shade")
+        nav_notif.clicked.connect(self._expand_notifications)
+        nav_row2.addWidget(nav_notif)
+        nav_row.addLayout(nav_row2)
+
+        device_ops_group.layout().addLayout(nav_row)
+
         # Advanced section - Reboot options (collapsible, colored red)
         advanced_header = QPushButton("▶ ⚠️ Advanced")
         advanced_header.setCheckable(True)
@@ -1672,8 +1780,7 @@ class ADBGUI(QMainWindow):
         shell_group = self.create_card("💻 Shell Commands")
         host_os = "Windows" if sys.platform == "win32" else ("macOS" if sys.platform == "darwin" else "Linux")
         shell_group.layout().addWidget(QLabel(f"Run commands ON YOUR ANDROID DEVICE (not {host_os}):"))
-        help_text = (f"⚠️ These commands run on your Android device (Linux), not on {host_os}.\n\n"
-                    "Examples: 'ls /sdcard', 'pm list packages', 'dumpsys battery | grep level'\n"
+        help_text = (f"Examples: 'ls /sdcard', 'pm list packages', 'dumpsys battery | grep level'\n"
                     "Use Android/Linux shell commands: 'grep', 'ls', 'cat' (not desktop OS commands).\n\n"
                     "Note: You can include 'adb shell' prefix, but it's not required (auto-stripped)")
         self.shell_help_label = QLabel(help_text)
@@ -2110,154 +2217,166 @@ class ADBGUI(QMainWindow):
             # Only log if device list changed
             devices_changed = current_device_ids != new_device_ids
 
-            # Clear old device buttons and stretch
-            for btn in self.device_buttons.values():
-                btn.deleteLater()
-            self.device_buttons.clear()
+            # Store device_display_map as instance variable for future comparisons
+            self.device_display_map = device_display_map
 
-            # Clear all items from layout (buttons and stretches)
-            while self.devices_layout.count() > 0:
-                item = self.devices_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+            # Only rebuild buttons if device list changed
+            if devices_changed:
+                # Clear old device buttons and stretch
+                for btn in self.device_buttons.values():
+                    btn.deleteLater()
+                self.device_buttons.clear()
 
-            # Create new device buttons
-            for d in devices:
-                device_id = d['id']
-                model = d.get('model')
-                manufacturer = d.get('manufacturer', '')
-                product = d.get('product')
+                # Clear all items from layout (buttons and stretches)
+                while self.devices_layout.count() > 0:
+                    item = self.devices_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
 
-                # Build display name
-                if model:
-                    if manufacturer:
-                        display_name = f"{manufacturer} {model}"
+            # Create new device buttons (only if changed)
+            if devices_changed:
+                for d in devices:
+                    device_id = d['id']
+                    model = d.get('model')
+                    manufacturer = d.get('manufacturer', '')
+                    product = d.get('product')
+
+                    # Build display name
+                    if model:
+                        if manufacturer:
+                            display_name = f"{manufacturer} {model}"
+                        else:
+                            display_name = model
+                    elif product:
+                        display_name = product.replace('_', ' ').title()
                     else:
-                        display_name = model
-                elif product:
-                    display_name = product.replace('_', ' ').title()
-                else:
-                    display_name = "Unknown Device"
+                        display_name = "Unknown Device"
 
-                # Try to find SEAT for this device from seat.sh
-                seat_name = ""
-                gateway_name = ""
-                if device_id in seat_device_map:
-                    seat_name = seat_device_map[device_id].get('seat', '')
-                    gateway_name = seat_device_map[device_id].get('gateway', '')
+                    # Try to find SEAT for this device from seat.sh
+                    seat_name = ""
+                    gateway_name = ""
+                    if device_id in seat_device_map:
+                        seat_name = seat_device_map[device_id].get('seat', '')
+                        gateway_name = seat_device_map[device_id].get('gateway', '')
 
-                # If not found in seat.sh, try history
-                if not seat_name:
-                    for seat_entry in self.seat_port_manager.load_history():
-                        if seat_entry['seat'] == device_id or device_id in seat_entry['seat']:
-                            seat_name = seat_entry['seat']
-                            # Gateway may include user@host; show only the host
-                            gw = seat_entry.get('gateway', '')
-                            if '@' in gw:
-                                gateway_name = gw.split('@', 1)[1]
-                            else:
-                                gateway_name = gw
-                            break
+                    # If not found in seat.sh, try history
+                    if not seat_name:
+                        for seat_entry in self.seat_port_manager.load_history():
+                            if seat_entry['seat'] == device_id or device_id in seat_entry['seat']:
+                                seat_name = seat_entry['seat']
+                                # Gateway may include user@host; show only the host
+                                gw = seat_entry.get('gateway', '')
+                                if '@' in gw:
+                                    gateway_name = gw.split('@', 1)[1]
+                                else:
+                                    gateway_name = gw
+                                break
 
-                # Create container widget with button and play button (no gap between them)
-                container = QWidget()
-                container_layout = QHBoxLayout(container)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                container_layout.setSpacing(0)  # No space between main button and play button
+                    # Create container widget with button and play button (no gap between them)
+                    container = QWidget()
+                    container_layout = QHBoxLayout(container)
+                    container_layout.setContentsMargins(0, 0, 0, 0)
+                    container_layout.setSpacing(0)  # No space between main button and play button
 
-                # Create button for this device
-                # If SEAT is available from seat.sh, use it as primary name with DEVICE as port
-                if seat_name:
-                    if gateway_name:
-                        device_display = f"💺 {seat_name}\n📡 {gateway_name}\n📱 {device_id}"
+                    # Create button for this device
+                    # If SEAT is available from seat.sh, use it as primary name with DEVICE as port
+                    if seat_name:
+                        if gateway_name:
+                            device_display = f"💺 {seat_name}\n📡 {gateway_name}\n📱 {device_id}"
+                        else:
+                            device_display = f"💺 {seat_name}\n📱 {device_id}"
                     else:
-                        device_display = f"💺 {seat_name}\n📱 {device_id}"
-                else:
-                    device_display = f"📱 {display_name}\n{device_id}"
+                        device_display = f"📱 {display_name}\n{device_id}"
 
-                btn = QPushButton(device_display)
-                btn.setMinimumHeight(60)
-                btn.setMaximumHeight(60)
-                btn.setMinimumWidth(160)
-                btn.setMaximumWidth(160)
-                btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
-                btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-                btn.clicked.connect(lambda checked, did=device_id: self.select_device_button(did))
+                    btn = QPushButton(device_display)
+                    btn.setMinimumHeight(60)
+                    btn.setMaximumHeight(60)
+                    btn.setMinimumWidth(160)
+                    btn.setMaximumWidth(160)
+                    btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+                    btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                    btn.clicked.connect(lambda checked, did=device_id: self.select_device_button(did))
 
-                # Apply styling with NO border (removes visual gap)
-                if device_id == self.current_device:
-                    # Selected: Green background, red on hover (to indicate disconnect)
-                    btn.setStyleSheet(f"""
-                        QPushButton {{
-                            background-color: {self.colors['success']};
-                            color: white;
-                            font-weight: bold;
-                            text-align: left;
-                            padding-left: 8px;
+                    # Apply styling with NO border (removes visual gap)
+                    if device_id == self.current_device:
+                        # Selected: Green background, red on hover (to indicate disconnect)
+                        btn.setStyleSheet(f"""
+                            QPushButton {{
+                                background-color: {self.colors['success']};
+                                color: white;
+                                font-weight: bold;
+                                text-align: left;
+                                padding-left: 8px;
+                                border: none;
+                                margin: 0px;
+                            }}
+                            QPushButton:hover {{
+                                background-color: {self.colors['error']};
+                                color: white;
+                            }}
+                        """)
+                    else:
+                        # Not selected: Default background, blue on hover (indicates select)
+                        btn.setStyleSheet(f"""
+                            QPushButton {{
+                                text-align: left;
+                                padding-left: 8px;
+                                border: none;
+                                margin: 0px;
+                            }}
+                            QPushButton:hover {{
+                                background-color: {self.colors['accent']};
+                                color: white;
+                            }}
+                        """)
+
+                    # Play button for scrcpy (tightly attached, no gap, no border)
+                    play_btn = QPushButton("▶")
+                    play_btn.setMaximumWidth(40)
+                    play_btn.setMinimumWidth(40)
+                    play_btn.setMaximumHeight(60)
+                    play_btn.setMinimumHeight(60)
+                    play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                    play_btn.clicked.connect(lambda checked=False, did=device_id: self._launch_scrcpy_for_device(did))
+                    play_btn.setToolTip("Mirror screen via scrcpy")
+                    play_btn.setStyleSheet("""
+                        QPushButton {
                             border: none;
                             margin: 0px;
-                        }}
-                        QPushButton:hover {{
-                            background-color: {self.colors['error']};
-                            color: white;
-                        }}
-                    """)
-                else:
-                    # Not selected: Default background, blue on hover (indicates select)
-                    btn.setStyleSheet(f"""
-                        QPushButton {{
-                            text-align: left;
-                            padding-left: 8px;
-                            border: none;
-                            margin: 0px;
-                        }}
-                        QPushButton:hover {{
-                            background-color: {self.colors['accent']};
-                            color: white;
-                        }}
+                            padding: 0px;
+                        }
+                        QPushButton:hover {
+                            background-color: #888;
+                        }
                     """)
 
-                # Play button for scrcpy (tightly attached, no gap, no border)
-                play_btn = QPushButton("▶")
-                play_btn.setMaximumWidth(40)
-                play_btn.setMinimumWidth(40)
-                play_btn.setMaximumHeight(60)
-                play_btn.setMinimumHeight(60)
-                play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-                play_btn.clicked.connect(lambda checked=False, did=device_id: self._launch_scrcpy_for_device(did))
-                play_btn.setToolTip("Mirror screen via scrcpy")
-                play_btn.setStyleSheet("""
-                    QPushButton {
-                        border: none;
-                        margin: 0px;
-                        padding: 0px;
-                    }
-                    QPushButton:hover {
-                        background-color: #888;
-                    }
-                """)
+                    container_layout.addWidget(btn, 0)
+                    container_layout.addWidget(play_btn, 0)
+                    container_layout.setContentsMargins(0, 0, 0, 0)
+                    container_layout.setSpacing(0)
 
-                container_layout.addWidget(btn, 0)
-                container_layout.addWidget(play_btn, 0)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                container_layout.setSpacing(0)
+                    # Store button in dict for select_device_button to find
+                    self.device_buttons[device_id] = btn
 
-                self.devices_layout.addWidget(container)
+                    self.devices_layout.addWidget(container)
 
-            self.devices_layout.addStretch()  # Add stretch at the end
+                self.devices_layout.addStretch()  # Add stretch at the end
 
-            # Auto-select first device if none selected
-            was_no_device = not self.current_device
-            if was_no_device and devices:
-                first_device_id = devices[0]['id']
-                self.select_device_button(first_device_id)
+                # Auto-select first device if none selected
+                was_no_device = not self.current_device
+                if was_no_device and devices:
+                    first_device_id = devices[0]['id']
+                    self.select_device_button(first_device_id)
             
-            if not silent or devices_changed:
+            if devices_changed:
+                # Only log when device list actually changes, not on every refresh
                 self.update_status(f"Found {len(devices)} device(s)")
-                if devices_changed:
-                    # Log with device names only when list changes
-                    device_names = [f"{d.get('model', d.get('product', 'Unknown'))} ({d['id']})" for d in devices]
-                    self.log(f"Found {len(devices)} device(s): {', '.join(device_names)}")
+                # Log with device names only when list changes
+                device_names = [f"{d.get('model', d.get('product', 'Unknown'))} ({d['id']})" for d in devices]
+                self.log(f"Found {len(devices)} device(s): {', '.join(device_names)}")
+            elif not silent:
+                # Update status bar even if devices didn't change (for manual refresh)
+                self.update_status(f"Found {len(devices)} device(s)")
         else:
             had_devices = len(self.device_buttons) > 0
             # Clear all device buttons
@@ -2274,9 +2393,25 @@ class ADBGUI(QMainWindow):
 
     def select_device_button(self, device_id):
         """Handle device button click. Clicking the already-selected device
-        deselects it, matching the red-on-hover styling."""
-        # Toggle: clicking the already-selected device clears the selection.
+        either deselects it (for local devices) or disconnects it (for seat devices)."""
+        # Toggle: clicking the already-selected device clears the selection or disconnects.
         if self.current_device == device_id:
+            # Check if this is a seat device (localhost:port format)
+            if device_id.startswith('localhost:'):
+                # Try to find the seat name for this device
+                try:
+                    seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+                    for dev_info in seat_sh_devices:
+                        if dev_info.get('device') == device_id:
+                            seat_name = dev_info.get('seat', '')
+                            if seat_name:
+                                self.log(f"Disconnecting seat device {seat_name}...")
+                                self.disconnect_seat(seat_name)
+                                return
+                except Exception:
+                    pass
+
+            # Not a seat device, or seat lookup failed - just deselect
             self.current_device = None
             self.device_info_label.setText("No device selected")
             self.device_info_label.setStyleSheet(f"color: {self.colors['text_secondary']};")
@@ -2290,7 +2425,22 @@ class ADBGUI(QMainWindow):
         # Update button appearance
         for bid, btn in self.device_buttons.items():
             if bid == device_id:
-                btn.setStyleSheet(f"background-color: {self.colors['success']}; color: white; font-weight: bold;")
+                # Selected: Green background, red on hover (to indicate disconnect)
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {self.colors['success']};
+                        color: white;
+                        font-weight: bold;
+                        text-align: left;
+                        padding-left: 8px;
+                        border: none;
+                        margin: 0px;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {self.colors['error']};
+                        color: white;
+                    }}
+                """)
             else:
                 btn.setStyleSheet("")
 
@@ -2300,9 +2450,11 @@ class ADBGUI(QMainWindow):
         # every single time.
         model = 'Unknown'
         status = 'unknown'
+
+        # Try to find the device in cached_devices
         for d in getattr(self, 'cached_devices', []):
             if d.get('id') == device_id:
-                model = d.get('model') or 'Unknown'
+                model = d.get('model') or d.get('product') or 'Unknown'
                 status = d.get('status') or 'unknown'
                 break
         else:
@@ -2310,13 +2462,39 @@ class ADBGUI(QMainWindow):
             try:
                 for d in self.adb.get_devices(silent=True):
                     if d.get('id') == device_id:
-                        model = d.get('model') or 'Unknown'
+                        model = d.get('model') or d.get('product') or 'Unknown'
                         status = d.get('status') or 'unknown'
                         break
             except Exception:
                 pass
 
-        self.device_info_label.setText(f"✓ Selected: {model} - Status: {status}")
+        # For seat devices, try to get seat name and gateway info
+        seat_name = ""
+        gateway_name = ""
+        if device_id.startswith('localhost:'):
+            # This is likely a seat device, try to find seat info
+            try:
+                seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+                for dev_info in seat_sh_devices:
+                    if dev_info.get('device') == device_id:
+                        seat_name = dev_info.get('seat', '')
+                        gateway_name = dev_info.get('gateway', '')
+                        break
+            except Exception:
+                pass
+
+        # Format the display string
+        if seat_name:
+            display_text = f"Seat: {seat_name}"
+            if gateway_name:
+                # Extract just the hostname from gateway if it has user@host
+                gw_display = gateway_name.split('@')[-1] if '@' in gateway_name else gateway_name
+                display_text += f" @ {gw_display}"
+            display_text += f" - Status: {status}"
+        else:
+            display_text = f"{model} - Status: {status}"
+
+        self.device_info_label.setText(f"✓ Selected: {display_text}")
         self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
 
         self.log(f"Selected device: {device_id}")
@@ -4134,36 +4312,24 @@ class ADBGUI(QMainWindow):
             self.log("Loading app names...")
             labels_found = 0
             for i, package in enumerate(apps):
-                if i % 20 == 0:
-                    self.log(f"Loading app names {i}/{len(apps)}...")
                 label = self.get_app_label(package)
                 if label and label != package:
                     app_window.app_labels[package] = label
                     labels_found += 1
-                    # Log first few successful extractions for debugging
-                    if labels_found <= 3:
-                        self.log(f"Found label for {package}: {label}", "DEBUG")
                 else:
                     # Use package name as fallback
                     app_window.app_labels[package] = package
-                    # Log first few failures for debugging
-                    if i < 3:
-                        self.log(f"Could not find label for {package}, using package name", "DEBUG")
             self.log(f"Loaded {len(app_window.app_labels)} app names ({labels_found} with custom labels)")
             if labels_found == 0:
                 self.log("Warning: No app labels found. Labels may be stored as resource IDs.", "WARNING")
             QTimer.singleShot(0, lambda: update_list())
-        
+
         # Load app versions in background
         def load_app_versions():
             """Load app versions for all apps asynchronously"""
             self.log("Loading app versions...")
             versions_found = 0
             for i, package in enumerate(apps):
-                if i % 50 == 0:
-                    self.log(f"Loading versions {i}/{len(apps)}...")
-                    self.update_status(f"Loading versions {i}/{len(apps)}...")
-                
                 # Get version name using dumpsys package
                 version_result = self.adb.run_command(f"{self.get_device_flag()} shell dumpsys package {package}")
                 if version_result['success'] and version_result['stdout']:
@@ -4176,11 +4342,8 @@ class ADBGUI(QMainWindow):
                             if version:
                                 app_window.app_versions[package] = version
                                 versions_found += 1
-                                # Update the list every 10 versions to show progress
-                                if versions_found % 10 == 0:
-                                    QTimer.singleShot(0, lambda: update_list())
                                 break
-            
+
             self.log(f"Loaded versions for {versions_found}/{len(apps)} apps")
             self.update_status(f"Found {len(apps)} apps")
             # Final update to show all versions
@@ -4921,27 +5084,34 @@ class ADBGUI(QMainWindow):
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
-        
-        # Create screenshots folder in executable's directory (or script directory if running from source)
-        # When running as PyInstaller executable, use the executable's directory
-        if getattr(sys, 'frozen', False):
-            # Running as compiled executable
-            project_dir = os.path.dirname(sys.executable)
-        else:
-            # Running as script
-            project_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        screenshots_dir = os.path.join(project_dir, 'screenshots')
+
+        # Determine screenshot save directory
+        # Priority: user setting > Desktop > project directory
+        screenshots_dir = self.settings.get('screenshot_path', '')
+
+        if not screenshots_dir:
+            # Default to Desktop if available, otherwise project directory
+            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+            if os.path.exists(desktop):
+                screenshots_dir = desktop
+            else:
+                # Fallback to executable/script directory
+                if getattr(sys, 'frozen', False):
+                    project_dir = os.path.dirname(sys.executable)
+                else:
+                    project_dir = os.path.dirname(os.path.abspath(__file__))
+                screenshots_dir = os.path.join(project_dir, 'screenshots')
+
         os.makedirs(screenshots_dir, exist_ok=True)
-        
+
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"screenshot_{timestamp}.png"
         dest_path = os.path.join(screenshots_dir, filename)
-        
+
         self.log("Taking screenshot...")
         self.update_status("Taking screenshot...")
-        
+
         def do_screenshot():
             try:
                 # Take screenshot on device
@@ -4969,7 +5139,7 @@ class ADBGUI(QMainWindow):
                 self.log(f"Exception in screenshot: {error_msg}", "ERROR")
                 self.update_status("Screenshot failed")
                 QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"An error occurred:\n{error_msg}"))
-        
+
         threading.Thread(target=do_screenshot, daemon=True).start()
 
     def find_scrcpy(self):
@@ -5002,8 +5172,104 @@ class ADBGUI(QMainWindow):
         for c in candidates:
             if os.path.exists(c):
                 return c
-        
+
         return None
+
+    def open_embedded_mirror(self):
+        """Open the embedded scrcpy mirror window with navigation buttons."""
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+
+        if ScrcpyMirrorWindow is None:
+            QMessageBox.warning(
+                self, "Feature Unavailable",
+                "The embedded mirror module (scrcpy_mirror.py) could not be imported.\n\n"
+                "Make sure the file exists in the same directory as adb_gui.py."
+            )
+            return
+
+        # Check dependencies and show install instructions if missing
+        if _check_embedded_mirror is not None:
+            ok, msg = _check_embedded_mirror()
+            if not ok:
+                QMessageBox.information(self, "Install Dependencies", msg)
+                return
+
+        device_id = self.current_device
+        adb_path = getattr(self.adb, 'adb_path', 'adb')
+
+        # Parse bitrate from settings (default 1m = 1000000)
+        bitrate = 1000000
+
+        try:
+            win = ScrcpyMirrorWindow(
+                device_id=device_id,
+                adb_path=adb_path,
+                bitrate=bitrate,
+                max_size=1024,
+            )
+            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            win.show()
+            self.log(f"Opened embedded mirror for {device_id}")
+        except Exception as e:
+            self.log(f"Failed to open embedded mirror: {e}", "ERROR")
+            QMessageBox.critical(self, "Mirror Error",
+                                 f"Failed to open embedded mirror:\n\n{e}")
+
+    def _send_keyevent(self, keycode, label=""):
+        """Send a keyevent to the currently selected device via ADB.
+
+        Works alongside the native scrcpy window — the user can run scrcpy
+        to mirror the device, then click these buttons to send Back / Home /
+        Recent / Power / Menu without keyboard shortcuts.
+        """
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+        result = self.adb.run_command(
+            f"-s {self.current_device} shell input keyevent {keycode}"
+        )
+        if result.get('success'):
+            self.log(f"Sent {label} keyevent ({keycode}) to {self.current_device}")
+            self.update_status(f"Sent {label} keyevent")
+        else:
+            self.log(f"Failed to send {label} keyevent: {result.get('stderr', '')}", "ERROR")
+
+    def _expand_notifications(self):
+        """Expand the notification shade on the currently selected device."""
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+        # Swipe down from top of screen to expand notifications.
+        # Get the device screen size first to compute the swipe coordinates.
+        size_result = self.adb.run_command(
+            f"-s {self.current_device} shell wm size"
+        )
+        w = h = 1080  # defaults
+        if size_result.get('success'):
+            out = size_result.get('stdout', '').strip()
+            # Output looks like: "Physical size: 1080x2400"
+            for token in out.replace(':', ' ').split():
+                if 'x' in token:
+                    try:
+                        parts = token.split('x')
+                        w, h = int(parts[0]), int(parts[1])
+                        break
+                    except (ValueError, IndexError):
+                        pass
+        swipe_x = w // 2
+        swipe_y_start = 10
+        swipe_y_end = h // 3
+        result = self.adb.run_command(
+            f"-s {self.current_device} shell input swipe "
+            f"{swipe_x} {swipe_y_start} {swipe_x} {swipe_y_end} 300"
+        )
+        if result.get('success'):
+            self.log(f"Expanded notifications on {self.current_device}")
+            self.update_status("Notifications expanded")
+        else:
+            self.log(f"Failed to expand notifications: {result.get('stderr', '')}", "ERROR")
 
     def scrcpy_device(self, bitrate='1m'):
         """Mirror device screen using scrcpy."""
