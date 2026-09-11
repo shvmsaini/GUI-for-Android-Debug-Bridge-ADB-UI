@@ -133,12 +133,19 @@ class CredentialManager:
 
 
 class SeatPortManager:
-    """Manage seat connections and port forwards from ~/.adb-seat-ports"""
+    """Manage seat connections and port forwards.
+
+    Seat history: ~/.cache/adb-seat-ports
+    Port forward history: ~/.cache/portforward-racks
+    """
 
     def __init__(self, log_callback=None, settings=None):
         self.log_callback = log_callback
         self.settings = settings or {}
-        self.history_file = os.path.expanduser("~/.adb-seat-ports")
+        # Use ~/.cache directory for history files
+        self.history_dir = os.path.expanduser("~/.cache")
+        self.seat_history_file = os.path.join(self.history_dir, "adb-seat-ports")
+        self.portforward_history_file = os.path.join(self.history_dir, "portforward-racks")
         self.connected_seats = {}  # {seat: gateway}
         self.connected_portforward = None  # gateway or None
 
@@ -160,19 +167,28 @@ class SeatPortManager:
         """Get the configured portforward script path"""
         return self.settings.get('portforward_script_path', '')
 
-    def load_history(self):
-        """Load connection history from ~/.adb-seat-ports"""
+    def load_history(self, entry_type='seat'):
+        """Load connection history from the appropriate history file.
+
+        Args:
+            entry_type: 'seat' or 'portforward' to determine which file to read.
+
+        Returns:
+            List of history entries with seat, port, gateway, timestamp fields.
+        """
+        history_file = self.seat_history_file if entry_type == 'seat' else self.portforward_history_file
         entries = []
-        if not os.path.exists(self.history_file):
+        if not os.path.exists(history_file):
             return entries
 
         try:
-            with open(self.history_file, 'r') as f:
+            with open(history_file, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     # Format: SEAT=PORT|GATEWAY|TS
+                    # For portforward: RACK=PORT|USER|TS → reconstruct as RACK=PORT|USER@RACK|TS
                     parts = line.split('=')
                     if len(parts) != 2:
                         continue
@@ -185,6 +201,13 @@ class SeatPortManager:
                         ts_int = int(ts)
                     except:
                         continue
+
+                    # For portforward entries, reconstruct gateway as user@hostname
+                    if entry_type == 'portforward':
+                        # gateway field contains user, seat field contains rack hostname
+                        # Reconstruct as user@rack for consistency with UI expectations
+                        gateway = f"{gateway}@{seat}"
+
                     entries.append({
                         'seat': seat,
                         'port': port,
@@ -193,13 +216,20 @@ class SeatPortManager:
                     })
         except Exception as e:
             if self.log_callback:
-                self.log_callback(f"Error loading seat/port history: {e}", "ERROR")
+                self.log_callback(f"Error loading {entry_type} history: {e}", "ERROR")
 
         return entries
 
     def get_top_entries(self, entry_type='seat', limit=5):
-        """Get top N entries (seats or port forwards) sorted by timestamp"""
-        entries = self.load_history()
+        """Get top N entries (seats or port forwards) sorted by timestamp.
+
+        Args:
+            entry_type: 'seat' or 'portforward' to determine which file to read.
+
+        Returns:
+            List of top N entries sorted by timestamp descending.
+        """
+        entries = self.load_history(entry_type)
 
         if entry_type == 'seat':
             # Group by seat, keep most recent
@@ -225,17 +255,29 @@ class SeatPortManager:
 
         return []
 
-    def append_history(self, seat, port, gateway):
-        """Append a new entry to ~/.adb-seat-ports"""
+    def append_history(self, seat, port, gateway, entry_type='seat'):
+        """Append a new entry to the appropriate history file.
+
+        Args:
+            seat: Seat name
+            port: Port number
+            gateway: Gateway host
+            entry_type: 'seat' or 'portforward' to determine which file to write.
+        """
         ts = int(time.time())
         line = f"{seat}={port}|{gateway}|{ts}\n"
 
+        history_file = self.seat_history_file if entry_type == 'seat' else self.portforward_history_file
+
         try:
-            with open(self.history_file, 'a') as f:
+            # Ensure the cache directory exists
+            if not os.path.exists(self.history_dir):
+                os.makedirs(self.history_dir)
+            with open(history_file, 'a') as f:
                 f.write(line)
         except Exception as e:
             if self.log_callback:
-                self.log_callback(f"Error writing to seat/port history: {e}", "ERROR")
+                self.log_callback(f"Error writing to {entry_type} history: {e}", "ERROR")
 
     def is_seat_connected(self, seat):
         """Check if a seat is currently connected"""
@@ -2505,7 +2547,10 @@ class ADBGUI(QMainWindow):
         pass
 
     def refresh_seat_port_lists(self, refetch=True):
-        """Refresh seat and port forward lists from ~/.adb-seat-ports
+        """Refresh seat and port forward lists.
+
+        Seat data comes from ~/.cache/adb-seat-ports
+        Port forward data comes from ~/.cache/portforward-racks
 
         Args:
             refetch: If True, re-run external scripts (seat.sh devices, portforward status).
