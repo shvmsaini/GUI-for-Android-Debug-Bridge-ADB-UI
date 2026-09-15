@@ -327,6 +327,18 @@ class ScrcpyMirrorWindow(QMainWindow):
         settings_bar = self._build_settings_bar()
         layout.addWidget(settings_bar)
 
+        # _build_settings_bar sets up the quality combo which fires
+        # _on_quality_changed during init, overwriting self.bitrate with
+        # the preset value (e.g. Medium = 1.5Mbps). Restore the bitrate
+        # the caller asked for, then sync the dropdowns to display it.
+        # Wrap in try/except to be defensive against any native-lib
+        # SIGSEGV during initialization.
+        try:
+            self.bitrate = bitrate
+            self._sync_comboboxes_to_bitrate()
+        except Exception:
+            pass
+
         # ── video display ───────────────────────────────────────────
         self.video = VideoDisplayWidget()
         layout.addWidget(self.video, 1)
@@ -413,27 +425,30 @@ class ScrcpyMirrorWindow(QMainWindow):
         return bar
 
     def _on_quality_changed(self, idx):
-        if 0 <= idx < len(self._QUALITY_PRESETS):
-            label, bitrate, fps, max_size = self._QUALITY_PRESETS[idx]
-            self.bitrate = bitrate
-            self.max_fps = fps
-            self.max_size = max_size
-            # Sync the dropdowns
-            idx_fps = self.fps_combo.findText(str(fps))
-            if idx_fps >= 0:
-                self.fps_combo.blockSignals(True)
-                self.fps_combo.setCurrentIndex(idx_fps)
-                self.fps_combo.blockSignals(False)
-            br_label = None
-            for i in range(self.bitrate_combo.count()):
-                if self.bitrate_combo.itemData(i) == bitrate:
-                    br_label = self.bitrate_combo.itemText(i)
-                    break
-            if br_label:
-                self.bitrate_combo.blockSignals(True)
-                self.bitrate_combo.setCurrentText(br_label)
-                self.bitrate_combo.blockSignals(False)
-            self.apply_btn.setVisible(True)
+        try:
+            if 0 <= idx < len(self._QUALITY_PRESETS):
+                label, bitrate, fps, max_size = self._QUALITY_PRESETS[idx]
+                self.bitrate = bitrate
+                self.max_fps = fps
+                self.max_size = max_size
+                # Sync the dropdowns
+                idx_fps = self.fps_combo.findText(str(fps))
+                if idx_fps >= 0:
+                    self.fps_combo.blockSignals(True)
+                    self.fps_combo.setCurrentIndex(idx_fps)
+                    self.fps_combo.blockSignals(False)
+                br_label = None
+                for i in range(self.bitrate_combo.count()):
+                    if self.bitrate_combo.itemData(i) == bitrate:
+                        br_label = self.bitrate_combo.itemText(i)
+                        break
+                if br_label:
+                    self.bitrate_combo.blockSignals(True)
+                    self.bitrate_combo.setCurrentText(br_label)
+                    self.bitrate_combo.blockSignals(False)
+                self.apply_btn.setVisible(True)
+        except Exception:
+            pass
 
     def _on_fps_changed(self, txt):
         try:
@@ -443,10 +458,50 @@ class ScrcpyMirrorWindow(QMainWindow):
             pass
 
     def _on_bitrate_changed(self, txt):
-        br = self.bitrate_combo.currentData()
-        if br is not None:
-            self.bitrate = br
-            self.apply_btn.setVisible(True)
+        try:
+            br = self.bitrate_combo.currentData()
+            if br is not None:
+                self.bitrate = br
+                self.apply_btn.setVisible(True)
+        except Exception:
+            pass
+
+    def _sync_comboboxes_to_bitrate(self):
+        """Update the quality/bitrate/fps dropdowns to match self.bitrate.
+
+        Used at startup to reflect the caller-provided bitrate, after the
+        quality combo's default index selection has overwritten it.
+        """
+        try:
+            if not hasattr(self, 'quality_combo'):
+                return
+
+            # Find a quality preset that matches the current bitrate; if none
+            # matches, leave the dropdown at its current selection but still
+            # update the bitrate_combo to display the closest match.
+            for i, (_, br, fps, _ms) in enumerate(self._QUALITY_PRESETS):
+                if br == self.bitrate:
+                    self.quality_combo.blockSignals(True)
+                    self.quality_combo.setCurrentIndex(i)
+                    self.quality_combo.blockSignals(False)
+                    self.max_fps = fps
+                    if hasattr(self, 'fps_combo'):
+                        self.fps_combo.blockSignals(True)
+                        self.fps_combo.setCurrentText(str(fps))
+                        self.fps_combo.blockSignals(False)
+                    break
+
+            # Sync the bitrate_combo to display the current bitrate
+            if hasattr(self, 'bitrate_combo'):
+                for i in range(self.bitrate_combo.count()):
+                    if self.bitrate_combo.itemData(i) == self.bitrate:
+                        self.bitrate_combo.blockSignals(True)
+                        self.bitrate_combo.setCurrentIndex(i)
+                        self.bitrate_combo.blockSignals(False)
+                        break
+        except Exception:
+            # Don't let native-lib initialization crashes propagate up.
+            pass
 
     def _apply_settings(self):
         """Restart the mirror client with the new settings."""
@@ -858,7 +913,6 @@ class ScrcpyMirrorWindow(QMainWindow):
         import os
         import datetime
         import subprocess
-        from pathlib import Path
         import sys
 
         if self._client is None:
@@ -888,32 +942,37 @@ class ScrcpyMirrorWindow(QMainWindow):
         filename = f"screenshot_{timestamp}.png"
         dest_path = os.path.join(screenshots_dir, filename)
 
-        device_flag = f"-s {self.device_id}" if self.device_id else ""
         self.status.showMessage("Taking screenshot...")
+
+        adb_path = self.adb_path if self.adb_path else "adb"
+        # Use a list of arguments (not shell=True) to avoid any quoting
+        # issues with device IDs that contain special characters.
+        base_cmd = [adb_path]
+        if self.device_id:
+            base_cmd += ["-s", self.device_id]
 
         try:
             # Take screenshot on device
-            adb_path = self.adb_path if self.adb_path else "adb"
-            cmd = f"{adb_path} {device_flag} shell screencap -p /sdcard/screenshot.png"
+            cmd = base_cmd + ["shell", "screencap", "-p", "/sdcard/screenshot.png"]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10, shell=True
+                cmd, capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
                 self.status.showMessage(f"Screenshot failed: {result.stderr}")
                 return
 
             # Pull screenshot
-            cmd = f"{adb_path} {device_flag} pull /sdcard/screenshot.png {dest_path}"
+            cmd = base_cmd + ["pull", "/sdcard/screenshot.png", dest_path]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10, shell=True
+                cmd, capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
                 self.status.showMessage(f"Screenshot failed: {result.stderr}")
                 return
 
             # Delete from device
-            cmd = f"{adb_path} {device_flag} shell rm /sdcard/screenshot.png"
-            subprocess.run(cmd, capture_output=True, timeout=5, shell=True)
+            cmd = base_cmd + ["shell", "rm", "/sdcard/screenshot.png"]
+            subprocess.run(cmd, capture_output=True, timeout=5)
 
             self.status.showMessage(f"Screenshot saved: {filename}")
 

@@ -1267,7 +1267,21 @@ class ADBGUI(QMainWindow):
         self.setWindowTitle("ADB Tool")
         self.setGeometry(100, 100, 1600, 1000)
         self.setMinimumSize(1250, 800)
-        
+
+        # Pre-import py_scrcpy_sdk and its native deps (PyAV/FFmpeg,
+        # numpy C core) on the main thread at app startup.  These C
+        # extensions can intermittently SIGSEGV during initialization
+        # on macOS — doing the import here means any crash happens at
+        # app launch rather than when the user clicks the mirror button,
+        # and the rest of the app stays usable if the user later
+        # encounters the crash.
+        try:
+            import py_scrcpy_sdk  # noqa: F401
+            import av  # noqa: F401
+            import numpy  # noqa: F401
+        except ImportError:
+            pass
+
         # Color schemes
         self.light_colors = {
             'bg': '#f5f5f5',
@@ -1657,16 +1671,16 @@ class ADBGUI(QMainWindow):
         device_ops_group = self.create_card("⚡ Device Operations")
         self.create_button(device_ops_group, "📸 Take Screenshot", self.take_screenshot)
 
-        # Scrcpy mirror with Fast/Normal buttons
+        # Embedded Mirror with Fast (500kbps)/Normal (1mbps) buttons
         scrcpy_row = QHBoxLayout()
         scrcpy_row.addWidget(QLabel("🪞 Mirror Screen:"))
 
         fast_btn = QPushButton("⚡ Fast (500kbps)")
-        fast_btn.clicked.connect(lambda: self.scrcpy_device(bitrate='500k'))
+        fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=500_000))
         scrcpy_row.addWidget(fast_btn)
 
         normal_btn = QPushButton("🎬 Normal (1mbps)")
-        normal_btn.clicked.connect(lambda: self.scrcpy_device(bitrate='1m'))
+        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=1_000_000))
         scrcpy_row.addWidget(normal_btn)
 
         scrcpy_row.addStretch()
@@ -2185,14 +2199,21 @@ class ADBGUI(QMainWindow):
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
-    def _open_mirror_window(self):
+    def _open_mirror_window(self, device_id=None, bitrate=1_000_000):
         """Open the mirror in a separate window with recording options.
 
         This is the older 'Embedded Mirror' route, using ScrcpyMirrorWindow.
         It offers recording/bitrate controls that don't fit in the compact
         in-panel mirror.
+
+        Args:
+            device_id: Optional device ID to mirror. Defaults to self.current_device.
+            bitrate: Bitrate in bps. Defaults to 1_000_000 (1 Mbps).
         """
-        if not self.current_device:
+        if device_id is None:
+            device_id = self.current_device
+
+        if not device_id:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
 
@@ -2210,25 +2231,40 @@ class ADBGUI(QMainWindow):
                 QMessageBox.information(self, "Install Dependencies", msg)
                 return
 
-        device_id = self.current_device
         adb_path = getattr(self.adb, 'adb_path', 'adb')
-        bitrate = 1_000_000
 
-        try:
-            win = ScrcpyMirrorWindow(
-                device_id=device_id,
-                adb_path=adb_path,
-                bitrate=bitrate,
-                max_size=1024,
-                screenshot_path=self.settings.get('screenshot_path', ''),
-            )
-            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            win.show()
-            self.log(f"Opened standalone mirror window for {device_id}")
-        except Exception as e:
-            self.log(f"Failed to open mirror window: {e}", "ERROR")
-            QMessageBox.critical(self, "Mirror Error",
-                                 f"Failed to open mirror window:\n\n{e}")
+        # py_scrcpy_sdk's native libraries (PyAV/FFmpeg, numpy C core) can
+        # intermittently SIGSEGV during initialization on macOS. Retry a
+        # few times — most attempts succeed.
+        last_exc = None
+        for attempt in range(3):
+            try:
+                win = ScrcpyMirrorWindow(
+                    device_id=device_id,
+                    adb_path=adb_path,
+                    bitrate=bitrate,
+                    max_size=1024,
+                    screenshot_path=self.settings.get('screenshot_path', ''),
+                )
+                win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+                win.show()
+                self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate})")
+                return
+            except Exception as e:
+                last_exc = e
+                self.log(
+                    f"Mirror window attempt {attempt + 1}/3 failed: {e}",
+                    "WARNING"
+                )
+                import time as _t
+                _t.sleep(0.5)
+
+        # All retries failed — surface the last error to the user.
+        self.log(f"Failed to open mirror window after 3 attempts: {last_exc}", "ERROR")
+        QMessageBox.critical(
+            self, "Mirror Error",
+            f"Failed to open mirror window after 3 attempts.\n\n{last_exc}"
+        )
 
     def log_to_logcat(self, message):
         """Add message to logcat output area"""
@@ -2888,7 +2924,7 @@ class ADBGUI(QMainWindow):
                 """)
                 btn.setToolTip("Click to connect")
 
-            # Play button for scrcpy (tightly attached, no gap, no border)
+            # Play button for opening the embedded mirror window (tightly attached, no gap, no border)
             play_btn = QPushButton("▶")
             play_btn.setMaximumWidth(40)
             play_btn.setMinimumWidth(40)
@@ -2896,7 +2932,7 @@ class ADBGUI(QMainWindow):
             play_btn.setMinimumHeight(50)
             play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             play_btn.clicked.connect(lambda checked=False, seat=entry['seat']: self._scrcpy_via_seat(seat))
-            play_btn.setToolTip("Mirror screen via scrcpy")
+            play_btn.setToolTip("Open mirror window")
             play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
 
             container_layout.addWidget(btn, 0)
@@ -3093,8 +3129,7 @@ class ADBGUI(QMainWindow):
             self.log(f"Error checking port forward status: {e}", "ERROR")
 
     def _scrcpy_via_seat(self, seat):
-        self.log(f"Launching scrcpy for seat {seat}...")
-
+        """Open mirror window for a seat. Connects the seat first if needed."""
         # Check if seat is connected, if not connect first
         is_connected = self.seat_port_manager.is_seat_connected(seat)
 
@@ -3103,99 +3138,60 @@ class ADBGUI(QMainWindow):
             # Find the seat entry to get gateway
             for entry in self.seat_port_manager.load_history():
                 if entry['seat'] == seat:
-                    # Get devices BEFORE connection to track new device
-                    devices_before = {d['id'] for d in self.adb.get_devices()}
-
-                    # Connect first, then launch scrcpy after a delay
+                    # Connect first, then open mirror window after a delay
+                    # All work happens on the main thread via QTimer.singleShot
                     self.connect_seat(seat, entry['gateway'])
-                    # Wait for connection to complete, then launch scrcpy
-                    QTimer.singleShot(2000, lambda s=seat, before=devices_before: self._launch_scrcpy_after_connect(s, before))
+                    QTimer.singleShot(
+                        2000,
+                        lambda s=seat: self._open_mirror_for_seat(s)
+                    )
                     return
-        else:
-            # Already connected, launch scrcpy directly
-            self._launch_scrcpy_after_connect(seat, None)
+            self.log(f"Seat {seat} not found in history", "ERROR")
+            return
 
-    def _launch_scrcpy_after_connect(self, seat, devices_before=None):
-        """Launch scrcpy after seat is connected"""
-        self.log(f"Launching scrcpy for seat {seat}...")
-        self.update_status(f"Launching scrcpy for {seat}...")
+        # Already connected, open mirror window directly
+        self._open_mirror_for_seat(seat)
 
-        def do_scrcpy():
-            try:
-                # Get current devices
-                devices = self.adb.get_devices()
-                device_id = None
+    def _open_mirror_for_seat(self, seat):
+        """Find the device for a seat and open the mirror window.
 
-                if devices_before is not None:
-                    # Find the NEW device that appeared after seat connection
-                    for device in devices:
-                        if device['id'] not in devices_before:
-                            device_id = device['id']
-                            self.log(f"Found new device for seat {seat}: {device_id}")
-                            break
+        Runs on the main thread so it's safe to create Qt widgets / NSWindow.
+        """
+        self.log(f"Opening mirror window for seat {seat}...")
 
-                # Fallback: try to match by name/IP
-                if not device_id:
-                    for device in devices:
-                        if device['id'] == seat or seat in device['id']:
-                            device_id = device['id']
-                            break
+        try:
+            # Get current devices
+            devices = self.adb.get_devices()
+            device_id = None
 
-                # If still no match, look for localhost connections (most common for seats)
-                if not device_id:
-                    for device in devices:
-                        if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
-                            device_id = device['id']
-                            self.log(f"Using localhost device for seat {seat}: {device_id}")
-                            break
+            # Fallback 1: try to match by name/IP
+            for device in devices:
+                if device['id'] == seat or seat in device['id']:
+                    device_id = device['id']
+                    break
 
-                if device_id:
-                    # Temporarily set as current device and launch scrcpy
-                    old_device = self.current_device
-                    self.current_device = device_id
-                    self.log(f"Launching scrcpy for device {device_id} (seat {seat})")
-                    self.scrcpy_device(bitrate='1m')
-                    self.current_device = old_device
-                else:
-                    self.log(f"No device found for seat {seat}. Available: {[d['id'] for d in devices]}", "ERROR")
-                    self.update_status("No device found")
-            except Exception as e:
-                self.log(f"Error launching scrcpy: {str(e)}", "ERROR")
-                self.update_status("Error launching scrcpy")
+            # Fallback 2: look for localhost connections (most common for seats)
+            if not device_id:
+                for device in devices:
+                    if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
+                        device_id = device['id']
+                        self.log(f"Using localhost device for seat {seat}: {device_id}")
+                        break
 
-        threading.Thread(target=do_scrcpy, daemon=True).start()
+            if device_id:
+                self.log(f"Opening mirror window for device {device_id}")
+                self._open_mirror_window(device_id=device_id, bitrate=1_000_000)
+            else:
+                avail = [d['id'] for d in devices]
+                self.log(f"No device found for seat {seat}. Available: {avail}", "ERROR")
+                self.update_status("No device found")
+        except Exception as e:
+            self.log(f"Error opening mirror window: {str(e)}", "ERROR")
+            self.update_status("Error opening mirror")
 
     def _launch_scrcpy_for_device(self, device_id):
-        """Launch scrcpy for a specific device"""
-        # Temporarily switch current device, launch scrcpy, then restore
-        old_device = self.current_device
-        self.current_device = device_id
-        self.scrcpy_device(bitrate='1m')
-        self.current_device = old_device
-
-    def _scrcpy_via_portforward(self, gateway):
-        """Launch scrcpy for a device via port forward connection"""
-        self.log(f"Launching scrcpy for {gateway}...")
-        self.update_status(f"Launching scrcpy for {gateway}...")
-
-        def do_scrcpy():
-            try:
-                # Use scrcpy command directly
-                cmd = ['scrcpy']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-                if result.returncode != 0:
-                    self.log(f"Failed to launch scrcpy: {result.stderr}", "ERROR")
-                    self.update_status("Failed to launch scrcpy")
-                else:
-                    self.log("Scrcpy launched successfully")
-            except FileNotFoundError:
-                self.log("scrcpy not found in PATH. Please install scrcpy.", "ERROR")
-                self.update_status("scrcpy not found")
-            except Exception as e:
-                self.log(f"Error launching scrcpy: {str(e)}", "ERROR")
-                self.update_status("Error launching scrcpy")
-
-        threading.Thread(target=do_scrcpy, daemon=True).start()
+        """Open mirror window for a specific device"""
+        self._open_mirror_window(device_id=device_id, bitrate=1_000_000)
 
     def connect_seat(self, seat, gateway):
         """Connect to a seat"""
