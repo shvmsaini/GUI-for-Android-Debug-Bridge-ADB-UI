@@ -1665,6 +1665,20 @@ class ADBGUI(QMainWindow):
         scrcpy_row.addStretch()
         device_ops_group.layout().addLayout(scrcpy_row)
 
+        # Embedded mirror on its own line — it's a different feature that
+        # launches a separate window.
+        embed_row = QHBoxLayout()
+        embed_row.addWidget(QLabel("🖥️ In-app Mirror (Beta):"))
+        embed_btn = QPushButton("🖥️ Open Embedded Mirror")
+        embed_btn.setToolTip(
+            "Open scrcpy stream inside the app with nav buttons\n"
+            "(uses py-scrcpy-sdk; requires av, numpy, opencv, imageio)"
+        )
+        embed_btn.clicked.connect(self.open_embedded_mirror)
+        embed_row.addWidget(embed_btn)
+        embed_row.addStretch()
+        device_ops_group.layout().addLayout(embed_row)
+
         # Navigation buttons for use during a scrcpy session
         # These send keyevents over ADB so they work with the native
         # scrcpy window on any Android version (no extra deps required).
@@ -5255,6 +5269,11 @@ class ADBGUI(QMainWindow):
                 max_size=1024,
             )
             win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            # Keep a reference so Python doesn't GC the window while
+            # the background thread is still using it.
+            if not hasattr(self, '_embedded_mirror_windows'):
+                self._embedded_mirror_windows = []
+            self._embedded_mirror_windows.append(win)
             win.show()
             self.log(f"Opened embedded mirror for {device_id}")
         except Exception as e:

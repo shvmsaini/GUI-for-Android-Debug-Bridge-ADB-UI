@@ -6,6 +6,13 @@
 
 PyQt6>=6.6.0
 
+# Optional: Embedded scrcpy mirror with navigation buttons
+# Requires ffmpeg and pkg-config on macOS: brew install ffmpeg pkg-config
+# Also requires Python 3.10+ (we patch slots=True for 3.9 compat at install)
+py-scrcpy-sdk>=0.1.2
+opencv-python-headless>=4.5.0
+imageio>=2.34.0
+
 # Installation:
 # 1. Install Python 3.8+ from https://www.python.org/downloads/
 # 2. Install dependencies: pip install -r requirements.txt
