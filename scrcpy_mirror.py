@@ -360,7 +360,10 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.signal.disconnected.connect(self._on_disconnect)
 
         # ── start streaming ─────────────────────────────────────────
-        QTimer.singleShot(100, self._start_client)
+        # Start the client as soon as the event loop is ready (next tick).
+        # The previous 100ms delay wasn't doing anything useful and just
+        # added startup latency on top of the ~5s scrcpy handshake.
+        QTimer.singleShot(0, self._start_client)
 
     # ──────────────────────────────────────────────────────────────────
     #  UI construction
@@ -512,8 +515,9 @@ class ScrcpyMirrorWindow(QMainWindow):
             except Exception:
                 pass
             self._client = None
-        # Restart streaming
-        QTimer.singleShot(100, self._start_client)
+        # Restart streaming — start on the next event-loop tick so the
+        # previous client has a chance to fully tear down first.
+        QTimer.singleShot(0, self._start_client)
 
     def _build_nav_bar(self):
         """Build the nav bar with two rows by default.
@@ -676,12 +680,16 @@ class ScrcpyMirrorWindow(QMainWindow):
         # starting the background thread.  Native library initialisation
         # (PyAV's FFmpeg, numpy's C core) is not safe to perform from a
         # background thread on macOS and causes intermittent SIGSEGVs.
-        try:
-            import py_scrcpy_sdk  # noqa: F401  # pyrefly: ignore[missing-import]
-            import av  # noqa: F401
-            import numpy  # noqa: F401
-        except ImportError:
-            pass
+        # Skip if the app-level preload already imported them — Python's
+        # module cache makes this a fast no-op and avoids a redundant
+        # ~10s freeze on the GUI thread when the user opens a mirror.
+        if 'py_scrcpy_sdk' not in sys.modules:
+            try:
+                import py_scrcpy_sdk  # noqa: F401  # pyrefly: ignore[missing-import]
+                import av  # noqa: F401
+                import numpy  # noqa: F401
+            except ImportError:
+                pass
 
         def _thread():
             try:
@@ -726,7 +734,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                         if "device" in msg and "not found" in msg:
                             break
                         import time as _t
-                        _t.sleep(1.5)
+                        _t.sleep(0.5)
                 else:
                     if last_exc is not None:
                         raise last_exc
@@ -779,6 +787,9 @@ class ScrcpyMirrorWindow(QMainWindow):
                 self.video.set_device_resolution(w, h)
             except Exception:
                 pass
+            # Update status to "Streaming" once we receive the first frame
+            if self.status.currentMessage() != "Streaming…":
+                self.status.showMessage("Streaming…")
         except RuntimeError:
             # Widget was deleted between signal emission and delivery.
             pass

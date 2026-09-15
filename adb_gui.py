@@ -1269,18 +1269,36 @@ class ADBGUI(QMainWindow):
         self.setMinimumSize(1250, 800)
 
         # Pre-import py_scrcpy_sdk and its native deps (PyAV/FFmpeg,
-        # numpy C core) on the main thread at app startup.  These C
-        # extensions can intermittently SIGSEGV during initialization
-        # on macOS — doing the import here means any crash happens at
-        # app launch rather than when the user clicks the mirror button,
-        # and the rest of the app stays usable if the user later
-        # encounters the crash.
-        try:
-            import py_scrcpy_sdk  # noqa: F401
-            import av  # noqa: F401
-            import numpy  # noqa: F401
-        except ImportError:
-            pass
+        # numpy C core) ~500ms after the GUI becomes visible.  Doing
+        # this in a background thread keeps the GUI responsive while
+        # warming up the native libs before the user clicks the mirror
+        # button — which avoids the ~10s delay on first mirror open.
+        # If a SIGSEGV occurs during this background import, it'll
+        # happen off the click path, and the retry logic in
+        # _open_mirror_window handles subsequent failures.
+        QTimer.singleShot(500, self._preload_mirror_native_libs)
+
+    def _preload_mirror_native_libs(self):
+        """Import py_scrcpy_sdk / PyAV / numpy in a background thread.
+
+        Decouples the slow native-library initialization from both
+        GUI startup and the user's click on the mirror button.  After
+        this completes, subsequent mirror opens don't re-trigger the
+        slow import (Python's module cache makes re-imports no-ops).
+        """
+        def _do_import():
+            try:
+                import py_scrcpy_sdk  # noqa: F401
+                import av  # noqa: F401
+                import numpy  # noqa: F401
+            except Exception:
+                pass
+
+        # If the libs are already loaded (e.g. from a previous mirror
+        # window), the import is a no-op and completes immediately.
+        # Otherwise the daemon thread runs the heavy import off the
+        # main thread, so the GUI stays responsive.
+        threading.Thread(target=_do_import, daemon=True).start()
 
         # Color schemes
         self.light_colors = {
@@ -3156,38 +3174,63 @@ class ADBGUI(QMainWindow):
         """Find the device for a seat and open the mirror window.
 
         Runs on the main thread so it's safe to create Qt widgets / NSWindow.
+        Retries device lookup a few times to wait for the device to appear
+        in adb's device list after the seat connection is established.
         """
         self.log(f"Opening mirror window for seat {seat}...")
 
-        try:
-            # Get current devices
-            devices = self.adb.get_devices()
-            device_id = None
+        # Retry loop: the device might not show up in adb devices immediately
+        # after the seat connection is established. Try a few times with small delays.
+        last_error = None
+        for attempt in range(5):
+            try:
+                # Get current devices
+                devices = self.adb.get_devices()
+                device_id = None
 
-            # Fallback 1: try to match by name/IP
-            for device in devices:
-                if device['id'] == seat or seat in device['id']:
-                    device_id = device['id']
-                    break
-
-            # Fallback 2: look for localhost connections (most common for seats)
-            if not device_id:
+                # Fallback 1: try to match by name/IP
                 for device in devices:
-                    if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
+                    if device['id'] == seat or seat in device['id']:
                         device_id = device['id']
-                        self.log(f"Using localhost device for seat {seat}: {device_id}")
                         break
 
-            if device_id:
-                self.log(f"Opening mirror window for device {device_id}")
-                self._open_mirror_window(device_id=device_id, bitrate=1_000_000)
-            else:
-                avail = [d['id'] for d in devices]
-                self.log(f"No device found for seat {seat}. Available: {avail}", "ERROR")
-                self.update_status("No device found")
-        except Exception as e:
-            self.log(f"Error opening mirror window: {str(e)}", "ERROR")
-            self.update_status("Error opening mirror")
+                # Fallback 2: look for localhost connections (most common for seats)
+                if not device_id:
+                    for device in devices:
+                        if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
+                            device_id = device['id']
+                            self.log(f"Using localhost device for seat {seat}: {device_id}")
+                            break
+
+                if device_id:
+                    self.log(f"Opening mirror window for device {device_id}")
+                    self._open_mirror_window(device_id=device_id, bitrate=1_000_000)
+                    return
+                else:
+                    # Device not found yet - wait and retry
+                    avail = [d['id'] for d in devices]
+                    last_error = f"No device found for seat {seat}. Available: {avail}"
+                    if attempt < 4:
+                        # Wait a bit before retrying (except on last attempt)
+                        import time as _t
+                        _t.sleep(0.5)
+                    continue
+
+            except Exception as e:
+                last_error = str(e)
+                self.log(f"Error opening mirror window (attempt {attempt + 1}/5): {e}", "WARNING")
+                if attempt < 4:
+                    import time as _t
+                    _t.sleep(0.5)
+                continue
+
+        # All retries failed
+        if last_error:
+            self.log(f"Failed to open mirror after 5 attempts: {last_error}", "ERROR")
+            self.update_status("Failed to open mirror")
+        else:
+            self.log(f"Failed to open mirror for seat {seat}", "ERROR")
+            self.update_status("Failed to open mirror")
 
     def _launch_scrcpy_for_device(self, device_id):
         """Open mirror window for a specific device"""
