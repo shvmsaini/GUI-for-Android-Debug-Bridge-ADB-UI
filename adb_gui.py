@@ -1426,6 +1426,15 @@ class ADBGUI(QMainWindow):
         self.log_thread = None
         self.log_running = False
         self.device_buttons = {}  # Initialize device buttons dict
+        # Per-device state for logcat and mirror, keyed by device id.
+        # Lets the user switch devices instantly while preserving each
+        # device's running logcat/mirror and accumulated logcat history.
+        # Each entry: {'logcat_running': bool, 'logcat_full_text': str,
+        #               'logcat_filter': str, 'mirror_running': bool}
+        self._device_state = {}
+        # The logcat filter and full-text cache are also tracked at the
+        # instance level for the currently selected device — they're
+        # saved/restored to the per-device dict on every switch.
         # Cache of the most recent device list from `adb devices -l`. Avoids
         # running adb again when the user just clicks an already-known device.
         self.cached_devices = []
@@ -2087,6 +2096,7 @@ class ADBGUI(QMainWindow):
         """Clear the currently visible log area"""
         if self.showing_logcat:
             self.logcat_text.clear()
+            self._logcat_full_text = ""
         else:
             self.output_text.clear()
 
@@ -2288,6 +2298,12 @@ class ADBGUI(QMainWindow):
         """Add message to logcat output area"""
         # Debug: log to app logs too
         self.log(f"[LOGCAT] {message[:100]}{'...' if len(message) > 100 else ''}")
+        # Append to full-text cache
+        self._logcat_full_text += message + "\n"
+        # Check if there's an active filter
+        filter_text = self.logcat_filter_entry.text().strip()
+        if filter_text and filter_text.lower() not in message.lower():
+            return  # Filtered out — don't display
         # Ensure widget is visible (in case toggle happened after start)
         if not self.logcat_text.isVisible():
             self.logcat_text.setVisible(True)
@@ -2320,15 +2336,30 @@ class ADBGUI(QMainWindow):
         """Append a batch of logcat lines in one UI update to avoid stutter."""
         if not lines:
             return
+        # Append to the full-text cache
+        self._logcat_full_text += "\n".join(lines) + "\n"
+        # Cap memory: keep only the last ~10000 lines in the cache
+        all_lines = self._logcat_full_text.split('\n')
+        if len(all_lines) > 10000:
+            self._logcat_full_text = '\n'.join(all_lines[-10000:])
         # Ensure widget is visible
         if not self.logcat_text.isVisible():
             self.logcat_text.setVisible(True)
             self.logcat_text.show()
-        # Move cursor to end once, then insert the whole batch
-        self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
-        # Join with newlines; one trailing newline so each line breaks
-        self.logcat_text.insertPlainText("\n".join(lines) + "\n")
-        # Cap memory: keep only the last ~3000 lines
+        # Get current filter
+        filter_text = self.logcat_filter_entry.text().strip()
+        # If a filter is active, only append lines that match
+        if filter_text:
+            filtered = [l for l in lines if filter_text.lower() in l.lower()]
+            if not filtered:
+                return
+            self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
+            self.logcat_text.insertPlainText("\n".join(filtered) + "\n")
+        else:
+            # No filter — append all lines
+            self.logcat_text.moveCursor(QTextCursor.MoveOperation.End)
+            self.logcat_text.insertPlainText("\n".join(lines) + "\n")
+        # Trim widget content
         self._trim_logcat_if_needed()
         # Auto-scroll to bottom
         scrollbar = self.logcat_text.verticalScrollBar()
@@ -2337,9 +2368,8 @@ class ADBGUI(QMainWindow):
     def _filter_logcat(self):
         """Filter logcat output based on the filter text.
 
-        This uses an efficient approach:
-        - Reads directly from the QTextEdit document instead of maintaining a separate cache
-        - Uses QTextCursor to efficiently replace content
+        Reads from the full-text cache (not the widget) so the original
+        unfiltered text is never lost.
         """
         filter_text = self.logcat_filter_entry.text().strip()
 
@@ -2347,26 +2377,25 @@ class ADBGUI(QMainWindow):
         scrollbar = self.logcat_text.verticalScrollBar()
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
 
-        # Read current text from widget (avoid duplicating content in memory)
-        full_text = self.logcat_text.toPlainText()
+        # Read from the full-text cache, not the widget
+        full_text = self._logcat_full_text
 
         if not filter_text:
-            return  # No filter - nothing to do, text is already in widget
+            # No filter — restore full text
+            self.logcat_text.clear()
+            self.logcat_text.setPlainText(full_text)
+            if was_at_bottom:
+                scrollbar.setValue(scrollbar.maximum())
+            return
 
-        # Filter lines from the text - use list comprehension for efficiency
+        # Filter lines from the full-text cache
         lines = full_text.split('\n')
         filtered_lines = [line for line in lines if filter_text.lower() in line.lower()]
 
-        # Use QTextCursor for efficient replacement
-        cursor = QTextCursor(self.logcat_text.document())
-        cursor.movePosition(QTextCursor.MoveOperation.Start)
-        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
-
-        # Replace with filtered content
+        # Replace widget content with filtered content
+        self.logcat_text.clear()
         if filtered_lines:
-            cursor.insertText('\n'.join(filtered_lines) + '\n')
-        else:
-            cursor.insertText('')
+            self.logcat_text.setPlainText('\n'.join(filtered_lines))
 
         # Restore scroll position
         if was_at_bottom:
@@ -2679,7 +2708,20 @@ class ADBGUI(QMainWindow):
                 except Exception:
                     pass
 
-            # Not a seat device, or seat lookup failed - just deselect
+            # Not a seat device, or seat lookup failed - just deselect.
+            # Save the outgoing device's state so its logcat/mirror can
+            # resume when the user selects it again.
+            self._save_current_device_state()
+            # Stop logcat if running
+            if self.log_running:
+                self.log_running = False
+                self.logcat_button.setText("▶️ Start")
+            # Stop in-window mirror if showing
+            if self.logs_view == 'screen':
+                self._stop_in_window_mirror()
+                self.logs_view = 'logs'
+                self._hide_all_log_panels(except_widget=self.output_text)
+                self.screen_view_button.setText("📱 Show Screen")
             self.current_device = None
             self.device_info_label.setText("No device selected")
             self.device_info_label.setStyleSheet(f"color: {self.colors['text_secondary']};")
@@ -2688,7 +2730,17 @@ class ADBGUI(QMainWindow):
             self.log("Deselected device")
             return
 
-        self.current_device = device_id
+        # If device is changing, switch to the new device's per-device state.
+        # The state for the outgoing device is saved (running streams, log
+        # history, view) and restored when the user comes back. The state
+        # for the new device (or defaults if first time) is loaded and any
+        # streams that were running for that device are restarted.
+        if self.current_device != device_id:
+            self._switch_to_device_state(device_id)
+        else:
+            # Clicking the already-selected device is handled in the toggle
+            # branch at the top of this method; we shouldn't get here.
+            self.current_device = device_id
 
         # Update button appearance
         for bid, btn in self.device_buttons.items():
@@ -2766,6 +2818,88 @@ class ADBGUI(QMainWindow):
         self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
 
         self.log(f"Selected device: {device_id}")
+
+        # When device changes, switch the logcat and in-window mirror
+        # to the new device's state (each device's running stream is
+        # tracked separately, so this is an instant switch — the previous
+        # device's stream keeps running in the background).
+        self._switch_to_device_state(device_id)
+
+    def _save_current_device_state(self, device_id=None):
+        """Save the current logcat/mirror state under the given device id.
+
+        Called when switching AWAY from a device, so its running streams
+        and accumulated history are preserved for when the user comes back.
+        """
+        key = device_id if device_id is not None else self.current_device
+        if not key:
+            return
+        self._device_state[key] = {
+            'logcat_running': self.log_running,
+            'logcat_full_text': self._logcat_full_text,
+            'logcat_filter': self.logcat_filter_entry.text(),
+            'mirror_running': (
+                self.mirror_client is not None and self.logs_view == 'screen'
+            ),
+            'logs_view': self.logs_view,
+        }
+
+    def _switch_to_device_state(self, device_id):
+        """Switch to a new device's saved state.
+
+        1. Stop the current device's logcat and mirror (saving state first).
+        2. Restore the new device's saved state, or initialize defaults
+           if this device has no saved state yet.
+        3. If the new device had logcat/mirror running, restart them
+           for the new device so it picks up where it left off.
+        """
+        # Save outgoing device's state under its (still-current) id, then
+        # stop its streams. self.current_device at this point is the
+        # outgoing device — we'll switch it to the new device after.
+        self._save_current_device_state()
+        if self.log_running:
+            self.log_running = False  # tells logcat thread to exit
+        if self.mirror_client is not None and self.logs_view == 'screen':
+            self._stop_in_window_mirror()
+
+        # Now flip current_device to the new one
+        self.current_device = device_id
+
+        # Load new device's state, defaulting to a fresh device
+        state = self._device_state.get(device_id, {})
+
+        # Restore logcat filter (applies to the new device's saved text too)
+        saved_filter = state.get('logcat_filter', '')
+        self.logcat_filter_entry.blockSignals(True)
+        self.logcat_filter_entry.setText(saved_filter)
+        self.logcat_filter_entry.blockSignals(False)
+
+        # Restore logcat full-text cache and view
+        self._logcat_full_text = state.get('logcat_full_text', '')
+        saved_view = state.get('logs_view', 'logs')
+        if saved_view == 'logcat' and self.logs_view != 'logcat':
+            # Show logcat view
+            self.toggle_log_view()
+        elif saved_view != 'logcat' and self.logs_view == 'logcat':
+            # Show logs view
+            self.toggle_log_view()
+
+        # Refresh the visible widget to show the new device's saved text
+        self.logcat_text.clear()
+        if self.showing_logcat and self._logcat_full_text:
+            # Re-apply the filter to the restored text
+            self._filter_logcat()
+
+        # If the new device had logcat running, restart it
+        was_running = state.get('logcat_running', False)
+        if was_running:
+            self.logcat_button.setText("⏹️ Stop")
+            self.toggle_logcat()  # starts logcat since log_running is False
+
+        # If the new device had the in-window mirror running, restart it
+        was_mirror = state.get('mirror_running', False)
+        if was_mirror and self.logs_view == 'screen':
+            QTimer.singleShot(300, self._start_in_window_mirror)
 
     def on_device_selected(self, selection=None, silent=False):
         """Legacy method - now using button-based device selection"""
