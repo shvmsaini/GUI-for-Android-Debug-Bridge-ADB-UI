@@ -18,7 +18,7 @@ import traceback
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QSizePolicy, QMessageBox, QStatusBar,
+    QLabel, QSizePolicy, QMessageBox, QStatusBar, QComboBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QCursor
@@ -123,6 +123,7 @@ class VideoDisplayWidget(QWidget):
         self._device_resolution = (0, 0)   # (width, height) from device
         self._client = None                # ScrcpyClient
         self._dragging = False
+        self._disconnected = False         # True when screen disconnected
 
         self.setMouseTracking(True)
         self.setMinimumSize(320, 240)
@@ -152,6 +153,8 @@ class VideoDisplayWidget(QWidget):
             qimg = QImage(rgb.data, w, h, w * 3,
                           QImage.Format.Format_RGB888)
             self._pixmap = QPixmap.fromImage(qimg)
+            # Reset disconnected state when we get a new frame
+            self._disconnected = False
             # Hold the buffer as an instance attribute so Python doesn't
             # GC it before Qt has time to render the pixmap.
             self._last_frame_buf = rgb
@@ -161,6 +164,16 @@ class VideoDisplayWidget(QWidget):
                 # Widget has been deleted — stop trying to repaint.
                 pass
         except Exception:
+            pass
+
+    def set_disconnected(self):
+        """Show disconnection message instead of frozen frame."""
+        self._disconnected = True
+        self._pixmap = None
+        self._last_frame_buf = None
+        try:
+            self.update()
+        except RuntimeError:
             pass
 
     # ── painting ────────────────────────────────────────────────────
@@ -174,6 +187,14 @@ class VideoDisplayWidget(QWidget):
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         rect = self.rect()
+
+        # Check if we're in disconnected state
+        if hasattr(self, '_disconnected') and self._disconnected:
+            painter.fillRect(rect, QColor("#2a1a1a"))
+            painter.setPen(QColor("#cc4444"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
+                             "Screen disconnected")
+            return
 
         if self._pixmap is None or self._pixmap.isNull():
             painter.fillRect(rect, QColor("#222222"))
@@ -222,6 +243,16 @@ class VideoDisplayWidget(QWidget):
 
     # ── mouse events ────────────────────────────────────────────────
 
+    def _safe_touch(self, phase, x, y):
+        """Send a touch phase, swallowing errors from a stale client."""
+        try:
+            if self._client is not None:
+                self._client._send_touch_phase(phase, x, y)
+        except Exception:
+            # Client was stopped/restarted (e.g. settings changed) and
+            # the control socket is closed. Drop the event silently.
+            pass
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._client:
             coords = self._widget_to_device_coords(event.position().toPoint())
@@ -229,13 +260,13 @@ class VideoDisplayWidget(QWidget):
                 # Start a drag/tap — send DOWN, will send UP on release
                 self._dragging = True
                 self._drag_start = coords
-                self._client._send_touch_phase(0, coords[0], coords[1])  # ACTION_DOWN
+                self._safe_touch(0, coords[0], coords[1])  # ACTION_DOWN
 
     def mouseMoveEvent(self, event):
         if self._dragging and self._client:
             coords = self._widget_to_device_coords(event.position().toPoint())
             if coords:
-                self._client._send_touch_phase(2, coords[0], coords[1])  # ACTION_MOVE
+                self._safe_touch(2, coords[0], coords[1])  # ACTION_MOVE
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._dragging:
@@ -243,7 +274,7 @@ class VideoDisplayWidget(QWidget):
             if self._client:
                 coords = self._widget_to_device_coords(event.position().toPoint())
                 if coords:
-                    self._client._send_touch_phase(1, coords[0], coords[1])  # ACTION_UP
+                    self._safe_touch(1, coords[0], coords[1])  # ACTION_UP
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -259,13 +290,23 @@ class ScrcpyMirrorWindow(QMainWindow):
     _BTN_HOVER = "#3a3a3a"
     _BTN_PRESS = "#404040"
 
+    # Quality presets: (label, bitrate bps, max_fps, max_size)
+    _QUALITY_PRESETS = [
+        ("Low (smooth)",  500_000,  24, 640),
+        ("Medium",       1_500_000, 30, 1024),
+        ("High",         3_000_000, 30, 1280),
+        ("Ultra",        6_000_000, 60, 1920),
+    ]
+
     def __init__(self, device_id, adb_path=None, bitrate=1_000_000,
-                 max_size=1024, parent=None):
+                 max_size=1024, screenshot_path=None, parent=None):
         super().__init__(parent)
         self.device_id = device_id
         self.adb_path = adb_path
         self.bitrate = bitrate
         self.max_size = max_size
+        self.max_fps = 30
+        self.screenshot_path = screenshot_path  # Use provided path or fall back to defaults
         self._client = None
         self._listener_thread = None
         self._closing = False
@@ -281,6 +322,10 @@ class ScrcpyMirrorWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        # ── settings bar (top) ──────────────────────────────────────
+        settings_bar = self._build_settings_bar()
+        layout.addWidget(settings_bar)
 
         # ── video display ───────────────────────────────────────────
         self.video = VideoDisplayWidget()
@@ -309,42 +354,172 @@ class ScrcpyMirrorWindow(QMainWindow):
     #  UI construction
     # ──────────────────────────────────────────────────────────────────
 
+    def _build_settings_bar(self):
+        """Top bar: Quality preset dropdown, FPS selector, Bitrate selector.
+
+        Changes apply to the next reconnect (we tear down the client and
+        restart when the user changes settings).
+        """
+        bar = QWidget()
+        bar.setStyleSheet(f"background-color: {self._BG};")
+        bar.setFixedHeight(40)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(8)
+
+        # Quality preset
+        h.addWidget(QLabel("Quality:"))
+        self.quality_combo = QComboBox()
+        for label, _, _, _ in self._QUALITY_PRESETS:
+            self.quality_combo.addItem(label)
+        self.quality_combo.setCurrentIndex(1)  # Medium by default
+        self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+        h.addWidget(self.quality_combo)
+
+        # FPS selector
+        h.addWidget(QLabel("FPS:"))
+        self.fps_combo = QComboBox()
+        for fps in [15, 24, 30, 45, 60]:
+            self.fps_combo.addItem(str(fps))
+        self.fps_combo.setCurrentText("30")
+        self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
+        h.addWidget(self.fps_combo)
+
+        # Bitrate selector (custom, allows fine-tuning)
+        h.addWidget(QLabel("Bitrate:"))
+        self.bitrate_combo = QComboBox()
+        for br, label in [
+            (500_000, "500 kbps"),
+            (1_000_000, "1 Mbps"),
+            (2_000_000, "2 Mbps"),
+            (4_000_000, "4 Mbps"),
+            (8_000_000, "8 Mbps"),
+        ]:
+            self.bitrate_combo.addItem(label, br)
+        self.bitrate_combo.setCurrentText("1 Mbps")
+        self.bitrate_combo.currentTextChanged.connect(self._on_bitrate_changed)
+        h.addWidget(self.bitrate_combo)
+
+        # Restart button — applies changes
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.setFixedHeight(26)
+        self.apply_btn.setToolTip("Restart mirror with new settings")
+        self.apply_btn.clicked.connect(self._apply_settings)
+        self.apply_btn.setVisible(False)  # only show when something changed
+        h.addWidget(self.apply_btn)
+        h.addStretch()
+
+        h.addStretch()
+        return bar
+
+    def _on_quality_changed(self, idx):
+        if 0 <= idx < len(self._QUALITY_PRESETS):
+            label, bitrate, fps, max_size = self._QUALITY_PRESETS[idx]
+            self.bitrate = bitrate
+            self.max_fps = fps
+            self.max_size = max_size
+            # Sync the dropdowns
+            idx_fps = self.fps_combo.findText(str(fps))
+            if idx_fps >= 0:
+                self.fps_combo.blockSignals(True)
+                self.fps_combo.setCurrentIndex(idx_fps)
+                self.fps_combo.blockSignals(False)
+            br_label = None
+            for i in range(self.bitrate_combo.count()):
+                if self.bitrate_combo.itemData(i) == bitrate:
+                    br_label = self.bitrate_combo.itemText(i)
+                    break
+            if br_label:
+                self.bitrate_combo.blockSignals(True)
+                self.bitrate_combo.setCurrentText(br_label)
+                self.bitrate_combo.blockSignals(False)
+            self.apply_btn.setVisible(True)
+
+    def _on_fps_changed(self, txt):
+        try:
+            self.max_fps = int(txt)
+            self.apply_btn.setVisible(True)
+        except ValueError:
+            pass
+
+    def _on_bitrate_changed(self, txt):
+        br = self.bitrate_combo.currentData()
+        if br is not None:
+            self.bitrate = br
+            self.apply_btn.setVisible(True)
+
+    def _apply_settings(self):
+        """Restart the mirror client with the new settings."""
+        self.apply_btn.setVisible(False)
+        if self._client is not None:
+            try:
+                self._client.stop()
+            except Exception:
+                pass
+            self._client = None
+        # Restart streaming
+        QTimer.singleShot(100, self._start_client)
+
     def _build_nav_bar(self):
+        """Build the nav bar with two rows by default.
+
+        Row 1: ◀ Back, ◯ Home, ▢ Recent (matches device ops panel)
+        Row 2: Close
+
+        For narrow portrait windows (mobile-style aspect ratio), the
+        resize handler switches to two rows with split buttons. The
+        same callback approach avoids fragile layout surgery.
+        """
         self.nav_bar_widget = QWidget()
         bar = self.nav_bar_widget
         bar.setStyleSheet(f"background-color: {self._BG};")
-        bar.setFixedHeight(50)
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(8, 6, 8, 6)
-        h.setSpacing(6)
+        bar.setMinimumHeight(50)
+
+        # Container layout (VBox so we can have two rows when narrow)
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(8, 4, 8, 4)
+        outer.setSpacing(4)
+
+        # Row 1: nav buttons
+        self._nav_row1 = QHBoxLayout()
+        self._nav_row1.setSpacing(6)
 
         buttons = [
-            ("Back", "back"),
-            ("Home", "home"),
-            ("Recent", "recent"),
-            ("Vol+", "vol_up"),
-            ("Vol-", "vol_down"),
-            ("Power", "power"),
-            ("Menu", "menu"),
-            ("Notif", "notif"),
+            ("◀ Back", "back"),
+            ("◯ Home", "home"),
+            ("▢ Recent", "recent"),
         ]
 
         self.nav_buttons = {}
         for label, key in buttons:
             btn = QPushButton(label)
             btn.setFixedHeight(38)
-            btn.setMinimumWidth(56)
+            btn.setMinimumWidth(60)
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.setEnabled(False)
             btn.clicked.connect(lambda _, k=key: self._nav_action(k))
-            h.addWidget(btn)
+            self._nav_row1.addWidget(btn)
             self.nav_buttons[key] = btn
 
-        h.addStretch()
+        # Screenshot button
+        self.screenshot_btn = QPushButton("📷 Screenshot")
+        self.screenshot_btn.setFixedHeight(38)
+        self.screenshot_btn.setMinimumWidth(80)
+        self.screenshot_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.screenshot_btn.setEnabled(False)
+        self.screenshot_btn.clicked.connect(self._take_screenshot)
+        self._nav_row1.addWidget(self.screenshot_btn)
+
+        self._nav_row1.addStretch()
+        outer.addLayout(self._nav_row1)
+
+        # Row 2: close button
+        self._nav_row2 = QHBoxLayout()
+        self._nav_row2.setSpacing(6)
 
         self.close_btn = QPushButton("Close")
         self.close_btn.setFixedHeight(38)
-        self.close_btn.setMinimumWidth(56)
+        self.close_btn.setMinimumWidth(60)
         self.close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.close_btn.setStyleSheet(
             f"QPushButton {{ background: #cc3333; color: white; "
@@ -353,9 +528,49 @@ class ScrcpyMirrorWindow(QMainWindow):
             f"QPushButton:hover {{ background: #ee4444; }}"
         )
         self.close_btn.clicked.connect(self.close)
-        h.addWidget(self.close_btn)
+        self._nav_row2.addWidget(self.close_btn)
+        self._nav_row2.addStretch()
+        outer.addLayout(self._nav_row2)
+
+        # Default to single-row appearance (close button hidden, row 2 hidden)
+        self._nav_row2_visible = False
+        self.close_btn.setVisible(False)
+
+        # Listen for resize events to toggle visibility based on width
+        bar.resizeEvent = self._on_nav_bar_resize
 
         return bar
+
+    def _on_nav_bar_resize(self, event):
+        """Show the Close button on a second row when the bar is narrow."""
+        w = event.size().width()
+        # Three nav buttons (60px min each = 180) + margins + spacing
+        # ~ 220.  If narrower, show row 2.
+        need_two_rows = w < 260
+        if need_two_rows != self._nav_row2_visible:
+            self._nav_row2_visible = need_two_rows
+            if need_two_rows:
+                # Make close button visible and let row 2 take space
+                self.close_btn.setVisible(True)
+                # Hide the stretch in row 1 so buttons stay left-aligned
+                self._set_row1_stretch(False)
+            else:
+                # Hide row 2; move close into row 1 visually
+                self.close_btn.setVisible(False)
+                self._set_row1_stretch(True)
+            # Force relayout
+            self.nav_bar_widget.updateGeometry()
+
+    def _set_row1_stretch(self, on: bool):
+        """Toggle whether row 1 has a trailing stretch."""
+        # Take out the last stretch item if present
+        last = self._nav_row1.itemAt(self._nav_row1.count() - 1)
+        if on:
+            if last is None or last.spacerItem() is None:
+                self._nav_row1.addStretch()
+        else:
+            if last is not None and last.spacerItem() is not None:
+                self._nav_row1.removeItem(last)
 
     def _stylesheet(self):
         return f"""
@@ -423,7 +638,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                     serial=self.device_id,
                     max_size=self.max_size,
                     video_bit_rate=self.bitrate,
-                    max_fps=30,
+                    max_fps=self.max_fps,
                 )
                 if self.adb_path:
                     kwargs['adb_path'] = self.adb_path
@@ -450,6 +665,11 @@ class ScrcpyMirrorWindow(QMainWindow):
                         break
                     except Exception as e:
                         last_exc = e
+                        # If the device is genuinely gone, don't waste time
+                        # retrying — fail fast with a clear message.
+                        msg = str(e)
+                        if "device" in msg and "not found" in msg:
+                            break
                         import time as _t
                         _t.sleep(1.5)
                 else:
@@ -471,10 +691,25 @@ class ScrcpyMirrorWindow(QMainWindow):
                 self._client.listen(on_frame)
 
             except Exception as e:
-                if not self._closing:
+                # If the user closed the window or restarted the client,
+                # the listen() loop will fail with a socket error — that's
+                # expected, not a real failure.
+                if self._closing:
+                    return
+                msg = str(e)
+                # Socket closed during shutdown / Apply-restart — not an error.
+                if "Bad file descriptor" in msg or "control socket" in msg:
+                    return
+                # Device disconnected — show a friendly message.
+                if "device" in msg and "not found" in msg:
                     self.signal.error.emit(
-                        f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
-                    )
+                        f"Device {self.device_id} not found.\n\n"
+                        f"It may have disconnected. Refresh the device list "
+                        f"and try again.")
+                    return
+                self.signal.error.emit(
+                    f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+                )
 
         threading.Thread(target=_thread, daemon=True).start()
 
@@ -508,6 +743,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             self.video.set_client(self._client)
             for btn in self.nav_buttons.values():
                 btn.setEnabled(True)
+            self.screenshot_btn.setEnabled(True)
         except RuntimeError:
             pass
 
@@ -515,11 +751,14 @@ class ScrcpyMirrorWindow(QMainWindow):
         try:
             if self._closing:
                 return
+            # Show disconnection message on the video display
+            self.video.set_disconnected()
             self.status.showMessage(f"Error: {error_msg[:80]}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
-            QMessageBox.critical(self, "Mirror Error", error_msg)
-            self.close()
+            self.screenshot_btn.setEnabled(False)
+            # Keep window open briefly so user can see the message, then close
+            QTimer.singleShot(3000, self.close)
         except RuntimeError:
             pass
 
@@ -527,10 +766,14 @@ class ScrcpyMirrorWindow(QMainWindow):
         try:
             if self._closing:
                 return
+            # Show disconnection message on the video display
+            self.video.set_disconnected()
             self.status.showMessage(f"Disconnected: {error_msg}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
-            self.close()
+            self.screenshot_btn.setEnabled(False)
+            # Keep window open briefly so user can see the message, then close
+            QTimer.singleShot(2000, self.close)
         except RuntimeError:
             pass
 
@@ -609,6 +852,82 @@ class ScrcpyMirrorWindow(QMainWindow):
                                   duration_ms=300)
         except Exception:
             pass
+
+    def _take_screenshot(self):
+        """Capture a screenshot of the current frame and save it."""
+        import os
+        import datetime
+        import subprocess
+        from pathlib import Path
+        import sys
+
+        if self._client is None:
+            return
+
+        # Determine screenshot save directory
+        # Priority: provided path > user setting > Desktop > project directory
+        screenshots_dir = self.screenshot_path or ''
+
+        if not screenshots_dir:
+            # Default to Desktop if available, otherwise project directory
+            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+            if os.path.exists(desktop):
+                screenshots_dir = desktop
+            else:
+                # Fallback to executable/script directory
+                if getattr(sys, 'frozen', False):
+                    project_dir = os.path.dirname(sys.executable)
+                else:
+                    project_dir = os.path.dirname(os.path.abspath(__file__))
+                screenshots_dir = os.path.join(project_dir, 'screenshots')
+
+        os.makedirs(screenshots_dir, exist_ok=True)
+
+        # Generate filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"screenshot_{timestamp}.png"
+        dest_path = os.path.join(screenshots_dir, filename)
+
+        device_flag = f"-s {self.device_id}" if self.device_id else ""
+        self.status.showMessage("Taking screenshot...")
+
+        try:
+            # Take screenshot on device
+            adb_path = self.adb_path if self.adb_path else "adb"
+            cmd = f"{adb_path} {device_flag} shell screencap -p /sdcard/screenshot.png"
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10, shell=True
+            )
+            if result.returncode != 0:
+                self.status.showMessage(f"Screenshot failed: {result.stderr}")
+                return
+
+            # Pull screenshot
+            cmd = f"{adb_path} {device_flag} pull /sdcard/screenshot.png {dest_path}"
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10, shell=True
+            )
+            if result.returncode != 0:
+                self.status.showMessage(f"Screenshot failed: {result.stderr}")
+                return
+
+            # Delete from device
+            cmd = f"{adb_path} {device_flag} shell rm /sdcard/screenshot.png"
+            subprocess.run(cmd, capture_output=True, timeout=5, shell=True)
+
+            self.status.showMessage(f"Screenshot saved: {filename}")
+
+            # Show success message
+            QMessageBox.information(
+                self, "Screenshot Saved",
+                f"Screenshot saved to:\n{dest_path}"
+            )
+        except Exception as e:
+            self.status.showMessage(f"Screenshot failed: {str(e)}")
+            QMessageBox.warning(
+                self, "Screenshot Failed",
+                f"Failed to take screenshot:\n{str(e)}"
+            )
 
     # ──────────────────────────────────────────────────────────────────
     #  Keyboard shortcuts

@@ -27,12 +27,19 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStandardPaths
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
 
-# Optional: embedded scrcpy mirror window (lazy-imported when first opened
-# so the app still runs if py_scrcpy_sdk isn't installed).
+# Optional: embedded scrcpy mirror (lazy-imported so the app still runs
+# if py_scrcpy_sdk isn't installed).
 try:
-    from scrcpy_mirror import ScrcpyMirrorWindow, _check_deps as _check_embedded_mirror
+    from scrcpy_mirror import (
+        ScrcpyMirrorWindow,
+        VideoDisplayWidget as _VideoDisplayWidget,
+        _FrameSignal as _MirrorFrameSignal,
+        _check_deps as _check_embedded_mirror,
+    )
 except ImportError:
     ScrcpyMirrorWindow = None
+    _VideoDisplayWidget = None
+    _MirrorFrameSignal = None
     _check_embedded_mirror = None
 
 
@@ -1665,75 +1672,29 @@ class ADBGUI(QMainWindow):
         scrcpy_row.addStretch()
         device_ops_group.layout().addLayout(scrcpy_row)
 
-        # Embedded mirror on its own line — it's a different feature that
-        # launches a separate window.
-        embed_row = QHBoxLayout()
-        embed_row.addWidget(QLabel("🖥️ In-app Mirror (Beta):"))
-        embed_btn = QPushButton("🖥️ Open Embedded Mirror")
-        embed_btn.setToolTip(
-            "Open scrcpy stream inside the app with nav buttons\n"
-            "(uses py-scrcpy-sdk; requires av, numpy, opencv, imageio)"
-        )
-        embed_btn.clicked.connect(self.open_embedded_mirror)
-        embed_row.addWidget(embed_btn)
-        embed_row.addStretch()
-        device_ops_group.layout().addLayout(embed_row)
-
         # Navigation buttons for use during a scrcpy session
         # These send keyevents over ADB so they work with the native
         # scrcpy window on any Android version (no extra deps required).
         # Stacked vertically so they don't stretch the row horizontally.
         nav_label_row = QHBoxLayout()
-        nav_label_row.addWidget(QLabel("📱 Nav (while scrcpy running):"))
-        nav_label_row.addStretch()
-        device_ops_group.layout().addLayout(nav_label_row)
+        nav_label_row.addWidget(QLabel("📱 Navigation:"))
 
-        nav_row = QVBoxLayout()
-        nav_row.setSpacing(4)
-
-        def _make_nav_row():
-            """Helper: build a horizontal row of nav buttons."""
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            return row
-
-        # Row 1: Back, Home, Recent
-        nav_row1 = _make_nav_row()
         nav_back = QPushButton("◀ Back")
         nav_back.setToolTip("Send KEYCODE_BACK to the device (4)")
         nav_back.clicked.connect(lambda: self._send_keyevent(4, "Back"))
-        nav_row1.addWidget(nav_back)
+        nav_label_row.addWidget(nav_back)
 
-        nav_home = QPushButton("⬛ Home")
+        nav_home = QPushButton("◯ Home")
         nav_home.setToolTip("Send KEYCODE_HOME to the device (3)")
         nav_home.clicked.connect(lambda: self._send_keyevent(3, "Home"))
-        nav_row1.addWidget(nav_home)
+        nav_label_row.addWidget(nav_home)
 
         nav_recent = QPushButton("▢ Recent")
         nav_recent.setToolTip("Send KEYCODE_APP_SWITCH to the device (187)")
         nav_recent.clicked.connect(lambda: self._send_keyevent(187, "Recent"))
-        nav_row1.addWidget(nav_recent)
-        nav_row.addLayout(nav_row1)
+        nav_label_row.addWidget(nav_recent)
 
-        # Row 2: Power, Menu, Notif
-        nav_row2 = _make_nav_row()
-        nav_power = QPushButton("🔌 Power")
-        nav_power.setToolTip("Send KEYCODE_POWER to the device (26)")
-        nav_power.clicked.connect(lambda: self._send_keyevent(26, "Power"))
-        nav_row2.addWidget(nav_power)
-
-        nav_menu = QPushButton("📋 Menu")
-        nav_menu.setToolTip("Send KEYCODE_MENU to the device (82)")
-        nav_menu.clicked.connect(lambda: self._send_keyevent(82, "Menu"))
-        nav_row2.addWidget(nav_menu)
-
-        nav_notif = QPushButton("🔔 Notif")
-        nav_notif.setToolTip("Expand notification shade")
-        nav_notif.clicked.connect(self._expand_notifications)
-        nav_row2.addWidget(nav_notif)
-        nav_row.addLayout(nav_row2)
-
-        device_ops_group.layout().addLayout(nav_row)
+        device_ops_group.layout().addLayout(nav_label_row)
 
         # Advanced section - Reboot options (collapsible, colored red)
         advanced_header = QPushButton("▶ ⚠️ Advanced")
@@ -1936,7 +1897,7 @@ class ADBGUI(QMainWindow):
         log_controls = QHBoxLayout()
 
         # Toggle between App Logs and Logcat
-        self.log_view_button = QPushButton("📱 Show Logcat")
+        self.log_view_button = QPushButton("📡 Show Logcat")
         self.log_view_button.clicked.connect(self.toggle_log_view)
         log_controls.addWidget(self.log_view_button)
 
@@ -1961,6 +1922,32 @@ class ADBGUI(QMainWindow):
         clear_btn.clicked.connect(self.clear_current_log)
         log_controls.addWidget(clear_btn)
 
+        # Export button — save current log to a file
+        export_btn = QPushButton("💾 Export")
+        export_btn.setToolTip("Export current log to a text file")
+        export_btn.clicked.connect(self.export_current_log)
+        log_controls.addWidget(export_btn)
+
+        # Show Screen button — toggles the in-window device mirror.
+        # Visible by default so the user can enter screen view from any state.
+        self.screen_view_button = QPushButton("📱 Show Screen")
+        self.screen_view_button.setToolTip(
+            "Mirror the device screen inside this panel\n"
+            "(uses py-scrcpy-sdk; requires av, numpy, opencv, imageio)"
+        )
+        self.screen_view_button.clicked.connect(self.toggle_screen_view)
+        log_controls.addWidget(self.screen_view_button)
+
+        # Separate Window button — appears on the same row, far right.
+        # Hidden by default; only shown when in screen view.
+        self.mirror_separate_btn = QPushButton("⛶ Separate Window")
+        self.mirror_separate_btn.setFixedHeight(26)
+        self.mirror_separate_btn.setToolTip(
+            "Open mirror in a separate window with recording options")
+        self.mirror_separate_btn.clicked.connect(self._open_mirror_window)
+        self.mirror_separate_btn.setVisible(False)
+        log_controls.addWidget(self.mirror_separate_btn)
+
         log_controls.addStretch()
         logs_layout.addLayout(log_controls)
 
@@ -1977,7 +1964,27 @@ class ADBGUI(QMainWindow):
         self.logcat_text.setVisible(False)
         logs_layout.addWidget(self.logcat_text)
 
-        # Track current view
+        # ── In-window screen mirror (hidden by default) ─────────────
+        self.mirror_video = None
+        self.mirror_nav_widget = None
+        self.mirror_signal = None
+        self.mirror_client = None
+        self.mirror_thread = None
+        self.mirror_closing = False
+
+        if _VideoDisplayWidget is not None:
+            self.mirror_video = _VideoDisplayWidget()
+            self.mirror_video.setVisible(False)
+            logs_layout.addWidget(self.mirror_video)
+
+            # Frame signal for in-window mirror
+            self.mirror_signal = _MirrorFrameSignal()
+            self.mirror_signal.frame_ready.connect(self._on_mirror_frame)
+            self.mirror_signal.init_done.connect(self._on_mirror_init)
+            self.mirror_signal.error.connect(self._on_mirror_error)
+
+        # Track current view: 'logs', 'logcat', or 'screen'
+        self.logs_view = 'logs'
         self.showing_logcat = False
 
         content_layout.addWidget(self.logs_group, 2)
@@ -2051,26 +2058,177 @@ class ADBGUI(QMainWindow):
         else:
             self.output_text.clear()
 
+    def export_current_log(self):
+        """Export the current log content to a text file."""
+        from PyQt6.QtWidgets import QFileDialog
+        if self.showing_logcat:
+            text = self.logcat_text.toPlainText()
+            default_name = "logcat"
+        else:
+            text = self.output_text.toPlainText()
+            default_name = "adb_logs"
+        if not text.strip():
+            QMessageBox.information(self, "Nothing to Export",
+                                    "The log is empty.")
+            return
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = os.path.join(os.path.expanduser("~"),
+                                    f"{default_name}_{timestamp}.txt")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Log", default_path,
+            "Text Files (*.txt);;All Files (*)")
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                self.log(f"Exported log to {path}")
+                self.update_status(f"Exported log to {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed",
+                                     f"Could not write file:\n\n{e}")
+
     def toggle_log_view(self):
         """Toggle between App Logs and Logcat view"""
+        # If currently showing screen mirror, stop it first
+        if self.logs_view == 'screen':
+            self._stop_in_window_mirror()
+
         self.showing_logcat = not self.showing_logcat
 
         if self.showing_logcat:
             # Switch to Logcat view
-            self.output_text.setVisible(False)
-            self.logcat_text.setVisible(True)
+            self._hide_all_log_panels(except_widget=self.logcat_text)
             self.log_view_button.setText("📋 Show Logs")
             self.logcat_button.setVisible(True)
             self.logcat_filter_label.setVisible(True)
             self.logcat_filter_entry.setVisible(True)
+            self.log_view_button.setVisible(True)
+            self.screen_view_button.setVisible(True)
+            self.screen_view_button.setText("📱 Show Screen")
+            self.mirror_separate_btn.setVisible(False)
+            self.logs_view = 'logcat'
         else:
             # Switch to App Logs view
-            self.output_text.setVisible(True)
-            self.logcat_text.setVisible(False)
-            self.log_view_button.setText("📱 Show Logcat")
+            self._hide_all_log_panels(except_widget=self.output_text)
+            self.log_view_button.setText("📡 Show Logcat")
             self.logcat_button.setVisible(False)
             self.logcat_filter_label.setVisible(False)
             self.logcat_filter_entry.setVisible(False)
+            self.log_view_button.setVisible(True)
+            self.screen_view_button.setVisible(True)
+            self.screen_view_button.setText("📱 Show Screen")
+            self.mirror_separate_btn.setVisible(False)
+            self.logs_view = 'logs'
+
+    def _hide_all_log_panels(self, except_widget=None):
+        """Hide all log panel widgets except the given one."""
+        panels = [self.output_text, self.logcat_text]
+        if self.mirror_video is not None:
+            panels.append(self.mirror_video)
+        for p in panels:
+            if p is not None and p is not except_widget:
+                p.setVisible(False)
+            elif p is not None and p is except_widget:
+                p.setVisible(True)
+        # Force Qt to process the visibility changes immediately so
+        # there's no brief moment where two panels are both visible.
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+    def toggle_screen_view(self):
+        """Toggle between logs and in-window screen mirror."""
+        if self.logs_view == 'screen':
+            # Back to logs (return to whichever log view we were in)
+            self._stop_in_window_mirror()
+            self._hide_all_log_panels(
+                except_widget=self.logcat_text if self.showing_logcat
+                else self.output_text)
+            self.log_view_button.setVisible(True)
+            self.log_view_button.setText(
+                "📋 Show Logs" if self.showing_logcat else "📡 Show Logcat")
+            self.logcat_button.setVisible(self.showing_logcat)
+            self.logcat_filter_label.setVisible(self.showing_logcat)
+            self.logcat_filter_entry.setVisible(self.showing_logcat)
+            self.screen_view_button.setVisible(True)
+            self.screen_view_button.setText("📱 Show Screen")
+            self.mirror_separate_btn.setVisible(False)
+            self.logs_view = 'logcat' if self.showing_logcat else 'logs'
+        else:
+            # Switch to screen mirror
+            if self.mirror_video is None:
+                QMessageBox.warning(
+                    self, "Feature Unavailable",
+                    "The screen mirror module (scrcpy_mirror.py) could not be imported.\n\n"
+                    "Make sure the file exists and dependencies are installed.")
+                return
+            if not self.current_device:
+                QMessageBox.warning(self, "No Device",
+                                    "Please select a device first")
+                return
+            if _check_embedded_mirror is not None:
+                ok, msg = _check_embedded_mirror()
+                if not ok:
+                    QMessageBox.information(self, "Install Dependencies", msg)
+                    return
+
+            self._hide_all_log_panels(except_widget=self.mirror_video)
+            self.log_view_button.setVisible(True)
+            self.log_view_button.setText(
+                "📋 Show Logs" if self.showing_logcat else "📡 Show Logcat")
+            self.logcat_button.setVisible(False)
+            self.logcat_filter_label.setVisible(False)
+            self.logcat_filter_entry.setVisible(False)
+            self.screen_view_button.setVisible(True)
+            self.screen_view_button.setText("📋 Show Logs")
+            self.mirror_separate_btn.setVisible(True)
+            self.logs_view = 'screen'
+            self._start_in_window_mirror()
+
+    def _open_mirror_window(self):
+        """Open the mirror in a separate window with recording options.
+
+        This is the older 'Embedded Mirror' route, using ScrcpyMirrorWindow.
+        It offers recording/bitrate controls that don't fit in the compact
+        in-panel mirror.
+        """
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+
+        if ScrcpyMirrorWindow is None:
+            QMessageBox.warning(
+                self, "Feature Unavailable",
+                "The scrcpy mirror module (scrcpy_mirror.py) could not be imported.\n\n"
+                "Make sure the file exists and dependencies are installed.")
+            return
+
+        # Check dependencies and show install instructions if missing
+        if _check_embedded_mirror is not None:
+            ok, msg = _check_embedded_mirror()
+            if not ok:
+                QMessageBox.information(self, "Install Dependencies", msg)
+                return
+
+        device_id = self.current_device
+        adb_path = getattr(self.adb, 'adb_path', 'adb')
+        bitrate = 1_000_000
+
+        try:
+            win = ScrcpyMirrorWindow(
+                device_id=device_id,
+                adb_path=adb_path,
+                bitrate=bitrate,
+                max_size=1024,
+                screenshot_path=self.settings.get('screenshot_path', ''),
+            )
+            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            win.show()
+            self.log(f"Opened standalone mirror window for {device_id}")
+        except Exception as e:
+            self.log(f"Failed to open mirror window: {e}", "ERROR")
+            QMessageBox.critical(self, "Mirror Error",
+                                 f"Failed to open mirror window:\n\n{e}")
 
     def log_to_logcat(self, message):
         """Add message to logcat output area"""
@@ -3096,14 +3254,36 @@ class ADBGUI(QMainWindow):
                     except:
                         pass
 
-                if returncode == 0:
+                # Check for success: returncode 0 AND no obvious error messages
+                error_indicators = [
+                    "Connection refused",
+                    "Could not resolve hostname",
+                    "nodename nor servname",
+                    "Permission denied",
+                    "Host key verification failed",
+                    "Connection timed out",
+                    "Network is unreachable",
+                    "No route to host",
+                    "ssh: ",
+                    "Error",
+                    "error",
+                    "FAILED",
+                    "failed",
+                ]
+                has_error = (
+                    returncode != 0
+                    or any(ind.lower() in stderr.lower() for ind in error_indicators)
+                    or any(ind.lower() in stdout.lower() for ind in error_indicators)
+                )
+
+                if not has_error:
                     self.seat_port_manager.mark_seat_connected(seat, gateway)
                     self.log(f"Connected to seat {seat}", "INFO")
                     self.update_status(f"Connected to {seat}")
                     QTimer.singleShot(0, self.refresh_seat_port_lists)
                     QTimer.singleShot(500, self.refresh_devices)  # Refresh devices after seat connection
                 else:
-                    error = stderr.strip() or stdout.strip() or "Unknown error"
+                    error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
                     self.log(f"Failed to connect to seat: {error}", "ERROR")
                     self.update_status("Failed to connect")
             except Exception as e:
@@ -3217,13 +3397,31 @@ class ADBGUI(QMainWindow):
                     except:
                         pass
 
-                if returncode == 0:
+                # Check for success: returncode 0 AND no obvious error messages
+                error_indicators = [
+                    "Connection refused",
+                    "Could not resolve hostname",
+                    "nodename nor servname",
+                    "Permission denied",
+                    "Host key verification failed",
+                    "Connection timed out",
+                    "Network is unreachable",
+                    "No route to host",
+                    "ssh: ",
+                ]
+                has_error = (
+                    returncode != 0
+                    or any(ind.lower() in stderr.lower() for ind in error_indicators)
+                    or any(ind.lower() in stdout.lower() for ind in error_indicators)
+                )
+
+                if not has_error:
                     self.seat_port_manager.mark_portforward_connected(gateway)
                     self.log(f"Port forward connected for {gateway}", "INFO")
                     self.update_status(f"Port forward connected")
                     QTimer.singleShot(0, self.refresh_seat_port_lists)
                 else:
-                    error = stderr.strip() or stdout.strip() or "Unknown error"
+                    error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
 
                     # Check if error is due to ports already in use - if so, stop existing and retry
                     if "Address already in use" in error or "cannot listen to port" in error:
@@ -3248,14 +3446,21 @@ class ADBGUI(QMainWindow):
                                 retry_cmd = [script_path, gateway_host, partition, user]
                                 retry_result = subprocess.run(retry_cmd, capture_output=True, text=True, timeout=30, env=env)
 
-                            if retry_result.returncode == 0:
+                            retry_stderr = retry_result.stderr or ""
+                            retry_stdout = retry_result.stdout or ""
+                            retry_has_error = (
+                                retry_result.returncode != 0
+                                or any(ind.lower() in retry_stderr.lower() for ind in error_indicators)
+                                or any(ind.lower() in retry_stdout.lower() for ind in error_indicators)
+                            )
+                            if not retry_has_error:
                                 self.seat_port_manager.mark_portforward_connected(gateway)
                                 self.log(f"Port forward connected for {gateway}", "INFO")
                                 self.update_status(f"Port forward connected")
                                 QTimer.singleShot(0, self.refresh_seat_port_lists)
                                 return
                             else:
-                                retry_error = retry_result.stderr.strip() or retry_result.stdout.strip() or "Unknown error"
+                                retry_error = retry_stderr.strip() or retry_stdout.strip() or f"Script exited with code {retry_result.returncode}"
                                 self.log(f"Failed to set up port forward after retry: {retry_error}", "ERROR")
                                 self.update_status("Failed to set up port forward")
                         else:
@@ -5234,52 +5439,162 @@ class ADBGUI(QMainWindow):
 
         return None
 
-    def open_embedded_mirror(self):
-        """Open the embedded scrcpy mirror window with navigation buttons."""
-        if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
-            return
+    def _start_in_window_mirror(self):
+        """Start the scrcpy client and stream frames into the logs panel."""
+        if self.mirror_client is not None:
+            return  # already running
 
-        if ScrcpyMirrorWindow is None:
-            QMessageBox.warning(
-                self, "Feature Unavailable",
-                "The embedded mirror module (scrcpy_mirror.py) could not be imported.\n\n"
-                "Make sure the file exists in the same directory as adb_gui.py."
-            )
-            return
+        self.mirror_closing = False
 
-        # Check dependencies and show install instructions if missing
-        if _check_embedded_mirror is not None:
-            ok, msg = _check_embedded_mirror()
-            if not ok:
-                QMessageBox.information(self, "Install Dependencies", msg)
-                return
+        # Eagerly import in the main thread to avoid native-lib init
+        # races in background threads on macOS.
+        try:
+            import py_scrcpy_sdk  # noqa: F401  # pyrefly: ignore[missing-import]
+            import av  # noqa: F401
+            import numpy  # noqa: F401
+        except ImportError:
+            pass
 
         device_id = self.current_device
         adb_path = getattr(self.adb, 'adb_path', 'adb')
 
-        # Parse bitrate from settings (default 1m = 1000000)
-        bitrate = 1000000
+        def _thread():
+            try:
+                from py_scrcpy_sdk import ScrcpyClient, ScrcpyConfig  # pyrefly: ignore[missing-import]
 
+                kwargs = dict(
+                    serial=device_id,
+                    max_size=1024,
+                    video_bit_rate=1_000_000,
+                    max_fps=30,
+                )
+                if adb_path:
+                    kwargs['adb_path'] = adb_path
+                config = ScrcpyConfig(**kwargs)
+
+                client = ScrcpyClient(config)
+                client.adb.ensure_server = lambda: None
+
+                last_exc: Exception | None = None
+                for attempt in range(3):
+                    if self.mirror_closing:
+                        return
+                    try:
+                        client.start()
+                        break
+                    except Exception as e:
+                        last_exc = e
+                        import time as _t
+                        _t.sleep(1.5)
+                else:
+                    if last_exc is not None:
+                        raise last_exc
+                    raise RuntimeError("Failed to start scrcpy client")
+
+                self.mirror_client = client
+                name = client.device_name or device_id
+                self.mirror_signal.init_done.emit(name)
+
+                def on_frame(frame):
+                    if self.mirror_closing:
+                        return False
+                    self.mirror_signal.frame_ready.emit(frame)
+                    return True
+
+                client.listen(on_frame)
+
+            except Exception as e:
+                # Socket closed during shutdown — expected, not a real error.
+                if self.mirror_closing:
+                    return
+                msg = str(e)
+                if "Bad file descriptor" in msg or "control socket" in msg:
+                    return
+                # Device disconnected — show a friendly message.
+                if "device" in msg and "not found" in msg:
+                    self.mirror_signal.error.emit(
+                        f"Device {device_id} not found.\n\n"
+                        f"It may have disconnected. Refresh the device list "
+                        f"and try again.")
+                    return
+                self.mirror_signal.error.emit(
+                    f"{type(e).__name__}: {e}")
+
+        import threading
+        self.mirror_thread = threading.Thread(
+            target=_thread, daemon=True)
+        self.mirror_thread.start()
+
+    def _stop_in_window_mirror(self):
+        """Stop the in-window scrcpy client."""
+        self.mirror_closing = True
+        if self.mirror_client is not None:
+            try:
+                self.mirror_client.stop()
+            except Exception:
+                pass
+            self.mirror_client = None
+        # Disable nav buttons
+        if hasattr(self, 'mirror_nav_buttons'):
+            for btn in self.mirror_nav_buttons:
+                btn.setEnabled(False)
+
+    def _on_mirror_frame(self, frame_array):
+        """Receive a frame from the mirror and render it."""
+        if self.logs_view != 'screen' or self.mirror_closing:
+            return
         try:
-            win = ScrcpyMirrorWindow(
-                device_id=device_id,
-                adb_path=adb_path,
-                bitrate=bitrate,
-                max_size=1024,
-            )
-            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            # Keep a reference so Python doesn't GC the window while
-            # the background thread is still using it.
-            if not hasattr(self, '_embedded_mirror_windows'):
-                self._embedded_mirror_windows = []
-            self._embedded_mirror_windows.append(win)
-            win.show()
-            self.log(f"Opened embedded mirror for {device_id}")
-        except Exception as e:
-            self.log(f"Failed to open embedded mirror: {e}", "ERROR")
-            QMessageBox.critical(self, "Mirror Error",
-                                 f"Failed to open embedded mirror:\n\n{e}")
+            self.mirror_video.update_frame(frame_array)
+            try:
+                h, w = frame_array.shape[:2]
+                self.mirror_video.set_device_resolution(w, h)
+            except Exception:
+                pass
+        except RuntimeError:
+            pass
+
+    def _on_mirror_init(self, device_name):
+        """Mirror connected — enable nav buttons and attach client."""
+        try:
+            res = ""
+            if self.mirror_client and self.mirror_client.codec_meta:
+                res = f"  |  {self.mirror_client.codec_meta.width}x{self.mirror_client.codec_meta.height}"
+            self.update_status(f"Mirror: {device_name}{res}")
+            self.log(f"Mirror connected: {device_name}")
+            self.mirror_video.set_client(self.mirror_client)
+            if hasattr(self, 'mirror_nav_buttons'):
+                for btn in self.mirror_nav_buttons:
+                    btn.setEnabled(True)
+        except RuntimeError:
+            pass
+
+    def _on_mirror_error(self, error_msg):
+        """Mirror error — log it and switch back to logs."""
+        try:
+            self.log(f"Mirror error: {error_msg}", "ERROR")
+            self.update_status("Mirror error — see logs")
+        except RuntimeError:
+            pass
+
+    def _mirror_press_key(self, keycode):
+        """Send a keyevent via the scrcpy control socket."""
+        if self.mirror_client is None:
+            return
+        try:
+            self.mirror_client.press_key(keycode)
+        except Exception:
+            pass
+
+    def _mirror_expand_notif(self):
+        """Expand notifications via the scrcpy control socket."""
+        if self.mirror_client is None:
+            return
+        try:
+            w, h = self.mirror_client.frame_size
+            self.mirror_client.drag(w // 2, 10, w // 2, h // 3,
+                                    duration_ms=300)
+        except Exception:
+            pass
 
     def _send_keyevent(self, keycode, label=""):
         """Send a keyevent to the currently selected device via ADB.
