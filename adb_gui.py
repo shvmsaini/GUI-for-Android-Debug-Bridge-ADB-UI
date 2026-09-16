@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QTextEdit, QLineEdit, QFileDialog,
     QMessageBox, QInputDialog, QFrame, QScrollArea, QGroupBox, QSizePolicy,
-    QDialog, QListWidget, QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup, QTabWidget
+    QDialog, QListWidget, QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup, QTabWidget,
+    QCompleter, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStandardPaths
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
@@ -1672,7 +1673,6 @@ class ADBGUI(QMainWindow):
         app_actions_row.addWidget(uninstall_btn)
         app_group.layout().addLayout(app_actions_row)
 
-        self.create_button(app_group, "♻️ Reinstall for User", self.reinstall_for_user)
         self.create_button(app_group, "📋 List Installed Apps", self.list_apps)
         self.create_button(app_group, "📂 Open APKs Folder", self.open_apks_folder)
         
@@ -4283,9 +4283,61 @@ class ADBGUI(QMainWindow):
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
-        
-        package_name, ok = QInputDialog.getText(self, "Uninstall App", "Enter package name (e.g., com.example.app):")
-        if not ok or not package_name:
+
+        # Get list of installed packages for dropdown suggestions
+        def get_installed_packages():
+            result = self.adb.run_command(f"{self.get_device_flag()} shell pm list packages")
+            packages = []
+            if result['success']:
+                lines = result['stdout'].strip().split('\n')
+                packages = [p.replace('package:', '').strip() for p in lines if p.strip()]
+            return packages
+
+        packages = get_installed_packages()
+
+        # Create a dialog with dropdown
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Uninstall App")
+        dialog.setMinimumWidth(500)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # Label
+        label = QLabel("Select or enter package name to uninstall:")
+        layout.addWidget(label)
+
+        # Dropdown with edit capability
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        # Add installed packages to dropdown
+        combo.addItems(sorted(packages))
+
+        # Auto-suggest while typing
+        completer = QCompleter(sorted(packages))
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        combo.setCompleter(completer)
+
+        layout.addWidget(combo)
+
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(button_box)
+
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        package_name = combo.currentText().strip()
+        if not package_name:
             return
         
         reply = QMessageBox.question(self, "Confirm", f"Uninstall {package_name}?", 
@@ -4435,173 +4487,7 @@ class ADBGUI(QMainWindow):
         # Last resort - return None to use package name as fallback
         # Note: If labels aren't showing, check the log output to see what dumpsys/pm dump returns
         return None
-    
-    def reinstall_for_user(self):
-        """Reinstall app for current user (for apps uninstalled with --user 0)"""
-        if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
-            return
-        
-        self.log("Searching for apps...")
-        self.update_status("Loading apps...")
-        
-        def load_apps():
-            # Get all packages (including uninstalled for user)
-            # Try to get uninstalled packages first, then fall back to all packages
-            result = self.adb.run_command(f"{self.get_device_flag()} shell pm list packages -u")
-            if not result['success']:
-                # Fall back to all packages
-                result = self.adb.run_command(f"{self.get_device_flag()} shell pm list packages")
-            
-            if not result['success']:
-                self.log(f"Error: {result['stderr']}", "ERROR")
-                # Thread-safe messagebox - use QTimer to call from main thread
-                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to list packages:\n{result['stderr']}"))
-                return
-            
-            packages = result['stdout'].strip().split('\n')
-            packages = [p.replace('package:', '').strip() for p in packages if p.strip()]
-            
-            self.log(f"Found {len(packages)} packages. Getting app names...")
-            
-            # Get app labels (cache them)
-            app_data = {}  # {package_name: (label, package_name)}
-            
-            # Get labels in batches to avoid too many calls
-            for i, package in enumerate(packages):
-                if i % 10 == 0:
-                    self.log(f"Processing packages {i}/{len(packages)}...")
-                
-                label = self.get_app_label(package)
-                if label:
-                    app_data[package] = (label, package)
-                else:
-                    # Use package name as fallback
-                    app_data[package] = (package, package)
-            
-            self.log(f"Loaded {len(app_data)} apps")
-            QTimer.singleShot(0, lambda: self.show_app_search_dialog(app_data))
-        
-        threading.Thread(target=load_apps, daemon=True).start()
-    
-    def show_app_search_dialog(self, app_data):
-        """Show searchable dialog to select app by name"""
-        search_window = QDialog(self)
-        search_window.setWindowTitle("Search App to Reinstall")
-        search_window.setMinimumSize(600, 500)
-        
-        layout = QVBoxLayout(search_window)
-        layout.setSpacing(10)
-        layout.setContentsMargins(10, 10, 10, 10)
-        
-        # Search label and entry
-        search_label = QLabel("Search by app name (e.g., 'youtube' or 'YouTube'):")
-        layout.addWidget(search_label)
-        
-        search_entry = QLineEdit()
-        search_entry.setPlaceholderText("Type to search...")
-        layout.addWidget(search_entry)
-        
-        # List widget
-        listbox = QListWidget()
-        layout.addWidget(listbox)
-        
-        # Store app data
-        search_window.app_data = app_data
-        search_window.filtered_data = []
-        
-        def update_list():
-            """Update listbox based on search"""
-            search_term = search_entry.text().lower()
-            listbox.clear()
-            search_window.filtered_data = []
-            
-            if not search_term:
-                # Show all apps
-                for package, (label, pkg) in sorted(app_data.items(), key=lambda x: x[1][0].lower()):
-                    display_text = f"{label} ({pkg})"
-                    listbox.addItem(display_text)
-                    search_window.filtered_data.append((label, pkg))
-            else:
-                # Filter by search term
-                for package, (label, pkg) in sorted(app_data.items(), key=lambda x: x[1][0].lower()):
-                    if search_term in label.lower() or search_term in pkg.lower():
-                        display_text = f"{label} ({pkg})"
-                        listbox.addItem(display_text)
-                        search_window.filtered_data.append((label, pkg))
-        
-        search_entry.textChanged.connect(update_list)
-        search_entry.returnPressed.connect(select_app)
-        listbox.itemDoubleClicked.connect(lambda: select_app())
-        
-        def select_app():
-            """Select app and reinstall"""
-            current_item = listbox.currentItem()
-            if not current_item:
-                QMessageBox.warning(self, "No Selection", "Please select an app from the list")
-                return
-            
-            idx = listbox.row(current_item)
-            if idx < len(search_window.filtered_data):
-                label, package_name = search_window.filtered_data[idx]
-                
-                reply = QMessageBox.question(self, "Confirm Reinstall", 
-                                            f"Reinstall {label} ({package_name}) for current user?\n\nThis will restore apps that were uninstalled for your user account.",
-                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-                
-                search_window.accept()
-                self._do_reinstall_for_user(package_name, label)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        reinstall_btn = QPushButton("Reinstall Selected")
-        reinstall_btn.clicked.connect(select_app)
-        button_layout.addWidget(reinstall_btn)
-        button_layout.addStretch()
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(search_window.reject)
-        button_layout.addWidget(cancel_btn)
-        layout.addLayout(button_layout)
-        
-        # Initial population
-        update_list()
-        search_entry.setFocus()
-        search_window.exec()
-    
-    def _do_reinstall_for_user(self, package_name, app_label=None):
-        """Internal function to perform reinstall"""
-        display_name = app_label or package_name
-        self.log(f"Reinstalling {display_name} ({package_name}) for current user...")
-        self.update_status("Reinstalling app for user...")
-        
-        def do_reinstall():
-            # Use pm install-existing to reinstall apps uninstalled for the user
-            result = self.adb.run_command(f"{self.get_device_flag()} shell pm install-existing {package_name}")
-            if result['success']:
-                output = result['stdout'].strip() if result['stdout'] else ''
-                if 'Success' in output or 'success' in output.lower() or 'Package' in output:
-                    self.log("App reinstalled for current user successfully")
-                    self.update_status("App reinstalled for current user")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"{display_name} reinstalled for current user successfully!\n\n{package_name} is now available again."))
-                else:
-                    self.log(f"Reinstall result: {output}")
-                    self.update_status("Reinstall completed")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Reinstall completed:\n{output}"))
-            else:
-                error_msg = result['stderr'] if result['stderr'] else result['stdout']
-                if not error_msg or error_msg.strip() == '':
-                    error_msg = "Unknown error"
-                self.log(f"Error: {error_msg}", "ERROR")
-                self.update_status("Failed to reinstall app")
-                # Thread-safe messagebox - use QTimer to call from main thread
-                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to reinstall {display_name}:\n\n{error_msg}\n\nNote: This only works for apps that were previously installed but uninstalled for your user account."))
-        
-        threading.Thread(target=do_reinstall, daemon=True).start()
-    
+
     def open_apks_folder(self):
         """Open the APKs folder in file explorer"""
         # Get project directory - executable's directory if running as exe, script directory if from source
@@ -5355,15 +5241,11 @@ class ADBGUI(QMainWindow):
         uninstall_btn = QPushButton("Uninstall Selected")
         uninstall_btn.clicked.connect(uninstall_selected)
         button_layout.addWidget(uninstall_btn)
-        
+
         reinstall_btn = QPushButton("Reinstall Selected")
         reinstall_btn.clicked.connect(reinstall_selected)
         button_layout.addWidget(reinstall_btn)
-        
-        reinstall_user_btn = QPushButton("Reinstall for User")
-        reinstall_user_btn.clicked.connect(reinstall_for_user)
-        button_layout.addWidget(reinstall_user_btn)
-        
+
         disable_btn = QPushButton("Disable Selected")
         disable_btn.clicked.connect(disable_selected)
         button_layout.addWidget(disable_btn)
