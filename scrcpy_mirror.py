@@ -283,6 +283,68 @@ class VideoDisplayWidget(QWidget):
                 if coords:
                     self._safe_touch(1, coords[0], coords[1])  # ACTION_UP
 
+    def wheelEvent(self, event):
+        """Handle two-finger scroll gestures (mouse wheel/trackpad = two-finger swipe).
+
+        Uses ScrcpyClient.scroll() API for precise, smooth scrolling.
+        Positive delta_y = wheel UP = content scrolls UP (natural scroll direction).
+        """
+        if not self._client:
+            return
+
+        delta_y = event.angleDelta().y()
+        cursor_pos = event.position().toPoint()
+        coords = self._widget_to_device_coords(cursor_pos)
+
+        if not coords or not delta_y:
+            return
+
+        try:
+            import time as _t
+
+            # Get screen dimensions for normalized scroll calculation
+            try:
+                w, h = self._client.frame_size
+            except Exception:
+                w, h = 1080, 2400  # default fallback
+
+            # Normalize scroll amount (0.0 to 1.0 range works well)
+            # Each wheel notch = 0.15 normalized scroll
+            # Positive delta_y (wheel UP) = content UP = negative vertical scroll
+            # Negative delta_y (wheel DOWN) = content DOWN = positive vertical scroll
+            scroll_amount = delta_y * 0.00125  # ~120 units = 0.15 normalized
+
+            # Cap to reasonable range
+            scroll_amount = max(-0.5, min(0.5, scroll_amount))
+
+            # Use scrcpy's built-in scroll method with normalized values
+            # scroll(x, y, horizontal=0.0, vertical=0.0)
+            self._client.scroll(coords[0], coords[1], vertical=scroll_amount)
+
+            # Small delay to allow scroll to process
+            _t.sleep(0.01)
+        except Exception:
+            pass
+
+            x_start = coords[0]
+            y_start = coords[1]
+
+            # Touch DOWN at start
+            self._client._send_touch_phase(0, x_start, y_start)
+
+            # Drag through intermediate positions
+            for seg in range(1, num_segments + 1):
+                current_y = int(y_start + step_dy * seg)
+                self._client._send_touch_phase(2, x_start, current_y)
+                _t.sleep(0.008)  # small delay between moves for smoothness
+
+            # Touch UP at final position
+            y_end = int(y_start + total_dy_scaled)
+            self._client._send_touch_phase(1, x_start, y_end)
+
+        except Exception:
+            pass
+
 
 # ──────────────────────────────────────────────────────────────────────
 #  Scrcpy mirror window
