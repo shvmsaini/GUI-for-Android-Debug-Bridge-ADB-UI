@@ -287,16 +287,19 @@ class VideoDisplayWidget(QWidget):
         """Handle two-finger scroll gestures (mouse wheel/trackpad = two-finger swipe).
 
         Uses ScrcpyClient.scroll() API for precise, smooth scrolling.
-        Positive delta_y = wheel UP = content scrolls UP (natural scroll direction).
+        Supports both vertical and horizontal scrolling:
+        - Vertical: wheel UP/DOWN or two-finger vertical swipe
+        - Horizontal: horizontal trackpad swipe (shift+wheel on some mice)
         """
         if not self._client:
             return
 
         delta_y = event.angleDelta().y()
+        delta_x = event.angleDelta().x()
         cursor_pos = event.position().toPoint()
         coords = self._widget_to_device_coords(cursor_pos)
 
-        if not coords or not delta_y:
+        if not coords or (not delta_y and not delta_x):
             return
 
         try:
@@ -308,18 +311,24 @@ class VideoDisplayWidget(QWidget):
             except Exception:
                 w, h = 1080, 2400  # default fallback
 
-            # Normalize scroll amount (0.0 to 1.0 range works well)
-            # Each wheel notch = 0.15 normalized scroll
-            # Positive delta_y (wheel UP) = content UP = negative vertical scroll
+            # Normalize scroll amounts (0.0 to 1.0 range works well)
+            # Each wheel notch = 0.002 normalized scroll (~0.24 for 120 units) - increased from 0.00125
+
+            # Vertical: Positive delta_y (wheel UP) = content UP = negative vertical scroll
             # Negative delta_y (wheel DOWN) = content DOWN = positive vertical scroll
-            scroll_amount = delta_y * 0.00125  # ~120 units = 0.15 normalized
+            vertical_scroll = delta_y * 0.002
+
+            # Horizontal: Positive delta_x (swipe right) = content moves LEFT = negative horizontal scroll
+            # Negative delta_x (swipe left) = content moves RIGHT = positive horizontal scroll
+            horizontal_scroll = -delta_x * 0.002  # negative because swipe right should scroll left
 
             # Cap to reasonable range
-            scroll_amount = max(-0.5, min(0.5, scroll_amount))
+            vertical_scroll = max(-0.5, min(0.5, vertical_scroll))
+            horizontal_scroll = max(-0.5, min(0.5, horizontal_scroll))
 
-            # Use scrcpy's built-in scroll method with normalized values
+            # Use scrcpy's built-in scroll method with both horizontal and vertical values
             # scroll(x, y, horizontal=0.0, vertical=0.0)
-            self._client.scroll(coords[0], coords[1], vertical=scroll_amount)
+            self._client.scroll(coords[0], coords[1], horizontal=horizontal_scroll, vertical=vertical_scroll)
 
             # Small delay to allow scroll to process
             _t.sleep(0.01)
