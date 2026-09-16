@@ -95,6 +95,13 @@ KEYCODE_VOLUME_UP = 24
 KEYCODE_VOLUME_DOWN = 25
 KEYCODE_APP_SWITCH = 187
 
+# D-pad keycodes
+KEYCODE_DPAD_UP = 19
+KEYCODE_DPAD_DOWN = 20
+KEYCODE_DPAD_LEFT = 21
+KEYCODE_DPAD_RIGHT = 22
+KEYCODE_DPAD_CENTER = 23
+
 
 # ──────────────────────────────────────────────────────────────────────
 #  Thread-safe frame signal
@@ -299,7 +306,7 @@ class ScrcpyMirrorWindow(QMainWindow):
     ]
 
     def __init__(self, device_id, adb_path=None, bitrate=1_000_000,
-                 max_size=1024, screenshot_path=None, parent=None):
+                 max_size=1024, screenshot_path=None, parent=None, seat_info=None):
         super().__init__(parent)
         self.device_id = device_id
         self.adb_path = adb_path
@@ -310,8 +317,27 @@ class ScrcpyMirrorWindow(QMainWindow):
         self._client = None
         self._listener_thread = None
         self._closing = False
+        self.seat_info = seat_info
 
-        self.setWindowTitle(f"📡 Mirror — {device_id}")
+        # Set window title with enhanced info (device, seat, and if possible rack)
+        title_parts = [f"📡 Mirror — {device_id}"]
+        if seat_info:
+            title_parts.append(f"Seat: {seat_info}")
+            # Extract potential rack info from seat name if present
+            if '@' in seat_info:
+                parts = seat_info.split('@')
+                if len(parts) > 1:
+                    title_parts.append(f"Rack: {parts[1]}")
+            elif ':' in seat_info and '.' in seat_info and seat_info.count('.') == 3:
+                # Looks like an IP address - split by @ or :
+                if '@' in seat_info and ':' in seat_info:
+                    ip_part = seat_info.split('@')[-1].split(':')[0]
+                    rack_info = seat_info.split('@')[0] if '@' in seat_info else None
+                    if rack_info:
+                        title_parts.append(f"Rack: {rack_info}")
+                    title_parts.append(f"IP: {ip_part}")
+
+        self.setWindowTitle(" — ".join(title_parts))
         self.setMinimumSize(280, 400)
         self.resize(400, 800)
         self.setStyleSheet(self._stylesheet())
@@ -572,9 +598,12 @@ class ScrcpyMirrorWindow(QMainWindow):
         self._nav_row1.addStretch()
         outer.addLayout(self._nav_row1)
 
-        # Row 2: close button
+        # Row 2: D-pad controls removed per user request
+        # Keyboard-only D-pad controls (Arrow/WASD keys) are handled in keyPressEvent
         self._nav_row2 = QHBoxLayout()
         self._nav_row2.setSpacing(6)
+
+        self._nav_row2.addStretch()
 
         self.close_btn = QPushButton("Close")
         self.close_btn.setFixedHeight(38)
@@ -588,12 +617,12 @@ class ScrcpyMirrorWindow(QMainWindow):
         )
         self.close_btn.clicked.connect(self.close)
         self._nav_row2.addWidget(self.close_btn)
-        self._nav_row2.addStretch()
         outer.addLayout(self._nav_row2)
 
-        # Default to single-row appearance (close button hidden, row 2 hidden)
+        # Default to single-row appearance (row 2 hidden)
         self._nav_row2_visible = False
         self.close_btn.setVisible(False)
+        # Removed: dpad button visibility management (keyboard-controlled only)
 
         # Listen for resize events to toggle visibility based on width
         bar.resizeEvent = self._on_nav_bar_resize
@@ -611,11 +640,13 @@ class ScrcpyMirrorWindow(QMainWindow):
             if need_two_rows:
                 # Make close button visible and let row 2 take space
                 self.close_btn.setVisible(True)
+                # Removed: dpad button visibility
                 # Hide the stretch in row 1 so buttons stay left-aligned
                 self._set_row1_stretch(False)
             else:
                 # Hide row 2; move close into row 1 visually
                 self.close_btn.setVisible(False)
+                # Removed: dpad button visibility
                 self._set_row1_stretch(True)
             # Force relayout
             self.nav_bar_widget.updateGeometry()
@@ -809,6 +840,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             self.video.set_client(self._client)
             for btn in self.nav_buttons.values():
                 btn.setEnabled(True)
+            # Removed: dpad button enabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(True)
         except RuntimeError:
             pass
@@ -822,6 +854,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             self.status.showMessage(f"Error: {error_msg[:80]}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
+            # Removed: dpad button disabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(False)
             # Keep window open briefly so user can see the message, then close
             QTimer.singleShot(3000, self.close)
@@ -837,6 +870,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             self.status.showMessage(f"Disconnected: {error_msg}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
+            # Removed: dpad button disabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(False)
             # Keep window open briefly so user can see the message, then close
             QTimer.singleShot(2000, self.close)
@@ -908,6 +942,11 @@ class ScrcpyMirrorWindow(QMainWindow):
                 "vol_down": KEYCODE_VOLUME_DOWN,
                 "power": KEYCODE_POWER,
                 "menu": KEYCODE_MENU,
+                "dpad_up": KEYCODE_DPAD_UP,
+                "dpad_down": KEYCODE_DPAD_DOWN,
+                "dpad_left": KEYCODE_DPAD_LEFT,
+                "dpad_right": KEYCODE_DPAD_RIGHT,
+                "dpad_center": KEYCODE_DPAD_CENTER,
             }
             if key in keycodes:
                 self._client.press_key(keycodes[key])
@@ -1016,6 +1055,23 @@ class ScrcpyMirrorWindow(QMainWindow):
             return
         if key == Qt.Key.Key_Menu:
             self._client.press_key(KEYCODE_APP_SWITCH)
+            return
+
+        # D-pad/arrow key support
+        if key == Qt.Key.Key_Up or key == Qt.Key.Key_W:
+            self._client.press_key(KEYCODE_DPAD_UP)
+            return
+        if key == Qt.Key.Key_Down or key == Qt.Key.Key_S:
+            self._client.press_key(KEYCODE_DPAD_DOWN)
+            return
+        if key == Qt.Key.Key_Left or key == Qt.Key.Key_A:
+            self._client.press_key(KEYCODE_DPAD_LEFT)
+            return
+        if key == Qt.Key.Key_Right or key == Qt.Key.Key_D:
+            self._client.press_key(KEYCODE_DPAD_RIGHT)
+            return
+        if key == Qt.Key.Key_Enter or key == Qt.Key.Key_Return or key == Qt.Key.Key_Space:
+            self._client.press_key(KEYCODE_DPAD_CENTER)
             return
 
         super().keyPressEvent(event)

@@ -2227,7 +2227,7 @@ class ADBGUI(QMainWindow):
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
-    def _open_mirror_window(self, device_id=None, bitrate=1_000_000):
+    def _open_mirror_window(self, device_id=None, bitrate=1_000_000, seat_context=None):
         """Open the mirror in a separate window with recording options.
 
         This is the older 'Embedded Mirror' route, using ScrcpyMirrorWindow.
@@ -2237,6 +2237,7 @@ class ADBGUI(QMainWindow):
         Args:
             device_id: Optional device ID to mirror. Defaults to self.current_device.
             bitrate: Bitrate in bps. Defaults to 1_000_000 (1 Mbps).
+            seat_context: Optional seat context info for window title. Ex: seat name/IP.
         """
         if device_id is None:
             device_id = self.current_device
@@ -2273,10 +2274,11 @@ class ADBGUI(QMainWindow):
                     bitrate=bitrate,
                     max_size=1024,
                     screenshot_path=self.settings.get('screenshot_path', ''),
+                    seat_info=seat_context,
                 )
                 win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
                 win.show()
-                self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate})")
+                self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate}")
                 return
             except Exception as e:
                 last_exc = e
@@ -3337,8 +3339,8 @@ class ADBGUI(QMainWindow):
                             break
 
                 if device_id:
-                    self.log(f"Opening mirror window for device {device_id}")
-                    self._open_mirror_window(device_id=device_id, bitrate=1_000_000)
+                    self.log(f"Opening mirror window for device {device_id} (seat: {seat})")
+                    self._open_mirror_window(device_id=device_id, bitrate=1_000_000, seat_context=seat)
                     return
                 else:
                     # Device not found yet - wait and retry
