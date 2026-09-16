@@ -1985,7 +1985,7 @@ class ADBGUI(QMainWindow):
         self.mirror_separate_btn.setFixedHeight(26)
         self.mirror_separate_btn.setToolTip(
             "Open mirror in a separate window with recording options")
-        self.mirror_separate_btn.clicked.connect(self._open_mirror_window)
+        self.mirror_separate_btn.clicked.connect(lambda: self._open_mirror_window())
         self.mirror_separate_btn.setVisible(False)
         log_controls.addWidget(self.mirror_separate_btn)
 
