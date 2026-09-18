@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSizePolicy, QMessageBox, QStatusBar, QComboBox,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QProcess, QFileInfo
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QCursor
 
 
@@ -123,6 +123,9 @@ class VideoDisplayWidget(QWidget):
     """Renders a QPixmap with aspect-ratio preservation and forwards mouse
     events as touch events via the ScrcpyClient control socket."""
 
+    # Signal for APK install requests
+    request_adb_install = pyqtSignal(list)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap = None
@@ -137,6 +140,11 @@ class VideoDisplayWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
         self.setAutoFillBackground(False)
+
+        # Drag and drop setup
+        self.setAcceptDrops(True)
+        self._install_in_progress = False
+        self._drag_overlay = None  # Overlay widget shown during valid drag
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -354,6 +362,160 @@ class VideoDisplayWidget(QWidget):
         except Exception:
             pass
 
+    def dragEnterEvent(self, event):
+        """Accept APK files being dragged in."""
+        print(f"🔍 DEBUG: dragEnterEvent triggered")
+        try:
+            if self._install_in_progress:
+                print(f"🔍 DEBUG: dragEnter - already installing")
+                event.ignore()
+                return
+
+            mime = event.mimeData()
+            if not mime or not mime.hasUrls():
+                print(f"🔍 DEBUG: dragEnter - no URLs")
+                event.ignore()
+                return
+
+            print(f"🔍 DEBUG: dragEnter - checking URLs")
+            for url in mime.urls():
+                path = url.toLocalFile()
+                print(f"🔍 DEBUG: dragEnter - URL: {path}")
+                if path.lower().endswith('.apk'):
+                    print(f"🔍 DEBUG: dragEnter - ACCEPTING APK!")
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
+                    self._show_drop_overlay()
+                    return
+        except Exception as e:
+            print(f"🔍 DEBUG: dragEnter Exception: {e}")
+            import traceback
+            traceback.print_exc()
+            pass  # graceful fallback - don't crash on dnd
+
+        print(f"🔍 DEBUG: dragEnter - ignoring")
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        """Highlight the widget during valid drag."""
+        try:
+            if self._install_in_progress:
+                event.ignore()
+                return
+
+            mime = event.mimeData()
+            if mime and mime.hasUrls():
+                for url in mime.urls():
+                    if url.toLocalFile().lower().endswith('.apk'):
+                        event.setDropAction(Qt.DropAction.CopyAction)
+                        event.accept()
+                        return
+        except Exception:
+            pass  # graceful fallback - don't crash on dnd
+
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        """Hide overlay when drag leaves the widget."""
+        try:
+            self._hide_drop_overlay()
+        except Exception:
+            pass
+
+    def dropEvent(self, event):
+        """Signal parent to install dropped APK files."""
+        print(f"🔍 DEBUG: dropEvent triggered!")
+        try:
+            if self._install_in_progress:
+                print(f"🔍 DEBUG: Already installing")
+                event.ignore()
+                return
+
+            mime = event.mimeData()
+            if not mime or not mime.hasUrls():
+                print(f"🔍 DEBUG: No URLs in mime")
+                event.ignore()
+                return
+
+            # Extract dropped files (APKs only)
+            apk_files = [url.toLocalFile() for url in mime.urls() if url.toLocalFile().lower().endswith('.apk')]
+            print(f"🔍 DEBUG: Found {len(apk_files)} APK files: {apk_files}")
+
+            if not apk_files:
+                print(f"🔍 DEBUG: No APKs found")
+                self._hide_drop_overlay()
+                event.ignore()
+                return
+
+            print(f"🔍 DEBUG: Emitting signal!")
+            # Signal is connected to ScrcpyMirrorWindow
+            self._install_in_progress = True
+            self._hide_drop_overlay()
+            if self.window():
+                self.window().setCursor(QCursor(Qt.CursorShape.WaitCursor))
+
+            event.accept()
+            self.request_adb_install.emit(apk_files)
+            print(f"🔍 DEBUG: Signal emitted!")
+        except Exception as e:
+            print(f"🔍 DEBUG: Exception: {e}")
+            import traceback
+            traceback.print_exc()
+            self._hide_drop_overlay()
+            pass  # crash-safe dnd
+
+    def _show_drop_overlay(self):
+        """Show a semi-transparent overlay saying 'Drop to Install APK'."""
+        if self._drag_overlay is not None:
+            return  # Already showing
+
+        try:
+            overlay = QLabel(self)
+            overlay.setText("📦\nDrop to Install APK")
+            overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            overlay.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(40, 80, 160, 200);
+                    color: white;
+                    font-size: 24px;
+                    font-weight: bold;
+                    border: 4px dashed rgba(255, 255, 255, 220);
+                    border-radius: 16px;
+                    padding: 40px;
+                }
+            """)
+            overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            overlay.resize(self.size())
+            overlay.move(0, 0)
+            overlay.raise_()
+            overlay.show()
+            self._drag_overlay = overlay
+        except Exception:
+            pass
+
+    def _hide_drop_overlay(self):
+        """Hide the drop overlay if it exists."""
+        if self._drag_overlay is None:
+            return
+        try:
+            self._drag_overlay.hide()
+            self._drag_overlay.deleteLater()
+        except Exception:
+            pass
+        finally:
+            self._drag_overlay = None
+
+    def resizeEvent(self, event):
+        """Keep the drop overlay sized to the widget."""
+        try:
+            if self._drag_overlay is not None:
+                self._drag_overlay.resize(self.size())
+        except Exception:
+            pass
+        super().resizeEvent(event)
+
+        event.ignore()
+
 
 # ──────────────────────────────────────────────────────────────────────
 #  Scrcpy mirror window
@@ -440,6 +602,12 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.video = VideoDisplayWidget()
         layout.addWidget(self.video, 1)
 
+        # Connect APK install signal
+        try:
+            self.video.request_adb_install.connect(self._handle_apk_install_request)
+        except Exception:
+            pass  # crash-safe connect
+
         # ── navigation button row ───────────────────────────────────
         nav = self._build_nav_bar()
         layout.addWidget(nav)
@@ -461,6 +629,122 @@ class ScrcpyMirrorWindow(QMainWindow):
         # The previous 100ms delay wasn't doing anything useful and just
         # added startup latency on top of the ~5s scrcpy handshake.
         QTimer.singleShot(0, self._start_client)
+
+    # ──────────────────────────────────────────────────────────────────
+    #  APK install (drag-and-drop)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _handle_apk_install_request(self, apk_paths):
+        """Install APKs dropped on video widget – async with progress."""
+        # Process each APK asynchronously so the UI stays responsive
+        print(f"🔍 DEBUG: _handle_apk_install_request called with {len(apk_paths)} files: {apk_paths}")
+        try:
+            # Update status: starting install
+            if hasattr(self, 'status'):
+                self.status.showMessage(f"📦 Installing {len(apk_paths)} APK(s)...")
+
+            # Use a timer to start the install on the next event loop tick
+            QTimer.singleShot(0, lambda: self._install_apks_async(apk_paths))
+        except Exception:
+            # Crash-safe
+            if hasattr(self, 'video'):
+                self.video._install_in_progress = False
+
+    def _install_apks_async(self, apk_paths):
+        """Install APKs sequentially, updating status for each."""
+        print(f"🔍 DEBUG: _install_apks_async starting with {len(apk_paths)} APKs")
+        try:
+            for idx, apk_path in enumerate(apk_paths):
+                print(f"🔍 DEBUG: Installing APK {idx+1}/{len(apk_paths)}: {apk_path}")
+                self._install_single_apk(apk_path, idx + 1, len(apk_paths))
+        except Exception:
+            pass
+        finally:
+            try:
+                self.video._install_in_progress = False
+                if hasattr(self, 'setCursor'):
+                    self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            except Exception:
+                pass
+
+    def _install_single_apk(self, apk_path, idx, total):
+        """Install a single APK file and update status - fully async."""
+        print(f"🔍 DEBUG: _install_single_apk called for: {apk_path}")
+        proc = QProcess(self)
+
+        try:
+            if not isinstance(apk_path, str) or not apk_path.lower().endswith('.apk'):
+                self.status.showMessage(f"❌ Skipped non-APK file")
+                return
+
+            if not QFileInfo(apk_path).exists():
+                self.status.showMessage(f"❌ File not found: {apk_path}")
+                return
+
+            file_name = QFileInfo(apk_path).fileName()
+            progress_label = f"[{idx}/{total}] {file_name}"
+            self.status.showMessage(f"📦 Installing {progress_label}...")
+            print(f"🔍 DEBUG: Starting install for {file_name}")
+
+            # Construct command
+            adb_bin = self.adb_path if self.adb_path else 'adb'
+            cmd = [adb_bin, 'install', '-r', '-t', apk_path]
+            print(f"🔍 DEBUG: Running: {' '.join(cmd)}")
+
+            # Connect output signal for real-time progress
+            def on_stdout():
+                try:
+                    data = proc.readAllStandardOutput().data().decode('utf-8', errors='replace').strip()
+                    if data and len(data) < 200:
+                        self.status.showMessage(f"📦 {progress_label}: {data[:80]}")
+                        print(f"🔍 DEBUG: ADB: {data[:80]}")
+                except Exception:
+                    pass
+
+            def on_finished(exit_code, exit_status):
+                try:
+                    print(f"🔍 DEBUG: Finished with code {exit_code}")
+                    if exit_code == 0:
+                        self.status.showMessage(f"✅ [{idx}/{total}] {file_name} installed")
+                        print(f"🔍 DEBUG: Install SUCCESS")
+                    else:
+                        try:
+                            error = proc.readAllStandardError().data().decode('utf-8', errors='replace').strip()
+                        except Exception:
+                            error = "Unknown error"
+                        self.status.showMessage(f"❌ [{idx}/{total}] {file_name} failed: {error[:60]}")
+                        print(f"🔍 DEBUG: Install FAILED: {error[:100]}")
+                finally:
+                    proc.deleteLater()
+                    try:
+                        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                        if hasattr(self, 'video'):
+                            self.video._install_in_progress = False
+                    except Exception:
+                        pass
+
+            def on_error(error):
+                print(f"🔍 DEBUG: QProcess error: {error}")
+                self.status.showMessage(f"❌ Install error for {file_name}")
+
+            # Connect signals (truly async - no blocking!)
+            proc.readyReadStandardOutput.connect(on_stdout)
+            proc.finished.connect(on_finished)
+            proc.errorOccurred.connect(on_error)
+
+            # Start process (returns immediately - doesn't block!)
+            proc.start(cmd[0], cmd[1:])
+            print(f"🔍 DEBUG: Process started, returning immediately")
+
+        except Exception as e:
+            print(f"🔍 DEBUG: Exception in _install_single_apk: {e}")
+            import traceback
+            traceback.print_exc()
+            self.status.showMessage(f"❌ Install error for {apk_path}")
+            try:
+                proc.deleteLater()
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────────
     #  UI construction
