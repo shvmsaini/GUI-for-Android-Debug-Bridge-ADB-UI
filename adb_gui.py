@@ -2277,6 +2277,25 @@ class ADBGUI(QMainWindow):
         except Exception as e:
             return False, f"Error checking device: {str(e)}"
 
+    def _is_remote_device(self, device_id):
+        """True if device_id looks like a network/remote serial (e.g. localhost:55077).
+
+        Remote devices route through an SSH/proxy tunnel, where the embedded
+        py_scrcpy_sdk mirror has known issues with both forward and reverse
+        socket modes. The external scrcpy binary handles this case reliably.
+        """
+        return bool(device_id) and ':' in device_id
+
+    @staticmethod
+    def _bitrate_to_str(bitrate_bps):
+        """Convert a bitrate in bps to scrcpy's shorthand string ('500k', '1m', '3m')."""
+        if bitrate_bps >= 1_000_000:
+            m = bitrate_bps / 1_000_000
+            return f"{int(m)}m" if m == int(m) else f"{m:.1f}m"
+        if bitrate_bps >= 1_000:
+            return f"{int(bitrate_bps / 1_000)}k"
+        return str(int(bitrate_bps))
+
     def _open_mirror_window(self, device_id=None, bitrate=3_000_000,
                             max_fps=60, max_size=1024, seat_context=None):
         """Open the mirror in a separate window with recording options.
@@ -2302,6 +2321,21 @@ class ADBGUI(QMainWindow):
 
         if not device_id:
             QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+
+        # For remote/seat devices (e.g. localhost:55077 through an SSH tunnel),
+        # the embedded py_scrcpy_sdk mirror has trouble with both adb reverse
+        # and adb forward because both tunnel the scrcpy socket through adb's
+        # SSH proxy — when the local adb server sees more than one device, the
+        # proxy returns "more than one device/emulator". The system scrcpy
+        # binary handles this correctly by talking to adb-server itself and
+        # opening a direct socket.
+        if self._is_remote_device(device_id):
+            self.log(
+                f"Detected remote/seat device {device_id} — using external scrcpy binary",
+                "INFO",
+            )
+            self.scrcpy_device(bitrate=self._bitrate_to_str(bitrate), max_fps=max_fps)
             return
 
         if ScrcpyMirrorWindow is None:
