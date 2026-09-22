@@ -2240,43 +2240,6 @@ class ADBGUI(QMainWindow):
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
-    def _check_device_readiness(self, device_id):
-        """Check if a device is ready for scrcpy streaming.
-
-        Returns: (ready: bool, error_msg: str)
-
-        Verifies:
-        - Device is in 'device' state (not 'offline' or 'unauthorized')
-        - Device responds to basic shell commands (getprop)
-        """
-        try:
-            # Check device state
-            devices = self.adb.get_devices()
-            device_info = None
-            for dev in devices:
-                if dev['id'] == device_id:
-                    device_info = dev
-                    break
-
-            if not device_info:
-                return False, f"Device {device_id} not found in adb devices list."
-
-            # get_devices() returns 'status' (adb terminology), not 'state'
-            device_status = device_info.get('status', 'unknown')
-            if device_status != 'device':
-                return False, f"Device state is '{device_status}', expected 'device'."
-
-            # Quick shell command to verify device responsiveness
-            # Using 'getprop ro.build.version.release' — always exists and is fast
-            result = self.adb.run_command(f'-s {device_id} shell getprop ro.build.version.release')
-            if not result['success']:
-                return False, f"Device shell is not responsive: {result['stderr'][:100]}"
-
-            # Device is ready
-            return True, ""
-        except Exception as e:
-            return False, f"Error checking device: {str(e)}"
-
     def _open_mirror_window(self, device_id=None, bitrate=3_000_000,
                             max_fps=60, max_size=1024, seat_context=None):
         """Open the mirror in a separate window with recording options.
@@ -2304,12 +2267,6 @@ class ADBGUI(QMainWindow):
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
 
-        # Note: the embedded mirror (ScrcpyMirrorWindow) now handles remote/seat
-        # devices itself by forcing forward tunnel mode and skipping the reverse
-        # fallback (which is unsupported through SSH-tunneled adb proxies and
-        # produces spurious "more than one device/emulator" errors). Local
-        # emulator / USB devices continue to use the default reverse tunnel.
-
         if ScrcpyMirrorWindow is None:
             QMessageBox.warning(
                 self, "Feature Unavailable",
@@ -2325,19 +2282,6 @@ class ADBGUI(QMainWindow):
                 return
 
         adb_path = getattr(self.adb, 'adb_path', 'adb')
-
-        # Verify device is ready before opening mirror
-        # (particularly important for seat connections which may be unstable)
-        self.log(f"Checking device readiness for {device_id}...")
-        ready, error_msg = self._check_device_readiness(device_id)
-        if not ready:
-            self.log(f"Device {device_id} is not ready: {error_msg}", "WARNING")
-            QMessageBox.warning(
-                self, "Device Not Ready",
-                f"Device {device_id} is not responding to ADB commands.\n\n"
-                f"{error_msg}\n\n"
-                f"Please check the device connection and try again.")
-            return
 
         # py_scrcpy_sdk's native libraries (PyAV/FFmpeg, numpy C core) can
         # intermittently SIGSEGV during initialization on macOS. Retry a
