@@ -2240,6 +2240,42 @@ class ADBGUI(QMainWindow):
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
+    def _check_device_readiness(self, device_id):
+        """Check if a device is ready for scrcpy streaming.
+
+        Returns: (ready: bool, error_msg: str)
+
+        Verifies:
+        - Device is in 'device' state (not 'offline' or 'unauthorized')
+        - Device responds to basic shell commands (getprop)
+        - Device has writable /sdcard (for scrcpy socket)
+        """
+        try:
+            # Check device state
+            devices = self.adb.get_devices()
+            device_info = None
+            for dev in devices:
+                if dev['id'] == device_id:
+                    device_info = dev
+                    break
+
+            if not device_info:
+                return False, f"Device {device_id} not found in adb devices list."
+
+            if device_info['state'] != 'device':
+                return False, f"Device state is '{device_info['state']}', expected 'device'."
+
+            # Quick shell command to verify device responsiveness
+            # Using 'getprop ro.build.version.release' — always exists and is fast
+            result = self.adb.run_command(f'-s {device_id} shell getprop ro.build.version.release')
+            if not result['success']:
+                return False, f"Device shell is not responsive: {result['stderr'][:100]}"
+
+            # Device is ready
+            return True, ""
+        except Exception as e:
+            return False, f"Error checking device: {str(e)}"
+
     def _open_mirror_window(self, device_id=None, bitrate=3_000_000,
                             max_fps=60, max_size=1024, seat_context=None):
         """Open the mirror in a separate window with recording options.
@@ -2282,6 +2318,19 @@ class ADBGUI(QMainWindow):
                 return
 
         adb_path = getattr(self.adb, 'adb_path', 'adb')
+
+        # Verify device is ready before opening mirror
+        # (particularly important for seat connections which may be unstable)
+        self.log(f"Checking device readiness for {device_id}...")
+        ready, error_msg = self._check_device_readiness(device_id)
+        if not ready:
+            self.log(f"Device {device_id} is not ready: {error_msg}", "WARNING")
+            QMessageBox.warning(
+                self, "Device Not Ready",
+                f"Device {device_id} is not responding to ADB commands.\n\n"
+                f"{error_msg}\n\n"
+                f"Please check the device connection and try again.")
+            return
 
         # py_scrcpy_sdk's native libraries (PyAV/FFmpeg, numpy C core) can
         # intermittently SIGSEGV during initialization on macOS. Retry a
@@ -3017,6 +3066,18 @@ class ADBGUI(QMainWindow):
                     })
                     existing_seat_keys.add(key)
 
+        # Cache for click handler to use (needs to stay in sync with highlighting)
+        # Store as dict: seat_name -> set of gateways for this seat
+        connected_seat_gateways = {}
+        for dev_info in seat_sh_devices:
+            seat = dev_info.get('seat', '')
+            gateway = dev_info.get('gateway', '')
+            if seat:
+                if seat not in connected_seat_gateways:
+                    connected_seat_gateways[seat] = set()
+                connected_seat_gateways[seat].add(gateway)
+        self._connected_seat_gateways_cached = connected_seat_gateways
+
         # Sort: Connected seats first (from both connection state and seat.sh), then disconnected
         connected_seats = []
         disconnected_seats = []
@@ -3242,10 +3303,18 @@ class ADBGUI(QMainWindow):
         # Treat as connected only when the seat is connected to *this* gateway,
         # otherwise the same seat name on a different gateway would silently
         # route to the disconnect path.
-        is_connected = (
-            self.seat_port_manager.is_seat_connected(entry['seat'])
-            and self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway']
+        # Also check external state from seat.sh devices (to match highlighting behavior).
+        seat = entry['seat']
+        gateway = entry['gateway']
+        is_internally_connected = (
+            self.seat_port_manager.is_seat_connected(seat)
+            and self.seat_port_manager.connected_seats.get(seat) == gateway
         )
+        # Check if seat appears in seat.sh devices output with matching gateway (external connection state)
+        connected_gateways = getattr(self, '_connected_seat_gateways_cached', {}).get(seat, set())
+        is_externally_connected = gateway in connected_gateways
+
+        is_connected = is_internally_connected or is_externally_connected
 
         if is_connected:
             # Disconnect

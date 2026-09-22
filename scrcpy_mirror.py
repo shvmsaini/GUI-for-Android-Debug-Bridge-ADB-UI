@@ -1116,23 +1116,30 @@ class ScrcpyMirrorWindow(QMainWindow):
                 self._client.adb.ensure_server = lambda: None
 
                 # Retry start() a few times — transient "device not found"
-                # errors are common right after adb restarts.
+                # errors are common right after adb restarts or device connections
+                # are establishing. Use exponential backoff for robustness.
                 last_exc: Exception | None = None
-                for attempt in range(3):
+                for attempt in range(5):  # Increased from 3 to 5 attempts
                     if self._closing:
                         return
                     try:
                         self._client.start()
-                        break
+                        break  # Successfully started — proceed to listening
                     except Exception as e:
                         last_exc = e
-                        # If the device is genuinely gone, don't waste time
-                        # retrying — fail fast with a clear message.
                         msg = str(e)
-                        if "device" in msg and "not found" in msg:
+                        # If the device is genuinely gone, don't waste time retrying
+                        if "device" in msg.lower() and "not found" in msg.lower():
+                            # But wait a moment - device might just be reconnecting
+                            if attempt < 2:
+                                import time as _t
+                                _t.sleep(1)  # Longer wait for device reconnection
+                                continue
                             break
+                        # For other errors, use exponential backoff
                         import time as _t
-                        _t.sleep(0.5)
+                        wait_time = min(0.5 * (2 ** attempt), 3)  # Max 3 seconds
+                        _t.sleep(wait_time)
                 else:
                     if last_exc is not None:
                         raise last_exc
@@ -1165,12 +1172,15 @@ class ScrcpyMirrorWindow(QMainWindow):
                 if "device" in msg and "not found" in msg:
                     self.signal.error.emit(
                         f"Device {self.device_id} not found.\n\n"
-                        f"It may have disconnected. Refresh the device list "
-                        f"and try again.")
+                        f"It may have disconnected or the adb connection was interrupted.\n\n"
+                        f"Try refreshing devices and reconnecting.")
                     return
-                self.signal.error.emit(
-                    f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
-                )
+                # Better error logging for debugging
+                import traceback as tb
+                full_trace = tb.format_exc()
+                # Send both the message and full trace for debugging
+                error_summary = f"{type(e).__name__}: {msg}"
+                self.signal.error.emit(f"{error_summary}\n\nDebug info:\n{full_trace[:500]}")
 
         threading.Thread(target=_thread, daemon=True).start()
 
@@ -1218,13 +1228,24 @@ class ScrcpyMirrorWindow(QMainWindow):
                 return
             # Show disconnection message on the video display
             self.video.set_disconnected()
-            self.status.showMessage(f"Error: {error_msg[:80]}")
+            self.status.showMessage(f"Error: {error_msg[:100]}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
             # Removed: dpad button disabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(False)
-            # Keep window open briefly so user can see the message, then close
-            QTimer.singleShot(3000, self.close)
+
+            # Show a dialog with full error details instead of auto-closing
+            # This gives the user a chance to see what happened and decide next steps
+            msg_display = error_msg if len(error_msg) < 300 else error_msg[:300] + "..."
+            reply = QMessageBox.critical(
+                self,
+                "Mirror Connection Error",
+                f"Failed to connect or stream from device.\n\n{msg_display}\n\nWould you like to close the window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.close()
+            # If No, user can try to manually reconnect or adjust settings and hit Apply
         except RuntimeError:
             pass
 
@@ -1234,13 +1255,22 @@ class ScrcpyMirrorWindow(QMainWindow):
                 return
             # Show disconnection message on the video display
             self.video.set_disconnected()
-            self.status.showMessage(f"Disconnected: {error_msg}")
+            self.status.showMessage(f"Disconnected: {error_msg[:100]}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
             # Removed: dpad button disabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(False)
-            # Keep window open briefly so user can see the message, then close
-            QTimer.singleShot(2000, self.close)
+
+            # Show a dialog with full error details
+            # Clean disconnect: show message but allow user to retry by adjusting settings
+            msg_display = error_msg if len(error_msg) < 300 else error_msg[:300] + "..."
+            reply = QMessageBox.warning(
+                self,
+                "Device Disconnected",
+                f"Connection lost to device.\n\n{msg_display}\n\nYou can adjust settings and hit Apply to retry.",
+                QMessageBox.StandardButton.Close
+            )
+            # For clean disconnects, keep window open so user can try again
         except RuntimeError:
             pass
 
