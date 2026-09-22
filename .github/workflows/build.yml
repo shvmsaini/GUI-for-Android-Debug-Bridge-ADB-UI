@@ -1,0 +1,95 @@
+name: Build ADB Tool
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            executable: ADB_Tool.exe
+            artifact: windows
+          - os: macos-latest
+            executable: ADB Tool.app
+            artifact: macos
+          - os: ubuntu-latest
+            executable: ADB_Tool
+            artifact: linux
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt6 -r requirements.txt
+
+      - name: Build executable (Windows & Linux)
+        if: matrix.os != 'macos-latest'
+        run: |
+          pyinstaller --name "ADB_Tool" --windowed --onefile --clean adb_gui.py
+
+      - name: Build executable (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          pyinstaller --name "ADB Tool" --windowed --onedir --clean --noconfirm adb_gui.py
+
+      - name: Upload artifact (Windows & Linux)
+        if: matrix.os != 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.executable }}
+
+      - name: Upload artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create ZIP archives
+        run: |
+          cd artifacts
+          zip -r ADB_Tool_Windows.zip windows/
+          zip -r ADB_Tool_macOS.zip macos/
+          zip -r ADB_Tool_Linux.zip linux/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/ADB_Tool_Windows.zip
+            artifacts/ADB_Tool_macOS.zip
+            artifacts/ADB_Tool_Linux.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

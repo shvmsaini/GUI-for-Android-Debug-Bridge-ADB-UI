@@ -1698,16 +1698,29 @@ class ADBGUI(QMainWindow):
         device_ops_group = self.create_card("⚡ Device Operations")
         self.create_button(device_ops_group, "📸 Take Screenshot", self.take_screenshot)
 
-        # Embedded Mirror with Fast (500kbps)/Normal (1mbps) buttons
+        # Embedded Mirror: two presets tuned for the most common cases.
+        # "Fast" → 1 Mbps / 24 fps / max_size 800, for bandwidth-sensitive
+        #           situations (seat/remote mirroring where the link is
+        #           the bottleneck). Lowering the long-edge from 1024 to
+        #           800 cuts bytes-per-frame by ~40%, the biggest single
+        #           latency lever we have on network seats.
+        # "High" → 3 Mbps / 60 fps / 1024, the recommended default for
+        #           local emulator or USB-connected device: clean text/UI
+        #           without H.264 macroblocking, and 60 fps matches the
+        #           typical emulator refresh rate so taps feel immediate.
         scrcpy_row = QHBoxLayout()
         scrcpy_row.addWidget(QLabel("🪞 Mirror Screen:"))
 
-        fast_btn = QPushButton("⚡ Fast (500kbps)")
-        fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=500_000))
+        fast_btn = QPushButton("⚡ Fast (1 Mbps, 24 fps)")
+        fast_btn.setToolTip("1 Mbps / 24 fps / 800px — for slow remote/seat connections")
+        fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=1_000_000,
+                                                                  max_fps=24, max_size=800))
         scrcpy_row.addWidget(fast_btn)
 
-        normal_btn = QPushButton("🎬 Normal (1mbps)")
-        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=1_000_000))
+        normal_btn = QPushButton("🎬 High (3 Mbps, 60 fps)")
+        normal_btn.setToolTip("3 Mbps / 60 fps / 1024px — recommended for local emulator & USB devices")
+        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=3_000_000,
+                                                                   max_fps=60, max_size=1024))
         scrcpy_row.addWidget(normal_btn)
 
         scrcpy_row.addStretch()
@@ -2227,7 +2240,8 @@ class ADBGUI(QMainWindow):
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
-    def _open_mirror_window(self, device_id=None, bitrate=1_000_000, seat_context=None):
+    def _open_mirror_window(self, device_id=None, bitrate=3_000_000,
+                            max_fps=60, max_size=1024, seat_context=None):
         """Open the mirror in a separate window with recording options.
 
         This is the older 'Embedded Mirror' route, using ScrcpyMirrorWindow.
@@ -2236,7 +2250,14 @@ class ADBGUI(QMainWindow):
 
         Args:
             device_id: Optional device ID to mirror. Defaults to self.current_device.
-            bitrate: Bitrate in bps. Defaults to 1_000_000 (1 Mbps).
+            bitrate: Bitrate in bps. Defaults to 3 Mbps — recommended for local
+                emulator / USB-connected devices (clean text, no macroblocking).
+                Use 1 Mbps for bandwidth-sensitive seat/remote mirroring.
+            max_fps: Max frames per second. Defaults to 60 to match typical
+                emulator refresh rates so taps feel immediate.
+            max_size: Long-edge resolution cap. Defaults to 1024 — keeps encoder
+                load ~50% lower than native while remaining visually sharp on
+                phone aspect ratios.
             seat_context: Optional seat context info for window title. Ex: seat name/IP.
         """
         if device_id is None:
@@ -2272,7 +2293,8 @@ class ADBGUI(QMainWindow):
                     device_id=device_id,
                     adb_path=adb_path,
                     bitrate=bitrate,
-                    max_size=1024,
+                    max_size=max_size,
+                    max_fps=max_fps,
                     screenshot_path=self.settings.get('screenshot_path', ''),
                     seat_info=seat_context,
                 )
@@ -3340,7 +3362,13 @@ class ADBGUI(QMainWindow):
 
                 if device_id:
                     self.log(f"Opening mirror window for device {device_id} (seat: {seat})")
-                    self._open_mirror_window(device_id=device_id, bitrate=1_000_000, seat_context=seat)
+                    # Seat/remote link — bandwidth-sensitive: 1 Mbps / 24 fps
+                    # / max-size 800. The 800 long-edge is the biggest
+                    # single latency lever we have on slow seats; it cuts
+                    # bytes-per-frame by ~40% vs the local default of 1024.
+                    self._open_mirror_window(device_id=device_id, bitrate=1_000_000,
+                                             max_fps=24, max_size=800,
+                                             seat_context=seat)
                     return
                 else:
                     # Device not found yet - wait and retry
@@ -3369,8 +3397,9 @@ class ADBGUI(QMainWindow):
             self.update_status("Failed to open mirror")
 
     def _launch_scrcpy_for_device(self, device_id):
-        """Open mirror window for a specific device"""
-        self._open_mirror_window(device_id=device_id, bitrate=1_000_000)
+        """Open mirror window for a specific device (local — uses defaults)."""
+        # Inherits the local defaults: 3 Mbps / 60 fps.
+        self._open_mirror_window(device_id=device_id)
 
     def connect_seat(self, seat, gateway):
         """Connect to a seat"""
@@ -3380,11 +3409,13 @@ class ADBGUI(QMainWindow):
         # Parse user from gateway
         parts = gateway.split('@')
         user = parts[0] if len(parts) == 2 else 'user'
+        # Get just the hostname part for credential manager
+        gateway_host = parts[1] if len(parts) == 2 else gateway
 
         # Get password from Keychain only (no plain text storage)
-        password = self.credential_manager.get_password(gateway, user)
+        password = self.credential_manager.get_password(gateway_host, user)
         if not password:
-            password = self.credential_manager.prompt_password(self, gateway, user)
+            password = self.credential_manager.prompt_password(self, gateway_host, user)
             if not password:
                 self.log("Password required to connect", "ERROR")
                 return
@@ -3517,9 +3548,8 @@ class ADBGUI(QMainWindow):
             gateway_host = gateway
 
         # Get password from Keychain only (no plain text storage)
-        # Keychain is keyed by the original (possibly user@host) gateway so
-        # we still look up the right credential.
-        password = self.credential_manager.get_password(gateway, user)
+        # Keychain is keyed by the hostname and user, constructed as user@hostname
+        password = self.credential_manager.get_password(gateway_host, user)
         if not password:
             password = self.credential_manager.prompt_password(self, gateway_host, user)
             if not password:
@@ -5522,8 +5552,8 @@ class ADBGUI(QMainWindow):
                 kwargs = dict(
                     serial=device_id,
                     max_size=1024,
-                    video_bit_rate=1_000_000,
-                    max_fps=30,
+                    video_bit_rate=3_000_000,  # local default: clean text, no macroblocking
+                    max_fps=60,                 # match typical emulator refresh rate
                 )
                 if adb_path:
                     kwargs['adb_path'] = adb_path
@@ -5707,8 +5737,15 @@ class ADBGUI(QMainWindow):
         else:
             self.log(f"Failed to expand notifications: {result.get('stderr', '')}", "ERROR")
 
-    def scrcpy_device(self, bitrate='1m'):
-        """Mirror device screen using scrcpy."""
+    def scrcpy_device(self, bitrate='3m', max_fps=60):
+        """Mirror device screen using scrcpy.
+
+        Defaults are tuned for *local* mirroring (emulator / USB-connected
+        device): 3 Mbps keeps text and UI clean without H.264 macroblocking,
+        and 60 fps matches the typical emulator refresh rate so taps feel
+        immediate. Pass bitrate='1m' for bandwidth-sensitive seat/remote
+        connections.
+        """
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
@@ -5798,6 +5835,11 @@ class ADBGUI(QMainWindow):
         # scrcpy build rejects it, the launch code below detects the
         # "unrecognized option" error and falls back.
         cmd_base.extend(['-m', '1024'])
+
+        # Cap frame rate at 60 fps so taps feel immediate on devices whose
+        # internal refresh exceeds 60 Hz (most emulators report 60–120).
+        # -f is widely supported in modern scrcpy builds.
+        cmd_base.extend(['-f', str(max_fps)])
 
         cmd_with_adb = None
         # Resolve adb_path: if it's just "adb" and not on PATH, try `which adb` ourselves.

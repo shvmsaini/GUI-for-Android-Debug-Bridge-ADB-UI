@@ -1,0 +1,50 @@
+--- adb_gui.py.orig	2026-07-07 18:05:00.000000000 +0530
++++ adb_gui.py	2026-07-07 18:10:00.000000000 +0530
+@@ -680,11 +680,20 @@
+         return btn
+
+     def log(self, message, level="INFO"):
+-        """Add message to output"""
++        """Add message to output (thread-safe)"""
+         timestamp = datetime.now().strftime("%H:%M:%S")
+-        self.output_text.append(f"[{timestamp}] [{level}] {message}")
+-        # Auto-scroll to bottom
+-        scrollbar = self.output_text.verticalScrollBar()
+-        scrollbar.setValue(scrollbar.maximum())
++        def do_log():
++            self.output_text.append(f"[{timestamp}] [{level}] {message}")
++            # Auto-scroll to bottom
++            scrollbar = self.output_text.verticalScrollBar()
++            scrollbar.setValue(scrollbar.maximum())
++        # Ensure this runs on main thread
++        if QThread.currentThread() == self.thread():
++            do_log()
++        else:
++            QTimer.singleShot(0, do_log)
+
+     def clear_output(self):
+         """Clear app logs output text"""
+@@ -726,11 +735,20 @@
+
+     def log_to_logcat(self, message):
+-        """Add message to logcat output area"""
++        """Add message to logcat output area (thread-safe)"""
+         # Debug: log to app logs too
+         self.log(f"[LOGCAT] {message[:100]}{'...' if len(message) > 100 else ''}")
+-        self.logcat_text.append(message)
+-        # Auto-scroll to bottom
+-        scrollbar = self.logcat_text.verticalScrollBar()
+-        scrollbar.setValue(scrollbar.maximum())
++        def do_log_logcat():
++            self.logcat_text.append(message)
++            # Auto-scroll to bottom
++            scrollbar = self.logcat_text.verticalScrollBar()
++            scrollbar.setValue(scrollbar.maximum())
++        # Ensure UI updates run on main thread
++        if QThread.currentThread() == self.thread():
++            do_log_logcat()
++        else:
++            QTimer.singleShot(0, do_log_logcat)
+
+     def update_status(self, message):
+         """Update status bar"""

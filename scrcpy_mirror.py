@@ -531,21 +531,32 @@ class ScrcpyMirrorWindow(QMainWindow):
     _BTN_PRESS = "#404040"
 
     # Quality presets: (label, bitrate bps, max_fps, max_size)
+    # Index 1 is the UI default (set in _build_settings_bar). Defaults are
+    # tuned for *local* mirroring (emulator or device-on-USB): 3 Mbps keeps
+    # text/UI clean without macroblocking, 60 fps matches the typical
+    # emulator refresh rate so taps feel immediate. The "Low (network)"
+    # preset at index 0 is intended for seat/remote connections where
+    # bandwidth is the bottleneck.
     _QUALITY_PRESETS = [
-        ("Low (smooth)",  500_000,  24, 640),
-        ("Medium",       1_500_000, 30, 1024),
-        ("High",         3_000_000, 30, 1280),
-        ("Ultra",        6_000_000, 60, 1920),
+        # Low (network): 1 Mbps / 24 fps / 800 long-edge. Tuned for slow
+        # network seats where bandwidth + frame-pipeline depth dominate
+        # latency. 800px on phone aspect ratios is still readable; 24 fps
+        # is enough for fluid interaction; 1 Mbps caps the bitrate so
+        # the encoder doesn't blow past the link's capacity.
+        ("Low (network)",  1_000_000, 24, 800),
+        ("Medium",         1_500_000, 30, 1024),
+        ("High (local)",   3_000_000, 60, 1024),
+        ("Ultra",          6_000_000, 60, 1920),
     ]
 
-    def __init__(self, device_id, adb_path=None, bitrate=1_000_000,
-                 max_size=1024, screenshot_path=None, parent=None, seat_info=None):
+    def __init__(self, device_id, adb_path=None, bitrate=3_000_000,
+                 max_size=1024, max_fps=60, screenshot_path=None, parent=None, seat_info=None):
         super().__init__(parent)
         self.device_id = device_id
         self.adb_path = adb_path
         self.bitrate = bitrate
         self.max_size = max_size
-        self.max_fps = 30
+        self.max_fps = max_fps
         self.screenshot_path = screenshot_path  # Use provided path or fall back to defaults
         self._client = None
         self._listener_thread = None
@@ -777,7 +788,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.fps_combo = QComboBox()
         for fps in [15, 24, 30, 45, 60]:
             self.fps_combo.addItem(str(fps))
-        self.fps_combo.setCurrentText("30")
+        self.fps_combo.setCurrentText("60")
         self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
         h.addWidget(self.fps_combo)
 
@@ -788,11 +799,12 @@ class ScrcpyMirrorWindow(QMainWindow):
             (500_000, "500 kbps"),
             (1_000_000, "1 Mbps"),
             (2_000_000, "2 Mbps"),
-            (4_000_000, "4 Mbps"),
+            (3_000_000, "3 Mbps"),
+            (6_000_000, "6 Mbps"),
             (8_000_000, "8 Mbps"),
         ]:
             self.bitrate_combo.addItem(label, br)
-        self.bitrate_combo.setCurrentText("1 Mbps")
+        self.bitrate_combo.setCurrentText("3 Mbps")
         self.bitrate_combo.currentTextChanged.connect(self._on_bitrate_changed)
         h.addWidget(self.bitrate_combo)
 
