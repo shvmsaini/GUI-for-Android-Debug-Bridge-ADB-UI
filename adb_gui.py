@@ -2248,7 +2248,6 @@ class ADBGUI(QMainWindow):
         Verifies:
         - Device is in 'device' state (not 'offline' or 'unauthorized')
         - Device responds to basic shell commands (getprop)
-        - Device has writable /sdcard (for scrcpy socket)
         """
         try:
             # Check device state
@@ -2262,8 +2261,10 @@ class ADBGUI(QMainWindow):
             if not device_info:
                 return False, f"Device {device_id} not found in adb devices list."
 
-            if device_info['state'] != 'device':
-                return False, f"Device state is '{device_info['state']}', expected 'device'."
+            # get_devices() returns 'status' (adb terminology), not 'state'
+            device_status = device_info.get('status', 'unknown')
+            if device_status != 'device':
+                return False, f"Device state is '{device_status}', expected 'device'."
 
             # Quick shell command to verify device responsiveness
             # Using 'getprop ro.build.version.release' — always exists and is fast
