@@ -1103,19 +1103,6 @@ class ScrcpyMirrorWindow(QMainWindow):
                 )
                 if self.adb_path:
                     kwargs['adb_path'] = self.adb_path
-                # For remote/seat devices (localhost:PORT serial), prefer forward
-                # tunnel over reverse. Reverse mode requires `adb reverse` to
-                # work through the SSH tunnel, which is slow and often fails
-                # with "socket closed while reading scrcpy stream". Forward
-                # mode (device dials back to our local listener) is much more
-                # reliable through seat connections. Local emulator / USB
-                # devices work fine with either mode.
-                if self.device_id and (':' in self.device_id):
-                    # Remote/seat device — use forward tunnel and longer timeout
-                    kwargs['prefer_forward'] = True
-                    # Forward tunnel over SSH is slower than local USB; allow
-                    # more time for the socket to come up.
-                    kwargs['connect_timeout'] = 15.0
                 config = ScrcpyConfig(**kwargs)
 
                 self._client = ScrcpyClient(config)
@@ -1128,71 +1115,24 @@ class ScrcpyMirrorWindow(QMainWindow):
                 # restarting it is unnecessary and harmful.
                 self._client.adb.ensure_server = lambda: None
 
-                # For remote/seat devices, also constrain _startup_profiles
-                # to forward-only.  py_scrcpy_sdk's default fallback tries
-                # `adb reverse` after forward fails, but reverse over an SSH
-                # tunnel to a seat device returns "more than one device/emulator"
-                # because the tunneled adb-daemon sees the same device twice.
-                # Reverse is genuinely unsupported for these devices — the
-                # fallback just adds noise and an extra failure to the error
-                # message.  Local emulator/USB devices keep the default
-                # behavior (forward primary, reverse fallback).
-                if self.device_id and (':' in self.device_id):
-                    primary_profiles = self._client._startup_profiles()
-                    self._client._startup_profiles = lambda: [
-                        p for p in primary_profiles if p.get("tunnel_mode") == "forward"
-                    ]
-
-                    # Cycle the adb connection so the local adb-server doesn't
-                    # have stale state for this serial.  Without this, repeated
-                    # `adb -s localhost:PORT shell` calls intermittently
-                    # return "more than one device/emulator" because the
-                    # tunneled adb-daemon's view of devices has drifted from
-                    # the local server's view.  Disconnect+reconnect syncs
-                    # them; the small pause below lets the new handshake
-                    # settle before scrcpy starts streaming.
-                    try:
-                        import subprocess as _sp
-                        adb_bin = self.adb_path if self.adb_path else 'adb'
-                        _sp.run([adb_bin, 'disconnect', self.device_id],
-                                capture_output=True, timeout=5)
-                        import time as _t
-                        _t.sleep(0.3)
-                        _sp.run([adb_bin, 'connect', self.device_id],
-                                capture_output=True, timeout=5)
-                        _t.sleep(0.5)
-                        # wait-for-device blocks until adb-server reports the
-                        # device is online, which clears the transient bad state.
-                        _sp.run([adb_bin, '-s', self.device_id, 'wait-for-device'],
-                                capture_output=True, timeout=10)
-                    except Exception:
-                        pass
-
                 # Retry start() a few times — transient "device not found"
-                # errors are common right after adb restarts or device connections
-                # are establishing. Use exponential backoff for robustness.
+                # errors are common right after adb restarts.
                 last_exc: Exception | None = None
-                for attempt in range(5):  # Increased from 3 to 5 attempts
+                for attempt in range(3):
                     if self._closing:
                         return
                     try:
                         self._client.start()
-                        break  # Successfully started — proceed to listening
+                        break
                     except Exception as e:
                         last_exc = e
+                        # If the device is genuinely gone, don't waste time
+                        # retrying — fail fast with a clear message.
                         msg = str(e)
-                        # If the device is genuinely gone, don't waste time retrying
-                        if "device" in msg.lower() and "not found" in msg.lower():
-                            # But wait a moment - device might just be reconnecting
-                            if attempt < 2:
-                                import time as _t
-                                _t.sleep(1)  # Longer wait for device reconnection
-                                continue
+                        if "device" in msg and "not found" in msg:
                             break
-                        # For other errors, use exponential backoff
                         import time as _t
-                        wait_time = min(0.5 * (2 ** attempt), 3)  # Max 3 seconds
-                        _t.sleep(wait_time)
+                        _t.sleep(0.5)
                 else:
                     if last_exc is not None:
                         raise last_exc
@@ -1225,15 +1165,12 @@ class ScrcpyMirrorWindow(QMainWindow):
                 if "device" in msg and "not found" in msg:
                     self.signal.error.emit(
                         f"Device {self.device_id} not found.\n\n"
-                        f"It may have disconnected or the adb connection was interrupted.\n\n"
-                        f"Try refreshing devices and reconnecting.")
+                        f"It may have disconnected. Refresh the device list "
+                        f"and try again.")
                     return
-                # Better error logging for debugging
-                import traceback as tb
-                full_trace = tb.format_exc()
-                # Send both the message and full trace for debugging
-                error_summary = f"{type(e).__name__}: {msg}"
-                self.signal.error.emit(f"{error_summary}\n\nDebug info:\n{full_trace[:500]}")
+                self.signal.error.emit(
+                    f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+                )
 
         threading.Thread(target=_thread, daemon=True).start()
 
@@ -1281,24 +1218,13 @@ class ScrcpyMirrorWindow(QMainWindow):
                 return
             # Show disconnection message on the video display
             self.video.set_disconnected()
-            self.status.showMessage(f"Error: {error_msg[:100]}")
+            self.status.showMessage(f"Error: {error_msg[:80]}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
             # Removed: dpad button disabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(False)
-
-            # Show a dialog with full error details instead of auto-closing
-            # This gives the user a chance to see what happened and decide next steps
-            msg_display = error_msg if len(error_msg) < 300 else error_msg[:300] + "..."
-            reply = QMessageBox.critical(
-                self,
-                "Mirror Connection Error",
-                f"Failed to connect or stream from device.\n\n{msg_display}\n\nWould you like to close the window?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.close()
-            # If No, user can try to manually reconnect or adjust settings and hit Apply
+            # Keep window open briefly so user can see the message, then close
+            QTimer.singleShot(3000, self.close)
         except RuntimeError:
             pass
 
@@ -1308,22 +1234,13 @@ class ScrcpyMirrorWindow(QMainWindow):
                 return
             # Show disconnection message on the video display
             self.video.set_disconnected()
-            self.status.showMessage(f"Disconnected: {error_msg[:100]}")
+            self.status.showMessage(f"Disconnected: {error_msg}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
             # Removed: dpad button disabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(False)
-
-            # Show a dialog with full error details
-            # Clean disconnect: show message but allow user to retry by adjusting settings
-            msg_display = error_msg if len(error_msg) < 300 else error_msg[:300] + "..."
-            reply = QMessageBox.warning(
-                self,
-                "Device Disconnected",
-                f"Connection lost to device.\n\n{msg_display}\n\nYou can adjust settings and hit Apply to retry.",
-                QMessageBox.StandardButton.Close
-            )
-            # For clean disconnects, keep window open so user can try again
+            # Keep window open briefly so user can see the message, then close
+            QTimer.singleShot(2000, self.close)
         except RuntimeError:
             pass
 

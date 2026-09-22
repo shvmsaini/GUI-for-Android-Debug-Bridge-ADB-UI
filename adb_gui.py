@@ -3473,27 +3473,9 @@ class ADBGUI(QMainWindow):
             self.update_status("Failed to open mirror")
 
     def _launch_scrcpy_for_device(self, device_id):
-        """Open mirror window for a specific device.
-
-        Quality preset depends on device type:
-          - Local emulator / USB (e.g. 'emulator-5589'): High (3 Mbps / 60 fps)
-            for clean UI and immediate taps.
-          - Seat / remote (e.g. 'localhost:55077'): Medium (1.5 Mbps / 30 fps /
-            1024) — enough fidelity for seat debugging without saturating
-            the SSH tunnel.  Fast (1 Mbps / 24 fps / 800) is still available
-            via the 'Fast' button for users who explicitly want it.
-        """
-        if device_id and ':' in device_id:
-            # Remote/seat device — Medium preset
-            self._open_mirror_window(
-                device_id=device_id,
-                bitrate=1_500_000,
-                max_fps=30,
-                max_size=1024,
-            )
-        else:
-            # Local emulator / USB — High preset
-            self._open_mirror_window(device_id=device_id)
+        """Open mirror window for a specific device (local — uses defaults)."""
+        # Inherits the local defaults: 3 Mbps / 60 fps.
+        self._open_mirror_window(device_id=device_id)
 
     def connect_seat(self, seat, gateway):
         """Connect to a seat"""
