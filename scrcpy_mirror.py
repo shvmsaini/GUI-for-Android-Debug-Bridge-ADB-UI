@@ -1143,6 +1143,31 @@ class ScrcpyMirrorWindow(QMainWindow):
                         p for p in primary_profiles if p.get("tunnel_mode") == "forward"
                     ]
 
+                    # Cycle the adb connection so the local adb-server doesn't
+                    # have stale state for this serial.  Without this, repeated
+                    # `adb -s localhost:PORT shell` calls intermittently
+                    # return "more than one device/emulator" because the
+                    # tunneled adb-daemon's view of devices has drifted from
+                    # the local server's view.  Disconnect+reconnect syncs
+                    # them; the small pause below lets the new handshake
+                    # settle before scrcpy starts streaming.
+                    try:
+                        import subprocess as _sp
+                        adb_bin = self.adb_path if self.adb_path else 'adb'
+                        _sp.run([adb_bin, 'disconnect', self.device_id],
+                                capture_output=True, timeout=5)
+                        import time as _t
+                        _t.sleep(0.3)
+                        _sp.run([adb_bin, 'connect', self.device_id],
+                                capture_output=True, timeout=5)
+                        _t.sleep(0.5)
+                        # wait-for-device blocks until adb-server reports the
+                        # device is online, which clears the transient bad state.
+                        _sp.run([adb_bin, '-s', self.device_id, 'wait-for-device'],
+                                capture_output=True, timeout=10)
+                    except Exception:
+                        pass
+
                 # Retry start() a few times — transient "device not found"
                 # errors are common right after adb restarts or device connections
                 # are establishing. Use exponential backoff for robustness.
