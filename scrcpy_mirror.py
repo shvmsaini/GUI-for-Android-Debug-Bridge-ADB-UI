@@ -1128,6 +1128,21 @@ class ScrcpyMirrorWindow(QMainWindow):
                 # restarting it is unnecessary and harmful.
                 self._client.adb.ensure_server = lambda: None
 
+                # For remote/seat devices, also constrain _startup_profiles
+                # to forward-only.  py_scrcpy_sdk's default fallback tries
+                # `adb reverse` after forward fails, but reverse over an SSH
+                # tunnel to a seat device returns "more than one device/emulator"
+                # because the tunneled adb-daemon sees the same device twice.
+                # Reverse is genuinely unsupported for these devices — the
+                # fallback just adds noise and an extra failure to the error
+                # message.  Local emulator/USB devices keep the default
+                # behavior (forward primary, reverse fallback).
+                if self.device_id and (':' in self.device_id):
+                    primary_profiles = self._client._startup_profiles()
+                    self._client._startup_profiles = lambda: [
+                        p for p in primary_profiles if p.get("tunnel_mode") == "forward"
+                    ]
+
                 # Retry start() a few times — transient "device not found"
                 # errors are common right after adb restarts or device connections
                 # are establishing. Use exponential backoff for robustness.
