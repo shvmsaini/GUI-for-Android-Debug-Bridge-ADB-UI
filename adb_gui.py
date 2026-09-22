@@ -5940,10 +5940,11 @@ class ADBGUI(QMainWindow):
         # "unrecognized option" error and falls back.
         cmd_base.extend(['-m', '1024'])
 
-        # Cap frame rate at 60 fps so taps feel immediate on devices whose
-        # internal refresh exceeds 60 Hz (most emulators report 60–120).
-        # -f is widely supported in modern scrcpy builds.
-        cmd_base.extend(['-f', str(max_fps)])
+        # Cap frame rate at max_fps. Note: -f is short for --fullscreen in
+        # scrcpy, NOT --max-fps — using -f here would make scrcpy interpret
+        # the next arg (the fps value) as a positional and fail with
+        # "Unexpected additional argument: <fps>".
+        cmd_base.extend(['--max-fps', str(max_fps)])
 
         cmd_with_adb = None
         # Resolve adb_path: if it's just "adb" and not on PATH, try `which adb` ourselves.
