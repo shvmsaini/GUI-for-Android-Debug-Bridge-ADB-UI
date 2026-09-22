@@ -1103,6 +1103,19 @@ class ScrcpyMirrorWindow(QMainWindow):
                 )
                 if self.adb_path:
                     kwargs['adb_path'] = self.adb_path
+                # For remote/seat devices (localhost:PORT serial), prefer forward
+                # tunnel over reverse. Reverse mode requires `adb reverse` to
+                # work through the SSH tunnel, which is slow and often fails
+                # with "socket closed while reading scrcpy stream". Forward
+                # mode (device dials back to our local listener) is much more
+                # reliable through seat connections. Local emulator / USB
+                # devices work fine with either mode.
+                if self.device_id and (':' in self.device_id):
+                    # Remote/seat device — use forward tunnel and longer timeout
+                    kwargs['prefer_forward'] = True
+                    # Forward tunnel over SSH is slower than local USB; allow
+                    # more time for the socket to come up.
+                    kwargs['connect_timeout'] = 15.0
                 config = ScrcpyConfig(**kwargs)
 
                 self._client = ScrcpyClient(config)
