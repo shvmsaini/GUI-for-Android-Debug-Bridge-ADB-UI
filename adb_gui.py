@@ -1266,7 +1266,7 @@ class ADBGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ADB Tool")
-        self.setGeometry(100, 100, 1600, 1000)
+        self.setGeometry(100, 100, 1800, 1000)
         self.setMinimumSize(1250, 800)
 
         # Pre-import py_scrcpy_sdk and its native deps (PyAV/FFmpeg,
@@ -3073,8 +3073,8 @@ class ADBGUI(QMainWindow):
             btn = QPushButton(text)
             btn.setMinimumHeight(50)
             btn.setMaximumHeight(50)
-            btn.setMinimumWidth(280)
-            btn.setMaximumWidth(280)
+            btn.setMinimumWidth(220)
+            btn.setMaximumWidth(220)
             btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.clicked.connect(lambda checked=False, e=entry: self._on_seat_clicked(e))
