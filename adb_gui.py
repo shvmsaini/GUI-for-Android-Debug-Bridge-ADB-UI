@@ -1267,7 +1267,7 @@ class ADBGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("ADB Tool")
         self.setGeometry(100, 100, 1800, 1000)
-        self.setMinimumSize(1250, 800)
+        self.setMinimumSize(1450, 800)
 
         # Pre-import py_scrcpy_sdk and its native deps (PyAV/FFmpeg,
         # numpy C core) ~500ms after the GUI becomes visible.  Doing
@@ -2073,7 +2073,7 @@ class ADBGUI(QMainWindow):
     def create_card(self, title):
         """Create a modern card container"""
         group = QGroupBox(title)
-        group.setMaximumWidth(350)
+        group.setMaximumWidth(280)
         # Styles are applied globally via apply_theme, no need for individual stylesheet
         layout = QVBoxLayout(group)
         layout.setContentsMargins(15, 20, 15, 15)
