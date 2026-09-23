@@ -2073,6 +2073,7 @@ class ADBGUI(QMainWindow):
     def create_card(self, title):
         """Create a modern card container"""
         group = QGroupBox(title)
+        group.setMaximumWidth(350)
         # Styles are applied globally via apply_theme, no need for individual stylesheet
         layout = QVBoxLayout(group)
         layout.setContentsMargins(15, 20, 15, 15)
