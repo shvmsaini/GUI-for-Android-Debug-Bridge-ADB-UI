@@ -588,10 +588,11 @@ class ScrcpyMirrorWindow(QMainWindow):
 
         # Set up keyboard shortcuts that work regardless of focus
         # Cmd+W on macOS, Ctrl+W on Windows/Linux to close window
+        from PyQt6.QtGui import QKeySequence
         if sys.platform == 'darwin':
-            close_shortcut = QShortcut(Qt.Key.Key_W | Qt.KeyboardModifier.MetaModifier, self)
+            close_shortcut = QShortcut(QKeySequence("Meta+W"), self)
         else:
-            close_shortcut = QShortcut(Qt.Key.Key_W | Qt.KeyboardModifier.ControlModifier, self)
+            close_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
         close_shortcut.activated.connect(self.close)
         close_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
 
