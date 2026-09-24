@@ -814,6 +814,25 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.apply_btn.setToolTip("Restart mirror with new settings")
         self.apply_btn.clicked.connect(self._apply_settings)
         self.apply_btn.setVisible(False)  # only show when something changed
+        # Apply button style with increased border width
+        self.apply_btn.setStyleSheet(
+            f"QPushButton {{ "
+            f"background-color: {self._BTN_BG}; "
+            f"color: white; "
+            f"border: 2px solid #555; "
+            f"border-radius: 4px; "
+            f"font-size: 9pt; "
+            f"font-weight: bold; "
+            f"padding: 0 12px; "
+            f"}} "
+            f"QPushButton:hover {{ "
+            f"background-color: {self._BTN_HOVER}; "
+            f"border-color: #777; "
+            f"}} "
+            f"QPushButton:disabled {{ "
+            f"opacity: 0.5; "
+            f"}}"
+        )
         h.addWidget(self.apply_btn)
         h.addStretch()
 
@@ -942,6 +961,26 @@ class ScrcpyMirrorWindow(QMainWindow):
             ("▢ Recent", "recent"),
         ]
 
+        # Navigation button style with increased border width
+        nav_btn_style = (
+            f"QPushButton {{ "
+            f"background-color: {self._BTN_BG}; "
+            f"color: white; "
+            f"border: 2px solid #555; "
+            f"border-radius: 6px; "
+            f"font-size: 9pt; "
+            f"font-weight: bold; "
+            f"padding: 0 12px; "
+            f"}} "
+            f"QPushButton:hover {{ "
+            f"background-color: {self._BTN_HOVER}; "
+            f"border-color: #777; "
+            f"}} "
+            f"QPushButton:disabled {{ "
+            f"opacity: 0.4; "
+            f"}}"
+        )
+
         self.nav_buttons = {}
         for label, key in buttons:
             btn = QPushButton(label)
@@ -950,6 +989,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.setEnabled(False)
             btn.clicked.connect(lambda _, k=key: self._nav_action(k))
+            btn.setStyleSheet(nav_btn_style)
             self._nav_row1.addWidget(btn)
             self.nav_buttons[key] = btn
 
@@ -960,6 +1000,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.screenshot_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.screenshot_btn.setEnabled(False)
         self.screenshot_btn.clicked.connect(self._take_screenshot)
+        self.screenshot_btn.setStyleSheet(nav_btn_style)
         self._nav_row1.addWidget(self.screenshot_btn)
 
         self._nav_row1.addStretch()
