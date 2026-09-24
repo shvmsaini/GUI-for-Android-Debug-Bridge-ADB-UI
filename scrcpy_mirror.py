@@ -1489,6 +1489,17 @@ class ScrcpyMirrorWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────
 
     def keyPressEvent(self, event):
+        # Handle Cmd+W (macOS) or Ctrl+W (Windows/Linux) to close window
+        if event.key() == Qt.Key.Key_W:
+            # On macOS, Cmd key is MetaModifier
+            if sys.platform == 'darwin' and event.modifiers() & Qt.KeyboardModifier.MetaModifier:
+                self.close()
+                return
+            # On Windows/Linux, Ctrl+W is standard
+            elif sys.platform != 'darwin' and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.close()
+                return
+
         if self._client is None:
             return super().keyPressEvent(event)
 
