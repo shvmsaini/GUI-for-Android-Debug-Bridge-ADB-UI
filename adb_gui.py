@@ -4443,26 +4443,41 @@ class ADBGUI(QMainWindow):
                 self.log(f"Regular uninstall failed: {error_msg}", "WARNING")
 
                 # Handle "Split not found" errors - this happens with split APKs (instant apps)
+                # The split name (e.g., "v4.2.0.172-online") is not the base package.
+                # We need to try uninstalling the base package or use 'cmd package'.
                 if "Split not found" in error_msg or "split" in error_msg.lower():
-                    self.log("Split APK detected - attempting to clear package data first...", "WARNING")
-                    # Clear the package data which effectively removes it for current user
-                    result_clear = self.adb.run_command(f"{self.get_device_flag()} shell pm clear {package_name}")
-                    if result_clear['success']:
-                        self.log("Package data cleared successfully, now attempting user uninstall...")
-                        # Try uninstall after clear
-                        result_user = self.adb.run_command(f"{self.get_device_flag()} shell pm uninstall --user 0 {package_name}")
-                        if result_user['success']:
-                            output = result_user['stdout'].strip() if result_user['stdout'] else ''
-                            self.log("App uninstalled successfully after clearing data")
-                            self.update_status("App uninstalled successfully")
-                            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App uninstalled successfully!\n\nPackage data was cleared first to fix split APK issue."))
-                        else:
-                            error_msg_user = result_user['stderr'] if result_user['stderr'] else result_user['stdout']
-                            self.log(f"User uninstall after clear also failed: {error_msg_user}", "ERROR")
-                            self.update_status("Failed to uninstall app")
-                            help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}\n\nSplit APK detected and cleared data, but uninstall still failed.\nTry disabling the app instead."
-                            QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", help_text))
+                    self.log("Split APK detected - trying 'cmd package uninstall-if-empty'...", "WARNING")
+
+                    # Try using 'cmd package uninstall-if-empty' which properly handles split APKs
+                    result_cmd = self.adb.run_command(f"{self.get_device_flag()} shell cmd package uninstall-if-empty {package_name}")
+                    if result_cmd['success']:
+                        output = result_cmd['stdout'].strip() if result_cmd['stdout'] else ''
+                        self.log("Split APK uninstalled successfully using cmd package")
+                        self.update_status("Split APK uninstalled successfully")
+                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Split APK uninstalled successfully!\n\nUsed 'cmd package uninstall-if-empty' to properly handle split APK packages."))
                         return
+                    else:
+                        error_msg_cmd = result_cmd['stderr'] if result_cmd['stderr'] else result_cmd['stdout']
+                        self.log(f"'cmd package' method also failed: {error_msg_cmd}", "WARNING")
+
+                        # Try to extract base package from split name and uninstall that
+                        # e.g., "aero.panasonic.mi.seatback.v4.2.0.172-online" → "aero.panasonic.mi.seatback"
+                        # but the error already shows the package name, so try uninstalling just the base
+                        # by removing common split suffixes
+                        import re
+                        # Remove version-like suffixes: .v4.2.0.172-online, .vn1, etc.
+                        base_package = re.sub(r'\.[a-zA-Z0-9_.-]+$', '', package_name)
+                        if base_package != package_name:
+                            self.log(f"Trying base package: {base_package}", "WARNING")
+                            result_base = self.adb.run_command(f"{self.get_device_flag()} shell pm uninstall --user 0 {base_package}")
+                            if result_base['success']:
+                                output = result_base['stdout'].strip() if result_base['stdout'] else ''
+                                self.log("Base package uninstalled successfully")
+                                self.update_status("Split APK uninstalled successfully")
+                                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Split APK uninstalled successfully!\n\nTried uninstalling base package '{base_package}' which worked."))
+                                return
+                            else:
+                                self.log(f"Base package uninstall also failed: {result_base['stderr'] or result_base['stdout']}", "WARNING")
 
                 # Try uninstalling for current user (works for system apps without root)
                 self.log("Attempting to uninstall for current user (--user 0)...")
