@@ -44,6 +44,10 @@ except ImportError:
     _check_embedded_mirror = None
 
 
+# Application version - single source of truth. Bump on release.
+APP_VERSION = "1.0.0"
+
+
 class _SignalEmitter(QObject):
     """Thread-safe signal emitter for marshaling calls from background threads."""
     call = pyqtSignal(object)
@@ -594,6 +598,12 @@ class SettingsDialog(QDialog):
         # Buttons
         button_row = QHBoxLayout()
         button_row.addStretch()
+
+        # Version label (above buttons)
+        version_label = QLabel(f"ADB Tool v{APP_VERSION}")
+        version_label.setStyleSheet(f"color: {self.colors.get('text_secondary', '#666')}; font-size: 11px;")
+        version_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        button_row.addWidget(version_label)
 
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
@@ -1265,7 +1275,7 @@ class ADBGUI(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ADB Tool")
+        self.setWindowTitle(f"ADB Tool v{APP_VERSION}")
         self.setGeometry(100, 100, 1800, 1000)
         self.setMinimumSize(1450, 800)
 
@@ -1554,12 +1564,12 @@ class ADBGUI(QMainWindow):
         # Header with title
         header_layout = QHBoxLayout()
         self.title_label = QLabel("ADB Tool")
-        self.title_label.setFont(QFont('', 24, QFont.Weight.Bold))
+        self.title_label.setFont(QFont('Arial', 24, QFont.Weight.Bold))
         self.title_label.setStyleSheet(f"color: {self.colors['fg']};")
         header_layout.addWidget(self.title_label)
 
         self.subtitle_label = QLabel("Android Device Manager")
-        self.subtitle_label.setFont(QFont('', 12))
+        self.subtitle_label.setFont(QFont('Arial', 12))
         self.subtitle_label.setStyleSheet(f"color: {self.colors['text_secondary']};")
         header_layout.addWidget(self.subtitle_label)
 
@@ -1711,13 +1721,13 @@ class ADBGUI(QMainWindow):
         scrcpy_row = QHBoxLayout()
         scrcpy_row.addWidget(QLabel("🪞 Mirror Screen:"))
 
-        fast_btn = QPushButton("⚡ Fast (1 Mbps, 24 fps)")
+        fast_btn = QPushButton("⚡ Fast")
         fast_btn.setToolTip("1 Mbps / 24 fps / 800px — for slow remote/seat connections")
         fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=1_000_000,
                                                                   max_fps=24, max_size=800))
         scrcpy_row.addWidget(fast_btn)
 
-        normal_btn = QPushButton("🎬 High (3 Mbps, 60 fps)")
+        normal_btn = QPushButton("🎬 Normal")
         normal_btn.setToolTip("3 Mbps / 60 fps / 1024px — recommended for local emulator & USB devices")
         normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=3_000_000,
                                                                    max_fps=60, max_size=1024))
@@ -2073,7 +2083,7 @@ class ADBGUI(QMainWindow):
     def create_card(self, title):
         """Create a modern card container"""
         group = QGroupBox(title)
-        group.setMaximumWidth(280)
+        group.setMaximumWidth(310)
         # Styles are applied globally via apply_theme, no need for individual stylesheet
         layout = QVBoxLayout(group)
         layout.setContentsMargins(15, 20, 15, 15)
@@ -2705,6 +2715,13 @@ class ADBGUI(QMainWindow):
             for btn in self.device_buttons.values():
                 btn.deleteLater()
             self.device_buttons.clear()
+
+            # Clear all items from layout (buttons, containers, and stretches)
+            while self.devices_layout.count() > 0:
+                item = self.devices_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
             self.current_device = None
             self.device_info_label.setText("No devices connected - Check USB connection and USB debugging")
             self.device_info_label.setStyleSheet(f"color: {self.colors['warning']};")
@@ -7821,6 +7838,7 @@ def main():
     app = QApplication(sys.argv)
     # App identity (shows in macOS menu bar/app switcher)
     app.setApplicationName("ADB GUI")
+    app.setApplicationVersion(APP_VERSION)
     app.setApplicationDisplayName("ADB GUI")
     app.setOrganizationName("ADB GUI")
 
