@@ -586,10 +586,6 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.resize(400, 800)
         self.setStyleSheet(self._stylesheet())
 
-        # Prevent this window from quitting the app when closed
-        # This ensures Cmd+W only closes the mirror, not the whole app
-        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
-
         # ── central widget ──────────────────────────────────────────
         central = QWidget()
         self.setCentralWidget(central)
@@ -1495,13 +1491,14 @@ class ScrcpyMirrorWindow(QMainWindow):
     def keyPressEvent(self, event):
         # Handle Cmd+W (macOS) or Ctrl+W (Windows/Linux) to close window
         if event.key() == Qt.Key.Key_W:
-            # On macOS, Cmd key is MetaModifier
-            if sys.platform == 'darwin' and event.modifiers() & Qt.KeyboardModifier.MetaModifier:
+            modifiers = event.modifiers()
+            is_cmd_mac = sys.platform == 'darwin' and modifiers & Qt.KeyboardModifier.MetaModifier
+            is_ctrl_other = sys.platform != 'darwin' and modifiers & Qt.KeyboardModifier.ControlModifier
+
+            if is_cmd_mac or is_ctrl_other:
+                print(f"DEBUG Cmd+W detected: platform={sys.platform}, cmd_mac={is_cmd_mac}, ctrl_other={is_ctrl_other}, modifiers={modifiers}")
                 self.hide()  # Hide instead of close to prevent quitting the app
-                return
-            # On Windows/Linux, Ctrl+W is standard
-            elif sys.platform != 'darwin' and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                self.hide()  # Hide instead of close to prevent quitting the app
+                event.accept()
                 return
 
         if self._client is None:
