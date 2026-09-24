@@ -18,10 +18,10 @@ import traceback
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QSizePolicy, QMessageBox, QStatusBar, QComboBox, QShortcut,
+    QLabel, QSizePolicy, QMessageBox, QStatusBar, QComboBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QProcess, QFileInfo
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QCursor
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QCursor, QShortcut
 
 
 # ──────────────────────────────────────────────────────────────────────
