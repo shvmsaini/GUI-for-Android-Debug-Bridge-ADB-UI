@@ -4866,11 +4866,21 @@ class ADBGUI(QMainWindow):
                         if 'Success' in output or 'success' in output.lower() or output == '':
                             self.log("App uninstalled for current user successfully")
                             self.update_status("App uninstalled for current user")
+                            # Remove from the stored apps list
+                            if package_name in app_window.original_apps:
+                                app_window.original_apps.remove(package_name)
+                            # Refresh the list
+                            QTimer.singleShot(0, lambda: update_list())
                             # Thread-safe messagebox - use QTimer to call from main thread
                             QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App uninstalled for current user successfully!\n\nNote: System apps are only removed for your user account, not from the device."))
                         else:
                             self.log(f"Uninstall result: {output}")
                             self.update_status("Uninstall completed")
+                            # Remove from the stored apps list
+                            if package_name in app_window.original_apps:
+                                app_window.original_apps.remove(package_name)
+                            # Refresh the list
+                            QTimer.singleShot(0, lambda: update_list())
                             # Thread-safe messagebox - use QTimer to call from main thread
                             QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Uninstall completed:\n{output}"))
                     else:
