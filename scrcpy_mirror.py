@@ -18,7 +18,7 @@ import traceback
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QSizePolicy, QMessageBox, QStatusBar, QComboBox,
+    QLabel, QSizePolicy, QMessageBox, QStatusBar, QComboBox, QShortcut,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QProcess, QFileInfo
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QCursor
@@ -585,6 +585,15 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.setMinimumSize(280, 400)
         self.resize(400, 800)
         self.setStyleSheet(self._stylesheet())
+
+        # Set up keyboard shortcuts that work regardless of focus
+        # Cmd+W on macOS, Ctrl+W on Windows/Linux to close window
+        if sys.platform == 'darwin':
+            close_shortcut = QShortcut(Qt.Key.Key_W | Qt.KeyboardModifier.MetaModifier, self)
+        else:
+            close_shortcut = QShortcut(Qt.Key.Key_W | Qt.KeyboardModifier.ControlModifier, self)
+        close_shortcut.activated.connect(self.close)
+        close_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
 
         # ── central widget ──────────────────────────────────────────
         central = QWidget()
@@ -1489,16 +1498,7 @@ class ScrcpyMirrorWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────
 
     def keyPressEvent(self, event):
-        # Handle Cmd+W (macOS) or Ctrl+W (Windows/Linux) to close window
-        if event.key() == Qt.Key.Key_W:
-            modifiers = event.modifiers()
-            is_cmd_mac = sys.platform == 'darwin' and modifiers & Qt.KeyboardModifier.MetaModifier
-            is_ctrl_other = sys.platform != 'darwin' and modifiers & Qt.KeyboardModifier.ControlModifier
-
-            if is_cmd_mac or is_ctrl_other:
-                self.hide()  # Hide instead of close to prevent quitting the app
-                event.accept()
-                return
+        # Note: Cmd+W/Ctrl+W is handled by QShortcut for better focus handling
 
         if self._client is None:
             return super().keyPressEvent(event)
