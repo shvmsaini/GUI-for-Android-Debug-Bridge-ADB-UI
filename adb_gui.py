@@ -4441,11 +4441,33 @@ class ADBGUI(QMainWindow):
                     error_msg = "Unknown error"
                 
                 self.log(f"Regular uninstall failed: {error_msg}", "WARNING")
-                
+
+                # Handle "Split not found" errors - this happens with split APKs (instant apps)
+                if "Split not found" in error_msg or "split" in error_msg.lower():
+                    self.log("Split APK detected - attempting to clear package data first...", "WARNING")
+                    # Clear the package data which effectively removes it for current user
+                    result_clear = self.adb.run_command(f"{self.get_device_flag()} shell pm clear {package_name}")
+                    if result_clear['success']:
+                        self.log("Package data cleared successfully, now attempting user uninstall...")
+                        # Try uninstall after clear
+                        result_user = self.adb.run_command(f"{self.get_device_flag()} shell pm uninstall --user 0 {package_name}")
+                        if result_user['success']:
+                            output = result_user['stdout'].strip() if result_user['stdout'] else ''
+                            self.log("App uninstalled successfully after clearing data")
+                            self.update_status("App uninstalled successfully")
+                            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App uninstalled successfully!\n\nPackage data was cleared first to fix split APK issue."))
+                        else:
+                            error_msg_user = result_user['stderr'] if result_user['stderr'] else result_user['stdout']
+                            self.log(f"User uninstall after clear also failed: {error_msg_user}", "ERROR")
+                            self.update_status("Failed to uninstall app")
+                            help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}\n\nSplit APK detected and cleared data, but uninstall still failed.\nTry disabling the app instead."
+                            QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", help_text))
+                        return
+
                 # Try uninstalling for current user (works for system apps without root)
                 self.log("Attempting to uninstall for current user (--user 0)...")
                 result_user = self.adb.run_command(f"{self.get_device_flag()} shell pm uninstall --user 0 {package_name}")
-                
+
                 if result_user['success']:
                     output = result_user['stdout'].strip() if result_user['stdout'] else ''
                     if 'Success' in output or 'success' in output.lower() or output == '':
@@ -4467,13 +4489,13 @@ class ADBGUI(QMainWindow):
                     self.log(f"Full stdout: {result['stdout']}", "DEBUG")
                     self.log(f"Full stderr: {result['stderr']}", "DEBUG")
                     self.update_status("Failed to uninstall app")
-                    
+
                     # Provide helpful message
                     if 'DELETE_FAILED_INTERNAL_ERROR' in error_msg or 'system app' in error_msg.lower() or 'package is a system package' in error_msg.lower():
                         help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}\n\nTried both regular and user uninstall methods.\nYou can try disabling it instead (use 'Disable Selected')."
                     else:
                         help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}"
-                    
+
                     # Thread-safe messagebox - use QTimer to call from main thread
                     QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", help_text))
         
