@@ -590,7 +590,8 @@ class ScrcpyMirrorWindow(QMainWindow):
         # Cmd+W on macOS, Ctrl+W on Windows/Linux to close window
         from PyQt6.QtGui import QKeySequence
         if sys.platform == 'darwin':
-            close_shortcut = QShortcut(QKeySequence("Meta+W"), self)
+            # On macOS, Cmd key maps to Ctrl in Qt's QKeySequence
+            close_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
         else:
             close_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
         close_shortcut.activated.connect(self.close)
