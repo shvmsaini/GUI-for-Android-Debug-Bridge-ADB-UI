@@ -1496,7 +1496,6 @@ class ScrcpyMirrorWindow(QMainWindow):
             is_ctrl_other = sys.platform != 'darwin' and modifiers & Qt.KeyboardModifier.ControlModifier
 
             if is_cmd_mac or is_ctrl_other:
-                print(f"DEBUG Cmd+W detected: platform={sys.platform}, cmd_mac={is_cmd_mac}, ctrl_other={is_ctrl_other}, modifiers={modifiers}")
                 self.hide()  # Hide instead of close to prevent quitting the app
                 event.accept()
                 return
