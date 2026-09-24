@@ -1149,7 +1149,18 @@ class ScrcpyMirrorWindow(QMainWindow):
                     self.signal.frame_ready.emit(frame)
                     return True
 
-                self._client.listen(on_frame)
+                # Set a frame timeout to detect socket disconnections early.
+                # Use longer timeout for seat/remote connections (localhost:port)
+                # vs shorter timeout for local USB devices.
+                # If no frame arrives within this time, the socket has likely stalled.
+                if self.device_id.startswith('localhost:'):
+                    # Seat/remote connection: longer timeout for network latency
+                    frame_timeout = 60.0
+                else:
+                    # Local USB device: shorter timeout, should be fast
+                    frame_timeout = 30.0
+
+                self._client.listen(on_frame, timeout=frame_timeout)
 
             except Exception as e:
                 # If the user closed the window or restarted the client,
@@ -1158,9 +1169,24 @@ class ScrcpyMirrorWindow(QMainWindow):
                 if self._closing:
                     return
                 msg = str(e)
+                exc_type = type(e).__name__
+
                 # Socket closed during shutdown / Apply-restart — not an error.
                 if "Bad file descriptor" in msg or "control socket" in msg:
                     return
+
+                # Frame timeout — socket likely stalled (no frames arriving)
+                if exc_type == "ScrcpyTimeoutError" or "timeout" in msg.lower():
+                    timeout_msg = "60 seconds" if self.device_id.startswith('localhost:') else "30 seconds"
+                    self.signal.error.emit(
+                        f"Connection timeout after {timeout_msg}.\n\n"
+                        f"The device may have become unresponsive or the network "
+                        f"connection is too slow. Try:\n"
+                        f"  • Selecting a lower quality preset\n"
+                        f"  • Checking USB connection or seat network\n"
+                        f"  • Closing other apps using the device")
+                    return
+
                 # Device disconnected — show a friendly message.
                 if "device" in msg and "not found" in msg:
                     self.signal.error.emit(
@@ -1168,8 +1194,20 @@ class ScrcpyMirrorWindow(QMainWindow):
                         f"It may have disconnected. Refresh the device list "
                         f"and try again.")
                     return
+
+                # Socket/connection errors
+                if any(x in msg.lower() for x in ["socket", "connection", "disconnected", "refused"]):
+                    self.signal.error.emit(
+                        f"Connection error: {msg[:100]}\n\n"
+                        f"The device connection was lost. This can happen if:\n"
+                        f"  • USB cable is disconnected\n"
+                        f"  • Network connection (seat) is unstable\n"
+                        f"  • Device went to sleep or powered off")
+                    return
+
+                # Generic error with full traceback for debugging
                 self.signal.error.emit(
-                    f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+                    f"{exc_type}: {msg}\n\n{traceback.format_exc()}"
                 )
 
         threading.Thread(target=_thread, daemon=True).start()
