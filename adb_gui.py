@@ -4800,8 +4800,8 @@ class ADBGUI(QMainWindow):
             display_text = current_item.text()
             # Remove [DISABLED] marker if present
             display_text = display_text.replace(' [DISABLED]', '').strip()
-            # Remove version string like " v1.0.0" if present
-            display_text = re.sub(r'\s+v[\d.]+$', '', display_text).strip()
+            # Remove version string like " v1.0.0", " v4.2.0.172-online", etc
+            display_text = re.sub(r'\s+v[\w.-]+$', '', display_text).strip()
             # Extract package name from format "App Name (package.name)"
             if '(' in display_text and ')' in display_text:
                 package_name = display_text.split('(')[-1].rstrip(')').strip()
