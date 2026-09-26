@@ -1699,12 +1699,6 @@ class ADBGUI(QMainWindow):
         apks_folder_btn = QPushButton("📂 Open APKs Folder")
         apks_folder_btn.clicked.connect(self.open_apks_folder)
         app_group_layout.addWidget(apks_folder_btn)
-        
-        # Separator
-        self.separator = QFrame()
-        self.separator.setFrameShape(QFrame.Shape.HLine)
-        self.separator.setStyleSheet(f"color: {self.colors['border']};")
-        app_group_layout.addWidget(self.separator)
 
         # DeGoogle buttons are hidden
         # degoogle_row = QHBoxLayout()
