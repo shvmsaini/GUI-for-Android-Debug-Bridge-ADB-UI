@@ -3265,11 +3265,11 @@ class ADBGUI(QMainWindow):
             # Format: show rack info if this is the active one
             # Truncate long gateway names to prevent horizontal scrolling
             gateway = entry['gateway']
-            if len(gateway) > 40:
-                gateway = gateway[:37] + "…"
+            if len(gateway) > 50:
+                gateway = gateway[:47] + "…"
             active_rack_display = active_rack if active_rack else ""
-            if active_rack_display and len(active_rack_display) > 40:
-                active_rack_display = active_rack_display[:37] + "…"
+            if active_rack_display and len(active_rack_display) > 50:
+                active_rack_display = active_rack_display[:47] + "…"
 
             if is_active_rack:
                 # Show rack info - this is the active port forward
@@ -4230,8 +4230,8 @@ class ADBGUI(QMainWindow):
             if not local_paths:
                 return
             dest_dir = current_path()
-            self.log(f"Uploading {len(local_paths)} file(s) to {dest_dir}…")
-            self.update_status("Uploading file(s)…")
+            self.log(f"Uploading {len(local_paths)} item(s) to {dest_dir}…")
+            self.update_status("Uploading item(s)…")
 
             def do_upload():
                 ok = 0
@@ -4240,17 +4240,32 @@ class ADBGUI(QMainWindow):
                     if not os.path.exists(lp):
                         failed += 1
                         continue
-                    # Push into the current folder (adb push <local> <remote_dir>/)
-                    res = self.adb.run_command(f"{self.get_device_flag()} push {lp} {dest_dir}/", timeout=120)
-                    if res["success"]:
-                        ok += 1
+
+                    # Check if it's a directory
+                    if os.path.isdir(lp):
+                        # Upload folder with its contents using adb push
+                        folder_name = os.path.basename(lp.rstrip(os.sep))
+                        # Push the folder itself: adb push <local_folder> <remote_dir>/
+                        res = self.adb.run_command(f"{self.get_device_flag()} push {lp} {dest_dir}/", timeout=300)
+                        if res["success"]:
+                            ok += 1
+                            self.log(f"Uploaded folder: {folder_name}", "INFO")
+                        else:
+                            failed += 1
+                            err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                            self.log(f"Upload failed for folder {lp}: {err}", "ERROR")
                     else:
-                        failed += 1
-                        err = res.get("stderr") or res.get("stdout") or "Unknown error"
-                        self.log(f"Upload failed for {lp}: {err}", "ERROR")
+                        # Upload single file
+                        res = self.adb.run_command(f"{self.get_device_flag()} push {lp} {dest_dir}/", timeout=120)
+                        if res["success"]:
+                            ok += 1
+                        else:
+                            failed += 1
+                            err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                            self.log(f"Upload failed for {lp}: {err}", "ERROR")
 
                 # Auto-refresh the file listing after uploads complete
-                # Refresh only if at least one file was uploaded successfully
+                # Refresh only if at least one item was uploaded successfully
                 if ok > 0:
                     ui.call.emit(refresh_listing)
 
@@ -4264,8 +4279,47 @@ class ADBGUI(QMainWindow):
             threading.Thread(target=do_upload, daemon=True).start()
 
         def upload_clicked():
-            files, _ = QFileDialog.getOpenFileNames(self, "Select file(s) to upload")
-            upload_files(files)
+            # Show dialog with both file and folder selection options
+            dialog = QDialog(explorer)
+            dialog.setWindowTitle("Select Files or Folders to Upload")
+            dialog.setMinimumWidth(400)
+
+            layout = QVBoxLayout(dialog)
+
+            label = QLabel("Choose what to upload:")
+            layout.addWidget(label)
+
+            button_layout = QHBoxLayout()
+
+            files_btn = QPushButton("📄 Select Files")
+            folders_btn = QPushButton("📁 Select Folder")
+            cancel_btn = QPushButton("Cancel")
+
+            button_layout.addWidget(files_btn)
+            button_layout.addWidget(folders_btn)
+            button_layout.addWidget(cancel_btn)
+            layout.addLayout(button_layout)
+
+            result = []
+
+            def select_files():
+                files, _ = QFileDialog.getOpenFileNames(explorer, "Select file(s) to upload")
+                if files:
+                    result.extend(files)
+                dialog.accept()
+
+            def select_folder():
+                folder = QFileDialog.getExistingDirectory(explorer, "Select folder to upload")
+                if folder:
+                    result.append(folder)
+                dialog.accept()
+
+            files_btn.clicked.connect(select_files)
+            folders_btn.clicked.connect(select_folder)
+            cancel_btn.clicked.connect(dialog.reject)
+
+            if dialog.exec() == QDialog.DialogCode.Accepted and result:
+                upload_files(result)
 
         def download_clicked():
             items = selected_items()
