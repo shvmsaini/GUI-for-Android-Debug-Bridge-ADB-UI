@@ -4802,6 +4802,23 @@ class ADBGUI(QMainWindow):
             QMessageBox.warning(self, "No Package", "No package name provided")
             return
 
+        # Ask user where to save the APK file
+        default_filename = f"{package_name}_base.apk"
+        local_apk, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Base APK As",
+            default_filename,
+            "APK files (*.apk);;All files (*.*)"
+        )
+
+        if not local_apk:
+            # User cancelled
+            return
+
+        # Ensure the file has .apk extension
+        if not local_apk.lower().endswith('.apk'):
+            local_apk += '.apk'
+
         self.log(f"Extracting base APK for {package_name}...")
         self.update_status("Extracting APK...")
 
@@ -4844,16 +4861,7 @@ class ADBGUI(QMainWindow):
             else:
                 self.log(f"Found base APK: {base_apk_path}", "INFO")
 
-            # Step 2: Create local apks directory
-            if getattr(sys, 'frozen', False):
-                project_dir = os.path.dirname(sys.executable)
-            else:
-                project_dir = os.path.dirname(os.path.abspath(__file__))
-            apks_dir = os.path.join(project_dir, 'apks')
-            os.makedirs(apks_dir, exist_ok=True)
-
-            # Step 3: Pull the base APK
-            local_apk = os.path.join(apks_dir, f"{package_name}_base.apk")
+            # Step 2: Pull the base APK to the user-selected location
             self.log(f"Pulling base APK to {local_apk}...")
             result = self.adb.run_command(f"{self.get_device_flag()} pull {base_apk_path} {local_apk}")
 
