@@ -1658,7 +1658,11 @@ class ADBGUI(QMainWindow):
         ops_layout.setSpacing(12)
         
         # File operations
-        file_group = self.create_card("📁 File Transfer")
+        file_group = QGroupBox("📁 File Transfer")
+        file_group.setObjectName("fileGroup")  # Apply modern styling
+        file_group_layout = QVBoxLayout(file_group)
+        file_group_layout.setContentsMargins(15, 20, 15, 15)
+        file_group_layout.setSpacing(4)
         push_pull_row = QHBoxLayout()
         push_btn = QPushButton("⬆️ Push")
         push_btn.clicked.connect(self.push_file)
@@ -1666,13 +1670,18 @@ class ADBGUI(QMainWindow):
         pull_btn.clicked.connect(self.pull_file)
         push_pull_row.addWidget(push_btn)
         push_pull_row.addWidget(pull_btn)
-        file_group.layout().addLayout(push_pull_row)
-        self.create_button(file_group, "🗂️ File Explorer (/sdcard)", self.open_file_explorer)
+        file_group_layout.addLayout(push_pull_row)
+        explorer_btn = QPushButton("🗂️ File Explorer (/sdcard)")
+        explorer_btn.clicked.connect(self.open_file_explorer)
+        file_group_layout.addWidget(explorer_btn)
         ops_layout.addWidget(file_group)
         
         # App operations
-        app_group = self.create_card("📱 App Management")
-
+        app_group = QGroupBox("📱 App Management")
+        app_group.setObjectName("appGroup")  # Apply modern styling
+        app_group_layout = QVBoxLayout(app_group)
+        app_group_layout.setContentsMargins(15, 20, 15, 15)
+        app_group_layout.setSpacing(4)
         # Install and uninstall in a single row (like push/pull)
         app_actions_row = QHBoxLayout()
         install_btn = QPushButton("📦 Install APK")
@@ -1681,16 +1690,21 @@ class ADBGUI(QMainWindow):
         uninstall_btn.clicked.connect(self.uninstall_app)
         app_actions_row.addWidget(install_btn)
         app_actions_row.addWidget(uninstall_btn)
-        app_group.layout().addLayout(app_actions_row)
+        app_group_layout.addLayout(app_actions_row)
 
-        self.create_button(app_group, "📋 List Installed Apps", self.list_apps)
-        self.create_button(app_group, "📂 Open APKs Folder", self.open_apks_folder)
+        list_apps_btn = QPushButton("📋 List Installed Apps")
+        list_apps_btn.clicked.connect(self.list_apps)
+        app_group_layout.addWidget(list_apps_btn)
+
+        apks_folder_btn = QPushButton("📂 Open APKs Folder")
+        apks_folder_btn.clicked.connect(self.open_apks_folder)
+        app_group_layout.addWidget(apks_folder_btn)
         
         # Separator
         self.separator = QFrame()
         self.separator.setFrameShape(QFrame.Shape.HLine)
         self.separator.setStyleSheet(f"color: {self.colors['border']};")
-        app_group.layout().addWidget(self.separator)
+        app_group_layout.addWidget(self.separator)
 
         # DeGoogle buttons are hidden
         # degoogle_row = QHBoxLayout()
@@ -1705,8 +1719,15 @@ class ADBGUI(QMainWindow):
         ops_layout.addWidget(app_group)
         
         # Device operations
-        device_ops_group = self.create_card("⚡ Device Operations")
-        self.create_button(device_ops_group, "📸 Take Screenshot", self.take_screenshot)
+        device_ops_group = QGroupBox("⚡ Device Operations")
+        device_ops_group.setObjectName("deviceOpsGroup")  # Apply modern styling
+        device_ops_group_layout = QVBoxLayout(device_ops_group)
+        device_ops_group_layout.setContentsMargins(15, 20, 15, 15)
+        device_ops_group_layout.setSpacing(4)
+
+        screenshot_btn = QPushButton("📸 Take Screenshot")
+        screenshot_btn.clicked.connect(self.take_screenshot)
+        device_ops_group_layout.addWidget(screenshot_btn)
 
         # Embedded Mirror: two presets tuned for the most common cases.
         # "Fast" → 1 Mbps / 24 fps / max_size 800, for bandwidth-sensitive
@@ -1734,7 +1755,7 @@ class ADBGUI(QMainWindow):
         scrcpy_row.addWidget(normal_btn)
 
         scrcpy_row.addStretch()
-        device_ops_group.layout().addLayout(scrcpy_row)
+        device_ops_group_layout.addLayout(scrcpy_row)
 
         # Navigation buttons for use during a scrcpy session
         # These send keyevents over ADB so they work with the native
@@ -1758,7 +1779,7 @@ class ADBGUI(QMainWindow):
         nav_recent.clicked.connect(lambda: self._send_keyevent(187, "Recent"))
         nav_label_row.addWidget(nav_recent)
 
-        device_ops_group.layout().addLayout(nav_label_row)
+        device_ops_group_layout.addLayout(nav_label_row)
 
         # Advanced section - Reboot options (collapsible, colored red)
         advanced_header = QPushButton("▶ ⚠️ Advanced")
@@ -1779,7 +1800,7 @@ class ADBGUI(QMainWindow):
             }}
         """)
         advanced_header.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        device_ops_group.layout().addWidget(advanced_header)
+        device_ops_group_layout.addWidget(advanced_header)
 
         # Container for reboot buttons (hidden by default)
         reboot_container = QWidget()
@@ -1842,7 +1863,7 @@ class ADBGUI(QMainWindow):
         bootloader_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         reboot_row.addWidget(bootloader_btn)
 
-        device_ops_group.layout().addWidget(reboot_container)
+        device_ops_group_layout.addWidget(reboot_container)
 
         # Connect toggle button to show/hide reboot buttons
         def toggle_advanced(checked):
@@ -1858,24 +1879,31 @@ class ADBGUI(QMainWindow):
         ops_layout.addWidget(device_ops_group)
         
         # Shell operations
-        shell_group = self.create_card("💻 Shell Commands")
+        shell_group = QGroupBox("💻 Shell Commands")
+        shell_group.setObjectName("shellGroup")  # Apply modern styling
+        shell_group_layout = QVBoxLayout(shell_group)
+        shell_group_layout.setContentsMargins(15, 20, 15, 15)
+        shell_group_layout.setSpacing(4)
         host_os = "Windows" if sys.platform == "win32" else ("macOS" if sys.platform == "darwin" else "Linux")
-        shell_group.layout().addWidget(QLabel(f"Run commands ON YOUR ANDROID DEVICE (not {host_os}):"))
+        shell_group_layout.addWidget(QLabel(f"Run commands ON YOUR ANDROID DEVICE (not {host_os}):"))
         help_text = (f"Examples: 'ls /sdcard', 'pm list packages', 'dumpsys battery | grep level'\n"
                     "Use Android/Linux shell commands: 'grep', 'ls', 'cat' (not desktop OS commands).\n\n"
                     "Note: You can include 'adb shell' prefix, but it's not required (auto-stripped)")
         self.shell_help_label = QLabel(help_text)
         self.shell_help_label.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 8pt;")
         self.shell_help_label.setWordWrap(True)
-        shell_group.layout().addWidget(self.shell_help_label)
+        shell_group_layout.addWidget(self.shell_help_label)
         self.shell_entry = QTextEdit()
         self.shell_entry.setMaximumHeight(100)
         self.shell_entry.setMinimumHeight(80)
         self.shell_entry.setStyleSheet("padding: 6px; font-size: 10pt;")
         self.shell_entry.setPlaceholderText("Enter Android shell command (e.g., 'ls /sdcard' or 'adb shell pm list packages')\nYou can enter multi-line commands here...")
         # QTextEdit doesn't have returnPressed, so we'll use Ctrl+Enter or just the button
-        shell_group.layout().addWidget(self.shell_entry)
-        self.create_button(shell_group, "▶️ Run Command", self.run_shell_command, accent=True)
+        shell_group_layout.addWidget(self.shell_entry)
+        run_command_btn = QPushButton("▶️ Run Command")
+        run_command_btn.clicked.connect(self.run_shell_command)
+        run_command_btn.setProperty("accent", "true")
+        shell_group_layout.addWidget(run_command_btn)
         ops_layout.addWidget(shell_group)
         
         ops_layout.addStretch()
@@ -1891,7 +1919,11 @@ class ADBGUI(QMainWindow):
         seat_port_layout.setSpacing(12)
 
         # Seat Management section
-        seat_group = self.create_card("💺 Seat Management")
+        seat_group = QGroupBox("💺 Seat Management")
+        seat_group.setObjectName("seatGroup")  # Apply modern styling
+        seat_group_layout = QVBoxLayout(seat_group)
+        seat_group_layout.setContentsMargins(15, 20, 15, 15)
+        seat_group_layout.setSpacing(4)
         # Add search filter
         seat_search_layout = QHBoxLayout()
         seat_search_label = QLabel("Search:")
@@ -1905,7 +1937,7 @@ class ADBGUI(QMainWindow):
         self.seat_search_entry.textChanged.connect(self._seat_search_timer.start)
         seat_search_layout.addWidget(seat_search_label)
         seat_search_layout.addWidget(self.seat_search_entry)
-        seat_group.layout().addLayout(seat_search_layout)
+        seat_group_layout.addLayout(seat_search_layout)
         # Seat list container with scroll area
         self.seat_scroll_area = QScrollArea()
         self.seat_scroll_area.setWidgetResizable(True)
@@ -1915,12 +1947,17 @@ class ADBGUI(QMainWindow):
         self.seat_list_layout = QVBoxLayout(self.seat_list_container)
         self.seat_list_layout.setContentsMargins(0, 0, 0, 0)
         self.seat_list_layout.setSpacing(8)  # Space between individual seat items
+        self.seat_list_container.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
         self.seat_scroll_area.setWidget(self.seat_list_container)
-        seat_group.layout().addWidget(self.seat_scroll_area)
+        seat_group_layout.addWidget(self.seat_scroll_area)
         seat_port_layout.addWidget(seat_group, 1)  # Weight 1 - shares available space
 
         # Port Forward section
-        portforward_group = self.create_card("🔌 Port Forward")
+        portforward_group = QGroupBox("🔌 Port Forward")
+        portforward_group.setObjectName("portforwardGroup")  # Apply modern styling
+        portforward_group_layout = QVBoxLayout(portforward_group)
+        portforward_group_layout.setContentsMargins(15, 20, 15, 15)
+        portforward_group_layout.setSpacing(4)
         # Add search filter
         pf_search_layout = QHBoxLayout()
         pf_search_label = QLabel("Search:")
@@ -1934,7 +1971,7 @@ class ADBGUI(QMainWindow):
         self.pf_search_entry.textChanged.connect(self._pf_search_timer.start)
         pf_search_layout.addWidget(pf_search_label)
         pf_search_layout.addWidget(self.pf_search_entry)
-        portforward_group.layout().addLayout(pf_search_layout)
+        portforward_group_layout.addLayout(pf_search_layout)
         # Port forward list container with scroll area
         self.pf_scroll_area = QScrollArea()
         self.pf_scroll_area.setWidgetResizable(True)
@@ -1944,8 +1981,9 @@ class ADBGUI(QMainWindow):
         self.portforward_list_layout = QVBoxLayout(self.portforward_list_container)
         self.portforward_list_layout.setContentsMargins(0, 0, 0, 0)
         self.portforward_list_layout.setSpacing(8)  # Space between individual port forward items
+        self.portforward_list_container.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
         self.pf_scroll_area.setWidget(self.portforward_list_container)
-        portforward_group.layout().addWidget(self.pf_scroll_area)
+        portforward_group_layout.addWidget(self.pf_scroll_area)
         seat_port_layout.addWidget(portforward_group, 1)  # Weight 1 - shares available space
 
         seat_port_layout.addStretch()
@@ -3079,10 +3117,15 @@ class ADBGUI(QMainWindow):
             )
             btn_connected = is_connected
             # Format: two lines with Port info on the seat line
-            text = f"{entry['seat']} (Port: {entry['port']})\n{entry['gateway']}"
+            # Truncate long gateway names to prevent horizontal scrolling
+            gateway = entry['gateway']
+            if len(gateway) > 40:
+                gateway = gateway[:37] + "…"
+            text = f"{entry['seat']} (Port: {entry['port']})\n{gateway}"
 
             # Create container widget with horizontal layout for button + play button (no gap)
             container = QWidget()
+            container.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
             container_layout = QHBoxLayout(container)
             container_layout.setContentsMargins(0, 0, 0, 0)
             container_layout.setSpacing(0)  # No space between main button and play button
@@ -3091,9 +3134,11 @@ class ADBGUI(QMainWindow):
             btn = QPushButton(text)
             btn.setMinimumHeight(50)
             btn.setMaximumHeight(50)
-            btn.setMinimumWidth(220)
-            btn.setMaximumWidth(220)
-            btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+            # btn.setMinimumWidth(220)
+            # btn.setMaximumWidth(220)
+            # btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+            btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
+            # Prevent horizontal scrolling - text should wrap within button bounds
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.clicked.connect(lambda checked=False, e=entry: self._on_seat_clicked(e))
 
@@ -3113,8 +3158,11 @@ class ADBGUI(QMainWindow):
                         color: white;
                     }}
                 """)
-                # Update tooltip to indicate action
-                btn.setToolTip("Click to disconnect")
+                # Update tooltip to indicate action and show full gateway name if truncated
+                tooltip_text = "Click to disconnect"
+                if len(entry['gateway']) > 40:
+                    tooltip_text += f"\n\nFull gateway: {entry['gateway']}"
+                btn.setToolTip(tooltip_text)
             else:
                 # Disconnected: Default background, blue on hover (indicates connect)
                 btn.setStyleSheet(f"""
@@ -3128,7 +3176,11 @@ class ADBGUI(QMainWindow):
                         color: white;
                     }}
                 """)
-                btn.setToolTip("Click to connect")
+                # Tooltip to show full gateway name if truncated and indicate action
+                tooltip_text = "Click to connect"
+                if len(entry['gateway']) > 40:
+                    tooltip_text += f"\n\nFull gateway: {entry['gateway']}"
+                btn.setToolTip(tooltip_text)
 
             # Play button for opening the embedded mirror window (tightly attached, no gap, no border)
             play_btn = QPushButton("▶")
@@ -3136,13 +3188,14 @@ class ADBGUI(QMainWindow):
             play_btn.setMinimumWidth(40)
             play_btn.setMaximumHeight(50)
             play_btn.setMinimumHeight(50)
+            play_btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
             play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             play_btn.clicked.connect(lambda checked=False, seat=entry['seat']: self._scrcpy_via_seat(seat))
             play_btn.setToolTip("Open mirror window")
             play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
 
-            container_layout.addWidget(btn, 0)
-            container_layout.addWidget(play_btn, 0)
+            container_layout.addWidget(btn, 1)  # Button takes available space
+            container_layout.addWidget(play_btn, 0)  # Play button stays fixed
             container_layout.setContentsMargins(0, 0, 0, 0)
             container_layout.setSpacing(0)
 
@@ -3210,12 +3263,20 @@ class ADBGUI(QMainWindow):
             )
 
             # Format: show rack info if this is the active one
+            # Truncate long gateway names to prevent horizontal scrolling
+            gateway = entry['gateway']
+            if len(gateway) > 40:
+                gateway = gateway[:37] + "…"
+            active_rack_display = active_rack if active_rack else ""
+            if active_rack_display and len(active_rack_display) > 40:
+                active_rack_display = active_rack_display[:37] + "…"
+
             if is_active_rack:
                 # Show rack info - this is the active port forward
-                text = f"🟢 {entry['gateway']}\n📡 Rack: {active_rack}"
+                text = f"🟢 {gateway}\n📡 Rack: {active_rack_display}"
                 btn_connected = True  # Force connected state for active rack
             else:
-                text = f"{entry['gateway']}"
+                text = f"{gateway}"
                 btn_connected = is_connected
 
             # Main button (no play button for port forward - uses full available width)
@@ -3244,9 +3305,15 @@ class ADBGUI(QMainWindow):
                 """)
                 # Update tooltip to indicate action
                 if is_active_rack:
-                    btn.setToolTip(f"Active rack: {active_rack}\nClick to stop port forward")
+                    tooltip_text = f"Active rack: {active_rack}\nClick to stop port forward"
+                    if len(active_rack) > 40:
+                        tooltip_text += f"\n\nFull rack: {active_rack}"
+                    btn.setToolTip(tooltip_text)
                 else:
-                    btn.setToolTip("Click to disconnect")
+                    tooltip_text = "Click to disconnect"
+                    if len(entry['gateway']) > 40:
+                        tooltip_text += f"\n\nFull gateway: {entry['gateway']}"
+                    btn.setToolTip(tooltip_text)
             else:
                 # Disconnected: Default background, blue on hover (indicates connect)
                 btn.setStyleSheet(f"""
@@ -3260,7 +3327,11 @@ class ADBGUI(QMainWindow):
                         color: white;
                     }}
                 """)
-                btn.setToolTip("Click to connect")
+                # Tooltip to show full gateway/rack name if truncated
+                tooltip_text = "Click to connect"
+                if len(entry['gateway']) > 40:
+                    tooltip_text += f"\n\nFull gateway: {entry['gateway']}"
+                btn.setToolTip(tooltip_text)
 
             # Add button directly to layout (no container, no play button)
             self.portforward_list_layout.addWidget(btn)
@@ -4033,12 +4104,14 @@ class ADBGUI(QMainWindow):
         download_btn = QPushButton("⬇️ Download…")
         delete_btn = QPushButton("🗑️ Delete")
         mkdir_btn = QPushButton("📁 New Folder…")
+        rename_btn = QPushButton("📝 Rename")
         close_btn = QPushButton("Close")
 
         btn_row.addWidget(upload_btn)
         btn_row.addWidget(download_btn)
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(mkdir_btn)
+        btn_row.addWidget(rename_btn)
         btn_row.addStretch()
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
@@ -4176,7 +4249,11 @@ class ADBGUI(QMainWindow):
                         err = res.get("stderr") or res.get("stdout") or "Unknown error"
                         self.log(f"Upload failed for {lp}: {err}", "ERROR")
 
-                QTimer.singleShot(0, refresh_listing)
+                # Auto-refresh the file listing after uploads complete
+                # Refresh only if at least one file was uploaded successfully
+                if ok > 0:
+                    ui.call.emit(refresh_listing)
+
                 ui.call.emit(lambda: self.update_status("Upload complete"))
                 ui.call.emit(lambda: QMessageBox.information(
                     self,
@@ -4307,6 +4384,50 @@ class ADBGUI(QMainWindow):
 
             threading.Thread(target=do_mkdir, daemon=True).start()
 
+        def rename_clicked():
+            items = selected_items()
+            if not items:
+                QMessageBox.warning(self, "No Selection", "Select one file/folder to rename.")
+                return
+            if len(items) > 1:
+                QMessageBox.warning(self, "Multiple Selection", "Rename one item at a time, please.")
+                return
+
+            item = items[0]
+            name = item.text()
+            if name.startswith("📁 "):
+                name = name.replace("📁 ", "", 1).strip()
+            if name.startswith("[Error]") or name == "Loading…":
+                return
+
+            new_name, ok = QInputDialog.getText(self, "Rename", "New name:", text=name)
+            if not ok or not new_name or not new_name.strip():
+                return
+            new_name = new_name.strip()
+
+            if new_name == name:
+                return  # No change
+
+            old_path = join_remote(current_path(), name)
+            new_path = join_remote(current_path(), new_name)
+
+            self.log(f"Renaming {name} to {new_name}…")
+            self.update_status("Renaming…")
+
+            def do_rename():
+                res = self.adb.run_command(f"{self.get_device_flag()} shell mv -f {sh_quote(old_path)} {sh_quote(new_path)}")
+                if res["success"]:
+                    ui.call.emit(refresh_listing)
+                    ui.call.emit(lambda: self.update_status("Renamed"))
+                    ui.call.emit(lambda: self.log(f"Renamed {name} to {new_name}"))
+                else:
+                    err = res.get("stderr") or res.get("stdout") or "Unknown error"
+                    self.log(f"Rename failed: {err}", "ERROR")
+                    ui.call.emit(lambda: self.update_status("Failed to rename"))
+                    ui.call.emit(lambda: QMessageBox.critical(self, "Error", f"Failed to rename:\n\n{err}"))
+
+            threading.Thread(target=do_rename, daemon=True).start()
+
         # Wire events
         close_btn.clicked.connect(explorer.accept)
         refresh_btn.clicked.connect(refresh_listing)
@@ -4316,6 +4437,7 @@ class ADBGUI(QMainWindow):
         download_btn.clicked.connect(download_clicked)
         delete_btn.clicked.connect(delete_clicked)
         mkdir_btn.clicked.connect(mkdir_clicked)
+        rename_btn.clicked.connect(rename_clicked)
         listbox.files_dropped.connect(upload_files)
         path_entry.returnPressed.connect(refresh_listing)
 
