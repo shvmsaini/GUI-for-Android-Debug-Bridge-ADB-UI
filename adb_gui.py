@@ -1696,10 +1696,6 @@ class ADBGUI(QMainWindow):
         list_apps_btn.clicked.connect(self.list_apps)
         app_group_layout.addWidget(list_apps_btn)
 
-        apks_folder_btn = QPushButton("📂 Open APKs Folder")
-        apks_folder_btn.clicked.connect(self.open_apks_folder)
-        app_group_layout.addWidget(apks_folder_btn)
-
         # DeGoogle buttons are hidden
         # degoogle_row = QHBoxLayout()
         # degoogle_btn = QPushButton("🚫 DeGoogle")
@@ -4765,28 +4761,6 @@ class ADBGUI(QMainWindow):
         # Note: If labels aren't showing, check the log output to see what dumpsys/pm dump returns
         return None
 
-    def open_apks_folder(self):
-        """Open the APKs folder in file explorer"""
-        # Get project directory - executable's directory if running as exe, script directory if from source
-        if getattr(sys, 'frozen', False):
-            # Running as compiled executable
-            project_dir = os.path.dirname(sys.executable)
-        else:
-            # Running as script
-            project_dir = os.path.dirname(os.path.abspath(__file__))
-        apks_dir = os.path.join(project_dir, 'apks')
-        os.makedirs(apks_dir, exist_ok=True)
-        
-        # Open folder in file explorer
-        if sys.platform == 'win32':
-            os.startfile(apks_dir)
-        elif sys.platform == 'darwin':
-            subprocess.run(['open', apks_dir])
-        else:
-            subprocess.run(['xdg-open', apks_dir])
-        
-        self.log(f"Opened APKs folder: {apks_dir}")
-    
     def list_apps(self):
         """List installed apps with uninstall/reinstall options"""
         if not self.current_device:
@@ -4817,7 +4791,101 @@ class ADBGUI(QMainWindow):
                 QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Error", f"Failed to list installed apps:\n{error_msg}"))
         
         threading.Thread(target=do_list, daemon=True).start()
-    
+
+    def extract_base_apk(self, package_name):
+        """Extract the base APK from an installed app to local disk"""
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+
+        if not package_name:
+            QMessageBox.warning(self, "No Package", "No package name provided")
+            return
+
+        self.log(f"Extracting base APK for {package_name}...")
+        self.update_status("Extracting APK...")
+
+        def do_extract():
+            # Step 1: Get the APK path(s) for the package
+            self.log(f"Getting APK path for {package_name}...")
+            result = self.adb.run_command(f"{self.get_device_flag()} shell pm path {package_name}")
+            if not result['success']:
+                error_msg = result.get('stderr') or "Unknown error"
+                self.log(f"Error getting APK path: {error_msg}", "ERROR")
+                QTimer.singleShot(0, lambda: QMessageBox.critical(
+                    self, "Error", f"Failed to get APK path:\n{error_msg}"
+                ))
+                return
+
+            # Parse APK paths (format: package:/data/app/.../base.apk)
+            # Handle multiple APK paths (split APKs) - we want the base one
+            apk_paths = result['stdout'].strip().split('\n')
+            apk_paths = [p.replace('package:', '').strip() for p in apk_paths if p.strip()]
+
+            if not apk_paths:
+                self.log("Could not find APK path", "ERROR")
+                QTimer.singleShot(0, lambda: QMessageBox.critical(
+                    self, "Error", "Could not find APK path on device"
+                ))
+                return
+
+            # Find the base APK (usually the first one or contains "base" in the name)
+            base_apk_path = None
+            for path in apk_paths:
+                filename = os.path.basename(path)
+                if 'base' in filename.lower() or filename == 'base.apk':
+                    base_apk_path = path
+                    break
+
+            # If no base.apk found, use the first one
+            if not base_apk_path:
+                base_apk_path = apk_paths[0]
+                self.log("No base.apk found, using first APK", "INFO")
+            else:
+                self.log(f"Found base APK: {base_apk_path}", "INFO")
+
+            # Step 2: Create local apks directory
+            if getattr(sys, 'frozen', False):
+                project_dir = os.path.dirname(sys.executable)
+            else:
+                project_dir = os.path.dirname(os.path.abspath(__file__))
+            apks_dir = os.path.join(project_dir, 'apks')
+            os.makedirs(apks_dir, exist_ok=True)
+
+            # Step 3: Pull the base APK
+            local_apk = os.path.join(apks_dir, f"{package_name}_base.apk")
+            self.log(f"Pulling base APK to {local_apk}...")
+            result = self.adb.run_command(f"{self.get_device_flag()} pull {base_apk_path} {local_apk}")
+
+            if result['success']:
+                file_size = os.path.getsize(local_apk) if os.path.exists(local_apk) else 0
+                size_mb = file_size / (1024 * 1024)
+                self.log(f"Base APK extracted successfully ({size_mb:.2f} MB)")
+                self.update_status("APK extracted")
+                QTimer.singleShot(0, lambda: QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Base APK extracted successfully!\n\n"
+                    f"Package: {package_name}\n"
+                    f"Size: {size_mb:.2f} MB\n"
+                    f"Saved to:\n{local_apk}"
+                ))
+            else:
+                error_msg = result.get('stderr') or result.get('stdout') or "Unknown error"
+                self.log(f"Error pulling APK: {error_msg}", "ERROR")
+                self.update_status("Failed to extract APK")
+                # Clean up partial file if it exists
+                if os.path.exists(local_apk):
+                    try:
+                        os.remove(local_apk)
+                    except:
+                        pass
+                QTimer.singleShot(0, lambda: QMessageBox.critical(
+                    self, "Error", f"Failed to pull APK:\n{error_msg}"
+                ))
+
+        threading.Thread(target=do_extract, daemon=True).start()
+
     def show_app_list_window(self, apps):
         """Show interactive app list window with uninstall/reinstall buttons"""
         app_window = QDialog(self)
@@ -5552,7 +5620,19 @@ class ADBGUI(QMainWindow):
         force_stop_btn = QPushButton("Force Stop")
         force_stop_btn.clicked.connect(force_stop_selected)
         button_layout.addWidget(force_stop_btn)
-        
+
+        def extract_apk_selected():
+            """Extract base APK for the selected app"""
+            package_name = get_selected_package()
+            if not package_name:
+                QMessageBox.warning(self, "No Selection", "Please select an app to extract APK")
+                return
+            self.extract_base_apk(package_name)
+
+        extract_btn = QPushButton("Extract Base APK")
+        extract_btn.clicked.connect(extract_apk_selected)
+        button_layout.addWidget(extract_btn)
+
         refresh_btn = QPushButton("Refresh List")
         refresh_btn.clicked.connect(refresh_list)
         button_layout.addWidget(refresh_btn)
