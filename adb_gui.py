@@ -45,7 +45,7 @@ except ImportError:
 
 
 # Application version - single source of truth. Bump on release.
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 class _SignalEmitter(QObject):
@@ -1242,9 +1242,24 @@ class ADBManager:
                     mfr_result = self.run_command(f"-s {device['id']} shell getprop ro.product.manufacturer")
                     if mfr_result['success'] and mfr_result['stdout'].strip():
                         device['manufacturer'] = mfr_result['stdout'].strip()
-        
+
+            # For local emulators (e.g., emulator-5554), try to get the AVD name.
+            # This gives a friendly name like "Pixel_9_Pro" instead of the generic
+            # product name. Only works for local emulators, not seat/adb-connect ones.
+            for device in devices:
+                device_id = device['id']
+                if device_id.startswith('emulator-'):
+                    try:
+                        avd_result = self.run_command(f"-s {device_id} emu avd name", timeout=5)
+                        if avd_result['success'] and avd_result['stdout'].strip():
+                            avd_name = avd_result['stdout'].strip()
+                            # Use AVD name as the display name (more friendly than product/model)
+                            device['avd_name'] = avd_name
+                    except Exception:
+                        pass
+
         return devices
-    
+
     def get_device_info(self, device_id):
         """Get device information"""
         info = {}
@@ -2565,9 +2580,14 @@ class ADBGUI(QMainWindow):
                 model = d.get('model')
                 manufacturer = d.get('manufacturer', '')
                 product = d.get('product')
+                avd_name = d.get('avd_name')
 
                 # Build display name
-                if model:
+                # Priority: AVD name (local emulators) > model > product > "Unknown Device"
+                if avd_name:
+                    # Local emulator with AVD name - use friendly AVD name
+                    display_name = avd_name
+                elif model:
                     if manufacturer:
                         display_name = f"{manufacturer} {model}"
                     else:
@@ -2608,9 +2628,14 @@ class ADBGUI(QMainWindow):
                     model = d.get('model')
                     manufacturer = d.get('manufacturer', '')
                     product = d.get('product')
+                    avd_name = d.get('avd_name')
 
                     # Build display name
-                    if model:
+                    # Priority: AVD name (local emulators) > model > product > "Unknown Device"
+                    if avd_name:
+                        # Local emulator with AVD name - use friendly AVD name
+                        display_name = avd_name
+                    elif model:
                         if manufacturer:
                             display_name = f"{manufacturer} {model}"
                         else:
