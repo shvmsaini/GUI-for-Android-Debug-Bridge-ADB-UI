@@ -1734,15 +1734,21 @@ class ADBGUI(QMainWindow):
         scrcpy_row = QHBoxLayout()
         scrcpy_row.addWidget(QLabel("🪞 Mirror Screen:"))
 
+        # Native scrcpy button - best quality
+        native_scrcpy_btn = QPushButton("🖥️ Open Scrcpy")
+        native_scrcpy_btn.setToolTip("Launch native scrcpy for best quality (highest bitrate & resolution)")
+        native_scrcpy_btn.clicked.connect(self.scrcpy_device)
+        scrcpy_row.addWidget(native_scrcpy_btn)
+
         fast_btn = QPushButton("⚡ Fast")
-        fast_btn.setToolTip("2 Mbps / 30 fps / 800px — for slow remote/seat connections")
+        fast_btn.setToolTip("2 Mbps / 30 fps / 800px — for slow remote/seat connections (embedded)")
         fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=2_000_000,
                                                                   max_fps=30, max_size=800))
         scrcpy_row.addWidget(fast_btn)
 
         normal_btn = QPushButton("🎬 Normal")
-        normal_btn.setToolTip("6 Mbps / 60 fps / 1024px — recommended for local emulator & USB devices (crisp text)")
-        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=6_000_000,
+        normal_btn.setToolTip("8 Mbps / 60 fps / 1024px — embedded mirror (decent quality)")
+        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=8_000_000,
                                                                    max_fps=60, max_size=1024))
         scrcpy_row.addWidget(normal_btn)
 
@@ -2281,7 +2287,7 @@ class ADBGUI(QMainWindow):
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
-    def _open_mirror_window(self, device_id=None, bitrate=6_000_000,
+    def _open_mirror_window(self, device_id=None, bitrate=8_000_000,
                             max_fps=60, max_size=1024, seat_context=None):
         """Open the mirror in a separate window with recording options.
 
@@ -2291,9 +2297,9 @@ class ADBGUI(QMainWindow):
 
         Args:
             device_id: Optional device ID to mirror. Defaults to self.current_device.
-            bitrate: Bitrate in bps. Defaults to 3 Mbps — recommended for local
-                emulator / USB-connected devices (clean text, no macroblocking).
-                Use 1 Mbps for bandwidth-sensitive seat/remote mirroring.
+            bitrate: Bitrate in bps. Defaults to 8 Mbps — embedded mirror quality.
+                For best text quality, use native scrcpy via "Open Scrcpy" button.
+                Use 2 Mbps for bandwidth-sensitive seat/remote mirroring.
             max_fps: Max frames per second. Defaults to 60 to match typical
                 emulator refresh rates so taps feel immediate.
             max_size: Long-edge resolution cap. Defaults to 1024 — keeps encoder
