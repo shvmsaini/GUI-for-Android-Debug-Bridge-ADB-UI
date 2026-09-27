@@ -1720,27 +1720,29 @@ class ADBGUI(QMainWindow):
         device_ops_group_layout.addWidget(screenshot_btn)
 
         # Embedded Mirror: two presets tuned for the most common cases.
-        # "Fast" → 1 Mbps / 24 fps / max_size 800, for bandwidth-sensitive
+        # "Fast" → 2 Mbps / 30 fps / max_size 800, for bandwidth-sensitive
         #           situations (seat/remote mirroring where the link is
         #           the bottleneck). Lowering the long-edge from 1024 to
         #           800 cuts bytes-per-frame by ~40%, the biggest single
         #           latency lever we have on network seats.
-        # "High" → 3 Mbps / 60 fps / 1024, the recommended default for
-        #           local emulator or USB-connected device: clean text/UI
+        # "Normal" → 6 Mbps / 60 fps / max_size 1024, the recommended default for
+        #           local emulator or USB-connected device: crisp text/UI
         #           without H.264 macroblocking, and 60 fps matches the
         #           typical emulator refresh rate so taps feel immediate.
+        #           6 Mbps provides significantly better text readability
+        #           while still staying within typical local network limits.
         scrcpy_row = QHBoxLayout()
         scrcpy_row.addWidget(QLabel("🪞 Mirror Screen:"))
 
         fast_btn = QPushButton("⚡ Fast")
-        fast_btn.setToolTip("1 Mbps / 24 fps / 800px — for slow remote/seat connections")
-        fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=1_000_000,
-                                                                  max_fps=24, max_size=800))
+        fast_btn.setToolTip("2 Mbps / 30 fps / 800px — for slow remote/seat connections")
+        fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=2_000_000,
+                                                                  max_fps=30, max_size=800))
         scrcpy_row.addWidget(fast_btn)
 
         normal_btn = QPushButton("🎬 Normal")
-        normal_btn.setToolTip("3 Mbps / 60 fps / 1024px — recommended for local emulator & USB devices")
-        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=3_000_000,
+        normal_btn.setToolTip("6 Mbps / 60 fps / 1024px — recommended for local emulator & USB devices (crisp text)")
+        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=6_000_000,
                                                                    max_fps=60, max_size=1024))
         scrcpy_row.addWidget(normal_btn)
 
@@ -2279,7 +2281,7 @@ class ADBGUI(QMainWindow):
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
-    def _open_mirror_window(self, device_id=None, bitrate=3_000_000,
+    def _open_mirror_window(self, device_id=None, bitrate=6_000_000,
                             max_fps=60, max_size=1024, seat_context=None):
         """Open the mirror in a separate window with recording options.
 
