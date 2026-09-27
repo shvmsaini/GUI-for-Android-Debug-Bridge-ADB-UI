@@ -1252,9 +1252,12 @@ class ADBManager:
                     try:
                         avd_result = self.run_command(f"-s {device_id} emu avd name", timeout=5)
                         if avd_result['success'] and avd_result['stdout'].strip():
-                            avd_name = avd_result['stdout'].strip()
-                            # Use AVD name as the display name (more friendly than product/model)
-                            device['avd_name'] = avd_name
+                            # Parse output: first line is AVD name, subsequent lines (e.g., "OK") are status
+                            output_lines = avd_result['stdout'].strip().split('\n')
+                            avd_name = output_lines[0].strip()
+                            # Filter out empty lines and common status messages
+                            if avd_name and avd_name not in ('OK', 'ok', ''):
+                                device['avd_name'] = avd_name
                     except Exception:
                         pass
 
