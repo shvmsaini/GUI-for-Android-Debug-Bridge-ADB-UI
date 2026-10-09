@@ -111,7 +111,8 @@ class _FrameSignal(QObject):
     """Marshals video frames from the listener thread to the Qt main thread."""
     frame_ready = pyqtSignal(object)   # numpy array (BGR24)
     init_done = pyqtSignal(str)        # device name
-    error = pyqtSignal(str)            # error message
+    error = pyqtSignal(str)            # error message (auto-closes after 3s)
+    error_retry = pyqtSignal(str)      # error message (shows Retry/Close dialog)
     disconnected = pyqtSignal(str)     # error message on clean disconnect
 
 
@@ -550,7 +551,8 @@ class ScrcpyMirrorWindow(QMainWindow):
     ]
 
     def __init__(self, device_id, adb_path=None, bitrate=3_000_000,
-                 max_size=1024, max_fps=60, screenshot_path=None, parent=None, seat_info=None):
+                 max_size=1024, max_fps=60, screenshot_path=None, parent=None,
+                 seat_info=None, on_fallback_native=None):
         super().__init__(parent)
         self.device_id = device_id
         self.adb_path = adb_path
@@ -561,7 +563,13 @@ class ScrcpyMirrorWindow(QMainWindow):
         self._client = None
         self._listener_thread = None
         self._closing = False
+        self._last_frame_time = None  # Track last frame time for connection watchdog
+        self._watchdog_timer = None   # QTimer that checks for stalled connections
+        self._first_frame_received = False  # Latch set by _on_frame so the watchdog knows when to stop
         self.seat_info = seat_info
+        # Optional callback invoked when the user clicks "Open Native scrcpy"
+        # in the error dialog.  Signature: on_fallback_native(device_id) -> None
+        self._on_fallback_native = on_fallback_native
 
         # Set window title with enhanced info (device, seat, and if possible rack)
         title_parts = [f"📡 Mirror — {device_id}"]
@@ -620,6 +628,18 @@ class ScrcpyMirrorWindow(QMainWindow):
         except Exception:
             pass
 
+        # If the caller asked for an absurdly high bitrate over a seat
+        # connection, that's a near-certain way to get the 60-second
+        # no-frames timeout from py_scrcpy_sdk.  Warn in the status bar
+        # but respect the caller's choice — they may know the seat has
+        # good bandwidth.  The Retry/Close dialog (added for timeouts)
+        # gives them an out if it stalls.
+        self._is_seat = self.device_id.startswith('localhost:')
+        if self._is_seat and self.bitrate > 2_000_000:
+            print(f"🔧 [scrcpy] WARNING: bitrate={self.bitrate} over seat "
+                  f"connection {self.device_id} — likely too high; consider "
+                  f"Low/Medium preset if stream stalls")
+
         # ── video display ───────────────────────────────────────────
         self.video = VideoDisplayWidget()
         layout.addWidget(self.video, 1)
@@ -644,6 +664,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.signal.frame_ready.connect(self._on_frame)
         self.signal.init_done.connect(self._on_init)
         self.signal.error.connect(self._on_error)
+        self.signal.error_retry.connect(lambda msg: self._on_error(msg, auto_close_ms=None))
         self.signal.disconnected.connect(self._on_disconnect)
 
         # ── start streaming ─────────────────────────────────────────
@@ -710,7 +731,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
             # Construct command
             adb_bin = self.adb_path if self.adb_path else 'adb'
-            cmd = [adb_bin, 'install', '-r', '-t', apk_path]
+            cmd = [adb_bin, 'install', '-s', self.device_id, '-r', '-t', apk_path]
             print(f"🔍 DEBUG: Running: {' '.join(cmd)}")
 
             # Connect output signal for real-time progress
@@ -932,12 +953,30 @@ class ScrcpyMirrorWindow(QMainWindow):
     def _apply_settings(self):
         """Restart the mirror client with the new settings."""
         self.apply_btn.setVisible(False)
+        # Stop the first-frame watchdog — a new one starts after the
+        # restart.  Also clear the "first frame received" latch so the
+        # watchdog arms fresh for the next attempt.
+        self._stop_frame_watchdog()
+        self._first_frame_received = False
+        self._last_frame_time = None
         if self._client is not None:
             try:
                 self._client.stop()
             except Exception:
                 pass
             self._client = None
+        # Reset the video display back to "Connecting…" so the user sees
+        # that the retry is actually doing something — without this the
+        # frozen "Screen disconnected" frame stays up and looks like the
+        # button did nothing.
+        try:
+            self.video._disconnected = False
+            self.video._pixmap = None
+            self.video._last_frame_buf = None
+            self.video.update()
+        except Exception:
+            pass
+        self.status.showMessage("Reconnecting…")
         # Restart streaming — start on the next event-loop tick so the
         # previous client has a chance to fully tear down first.
         QTimer.singleShot(0, self._start_client)
@@ -1120,6 +1159,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def _start_client(self):
         """Create and start the ScrcpyClient, then listen for frames."""
+        print(f"\n🔧 [scrcpy] _start_client() called for {self.device_id}")
         ok, msg = _check_deps()
         if not ok:
             QMessageBox.warning(self, "Dependencies Missing", msg)
@@ -1144,6 +1184,10 @@ class ScrcpyMirrorWindow(QMainWindow):
         def _thread():
             try:
                 from py_scrcpy_sdk import ScrcpyClient, ScrcpyConfig  # pyrefly: ignore[missing-import]
+
+                print(f"🔧 [scrcpy] Starting client for {self.device_id} "
+                      f"(bitrate={self.bitrate}, max_size={self.max_size}, "
+                      f"max_fps={self.max_fps}, adb_path={self.adb_path})")
 
                 # Build config — always pass adb_path so py_scrcpy_sdk uses
                 # the same adb binary the app already validated.
@@ -1172,26 +1216,47 @@ class ScrcpyMirrorWindow(QMainWindow):
                 last_exc: Exception | None = None
                 for attempt in range(3):
                     if self._closing:
+                        print("🔧 [scrcpy] Closing during start retries — aborting")
                         return
                     try:
+                        print(f"🔧 [scrcpy] start() attempt {attempt + 1}/3")
                         self._client.start()
+                        print("🔧 [scrcpy] start() succeeded")
                         break
                     except Exception as e:
                         last_exc = e
+                        msg = str(e)
+                        print(f"🔧 [scrcpy] start() attempt {attempt + 1} failed: "
+                              f"{type(e).__name__}: {msg}")
                         # If the device is genuinely gone, don't waste time
                         # retrying — fail fast with a clear message.
-                        msg = str(e)
                         if "device" in msg and "not found" in msg:
+                            print("🔧 [scrcpy] Device not found — stopping retries")
                             break
                         import time as _t
                         _t.sleep(0.5)
                 else:
                     if last_exc is not None:
+                        print(f"🔧 [scrcpy] All start attempts failed: {last_exc}")
                         raise last_exc
                     raise RuntimeError("Failed to start scrcpy client")
 
                 name = self._client.device_name or self.device_id
+                print(f"🔧 [scrcpy] Connected to {name}")
                 self.signal.init_done.emit(name)
+
+                # Start the frame-arrival watchdog.  QTimer.singleShot
+                # defers the start to the next event-loop tick on the
+                # Qt main thread (it can be invoked from any thread);
+                # the timer it creates is bound to `self`, which lives
+                # on the Qt main thread, so the tick callback runs
+                # there even when the listener thread is blocked in
+                # socket reads.  Probes self._client.frame_counter /
+                # reader_error directly instead of guessing from the
+                # status bar text — that's what makes this reliable on
+                # emulators whose screen is static (scrcpy only emits
+                # a frame when the screen has changed).
+                QTimer.singleShot(0, self._start_frame_watchdog)
 
                 # Listen for frames in this thread. The callback emits
                 # each frame to the Qt main thread via signal.
@@ -1212,53 +1277,84 @@ class ScrcpyMirrorWindow(QMainWindow):
                     # Local USB device: shorter timeout, should be fast
                     frame_timeout = 30.0
 
+                print(f"🔧 [scrcpy] listen() starting — frame_timeout={frame_timeout}s")
                 self._client.listen(on_frame, timeout=frame_timeout)
+                print("🔧 [scrcpy] listen() returned normally (stream ended cleanly)")
 
             except Exception as e:
                 # If the user closed the window or restarted the client,
                 # the listen() loop will fail with a socket error — that's
                 # expected, not a real failure.
                 if self._closing:
+                    print(f"🔧 [scrcpy] Exception after closing (expected): "
+                          f"{type(e).__name__}: {e}")
                     return
                 msg = str(e)
                 exc_type = type(e).__name__
 
+                # ── Terminal diagnostics ────────────────────────────────
+                # Always log the full traceback so we can see exactly what
+                # py_scrcpy_sdk raised when the stream died.
+                print(f"\n{'='*60}")
+                print(f"🔧 [scrcpy] STREAM EXCEPTION for {self.device_id}")
+                print(f"🔧 [scrcpy]   Type:    {exc_type}")
+                print(f"🔧 [scrcpy]   Message: {msg}")
+                print(f"🔧 [scrcpy]   Traceback:")
+                tb_lines = traceback.format_exc().splitlines()
+                for _ln in tb_lines:
+                    print(f"🔧 [scrcpy]     {_ln}")
+                print(f"{'='*60}\n")
+
                 # Socket closed during shutdown / Apply-restart — not an error.
                 if "Bad file descriptor" in msg or "control socket" in msg:
+                    print("🔧 [scrcpy] Socket closed during shutdown — ignoring")
                     return
 
-                # Frame timeout — socket likely stalled (no frames arriving)
+                # Frame timeout — socket likely stalled (no frames arriving).
+                # Surface it as a Retry/Close dialog instead of auto-closing:
+                # the underlying cause is often transient (device asleep,
+                # static screen, network blip) and a fresh retry usually
+                # succeeds.  Without this the window just vanishes.
                 if exc_type == "ScrcpyTimeoutError" or "timeout" in msg.lower():
                     timeout_msg = "60 seconds" if self.device_id.startswith('localhost:') else "30 seconds"
-                    self.signal.error.emit(
+                    print(f"🔧 [scrcpy] Frame timeout after {timeout_msg} — showing Retry/Close dialog")
+                    self.signal.error_retry.emit(
                         f"Connection timeout after {timeout_msg}.\n\n"
-                        f"The device may have become unresponsive or the network "
-                        f"connection is too slow. Try:\n"
-                        f"  • Selecting a lower quality preset\n"
-                        f"  • Checking USB connection or seat network\n"
+                        f"No video frames arrived — the device screen may be off, "
+                        f"the screen content is static (scrcpy only sends frames "
+                        f"when the picture changes), or the network/seat link is "
+                        f"too slow at the current quality.\n\n"
+                        f"Try:\n"
+                        f"  • Waking the device (press Power) or tapping the screen\n"
+                        f"  • Selecting a lower quality preset (Low/Medium)\n"
+                        f"  • Lowering bitrate / FPS, then Apply\n"
                         f"  • Closing other apps using the device")
                     return
 
-                # Device disconnected — show a friendly message.
+                # Device disconnected — show a Retry/Close dialog.  The
+                # cause is often transient (the seat tunnel re-establishes,
+                # the user reconnects USB) so a retry usually works.
                 if "device" in msg and "not found" in msg:
-                    self.signal.error.emit(
+                    self.signal.error_retry.emit(
                         f"Device {self.device_id} not found.\n\n"
                         f"It may have disconnected. Refresh the device list "
                         f"and try again.")
                     return
 
-                # Socket/connection errors
+                # Socket/connection errors — also transient, show Retry/Close.
                 if any(x in msg.lower() for x in ["socket", "connection", "disconnected", "refused"]):
-                    self.signal.error.emit(
+                    self.signal.error_retry.emit(
                         f"Connection error: {msg[:100]}\n\n"
                         f"The device connection was lost. This can happen if:\n"
                         f"  • USB cable is disconnected\n"
                         f"  • Network connection (seat) is unstable\n"
-                        f"  • Device went to sleep or powered off")
+                        f"  • Device went to sleep or powered off\n\n"
+                        f"Tap Retry to restart the mirror.")
                     return
 
-                # Generic error with full traceback for debugging
-                self.signal.error.emit(
+                # Generic error with full traceback for debugging — also
+                # promoted to a dialog so the user can copy the traceback.
+                self.signal.error_retry.emit(
                     f"{exc_type}: {msg}\n\n{traceback.format_exc()}"
                 )
 
@@ -1269,6 +1365,7 @@ class ScrcpyMirrorWindow(QMainWindow):
     def _on_frame(self, frame_array):
         """Receive a frame in the Qt main thread and render it."""
         try:
+            import time as _time
             self.video.update_frame(frame_array)
             try:
                 h, w = frame_array.shape[:2]
@@ -1278,6 +1375,11 @@ class ScrcpyMirrorWindow(QMainWindow):
             # Update status to "Streaming" once we receive the first frame
             if self.status.currentMessage() != "Streaming…":
                 self.status.showMessage("Streaming…")
+            # Mark that we received a frame (used by the connection watchdog)
+            self._last_frame_time = _time.time()
+            # Tell the watchdog we're streaming — it can stop now even if
+            # it never got a chance to read frame_counter directly.
+            self._first_frame_received = True
         except RuntimeError:
             # Widget was deleted between signal emission and delivery.
             pass
@@ -1302,10 +1404,181 @@ class ScrcpyMirrorWindow(QMainWindow):
         except RuntimeError:
             pass
 
-    def _on_error(self, error_msg):
-        try:
+    def _start_frame_watchdog(self):
+        """Start a two-stage watchdog for the video stream.
+
+        Stage 1 — first frame wait (10 s).  Covers normal startup
+        (typically <5 s); if no frame arrives in this window the device
+        is likely asleep or showing a static screen and we surface a
+        Retry/Close dialog so the user can wake the device and try again.
+
+        Stage 2 — stall detection (15 s for local USB, 30 s for seat
+        connections).  Once frames are flowing, if no *new* frame
+        arrives for this long, we treat it as a stream stall and again
+        show a Retry/Close dialog.  This catches the case where the
+        emulator screen goes static mid-session or the seat tunnel
+        dies after a successful start.
+
+        Driven by a QTimer on the Qt main thread (QTimer bound to
+        `self` ticks in the receiver's thread).  Probes the SDK client
+        directly when possible instead of guessing from status text —
+        that makes detection reliable even when no frames ever arrive
+        (frame_counter stays at 0 but the socket might still be alive).
+        """
+        if self._closing:
+            return
+        import time as _time
+        if self._last_frame_time is None:
+            self._last_frame_time = _time.time()
+
+        def _check():
             if self._closing:
                 return
+
+            client = self._client
+
+            # ── Stage 1: first frame wait ──────────────────────────
+            if not getattr(self, '_first_frame_received', False):
+                # If the SDK's decode thread surfaced a real error, report
+                # it now instead of waiting for the per-frame timeout.
+                if client is not None:
+                    reader_error = getattr(client, 'reader_error', None)
+                    if reader_error is not None:
+                        print(f"\n{'─'*60}")
+                        print(f"🔧 [scrcpy] WATCHDOG stage1: client.reader_error = {reader_error}")
+                        print(f"{'─'*60}\n")
+                        self._stop_frame_watchdog()
+                        self._on_error(
+                            f"Video reader failed: {reader_error}",
+                            auto_close_ms=None,
+                        )
+                        return
+
+                    # frame_counter > 0 means the decode thread produced
+                    # at least one frame; if _on_frame hasn't fired yet,
+                    # we've already missed it visually but the stream is
+                    # alive — treat as streaming.
+                    if getattr(client, 'frame_counter', 0) > 0:
+                        print(f"🔧 [scrcpy] WATCHDOG stage1: frame_counter > 0, "
+                              f"treating as streaming")
+                        self._first_frame_received = True
+                        # Don't stop the watchdog — it now watches for stalls.
+                        return
+
+                elapsed = _time.time() - (self._last_frame_time or _time.time())
+                if elapsed > 10.0:
+                    self._stop_frame_watchdog()
+                    self._first_frame_received = False
+                    print(f"\n{'─'*60}")
+                    print(f"🔧 [scrcpy] WATCHDOG stage1 FIRED — no frame after {elapsed:.1f}s")
+                    if client is not None:
+                        print(f"🔧 [scrcpy]   client.frame_counter: "
+                              f"{getattr(client, 'frame_counter', '?')}")
+                        print(f"🔧 [scrcpy]   client.reader_error:  "
+                              f"{getattr(client, 'reader_error', '?')}")
+                    print(f"{'─'*60}\n")
+                    self._on_error(
+                        "Video stream failed to start after 10 seconds.\n\n"
+                        "The scrcpy server connected but no frames are "
+                        "arriving. This usually means:\n"
+                        "  • The device screen is off — press the power "
+                        "button on the device to wake it\n"
+                        "  • The screen is showing a static image (lock "
+                        "screen, finished loading) — tap or swipe on the "
+                        "device to force a redraw\n"
+                        "  • The network connection (seat) is unstable\n"
+                        "  • py_scrcpy_sdk native libraries failed to "
+                        "initialize\n\n"
+                        "Tap Retry to try again.",
+                        auto_close_ms=None,
+                    )
+                    return
+                # Stage 1, still within first-frame window — keep checking.
+                return
+
+            # ── Stage 2: stall detection ────────────────────────────
+            # We're streaming.  If no new frame has arrived within the
+            # stall threshold (longer for seats), the connection has
+            # likely stalled or the device screen went static for too
+            # long.  Show a Retry/Close dialog.
+            stall_threshold = (
+                30.0 if self.device_id.startswith('localhost:') else 15.0
+            )
+            since_last = _time.time() - (self._last_frame_time or _time.time())
+            if since_last > stall_threshold:
+                self._stop_frame_watchdog()
+                self._first_frame_received = False
+                print(f"\n{'─'*60}")
+                print(f"🔧 [scrcpy] WATCHDOG stage2 FIRED — no frame for "
+                      f"{since_last:.1f}s (threshold {stall_threshold:.0f}s)")
+                if client is not None:
+                    print(f"🔧 [scrcpy]   client.frame_counter: "
+                          f"{getattr(client, 'frame_counter', '?')}")
+                    print(f"🔧 [scrcpy]   client.reader_error:  "
+                          f"{getattr(client, 'reader_error', '?')}")
+                print(f"{'─'*60}\n")
+                # If the SDK has a real reader error, surface it as the
+                # root cause; otherwise describe it as a stall.
+                reader_error = getattr(client, 'reader_error', None) if client else None
+                if reader_error is not None:
+                    detail = f"Video reader error: {reader_error}"
+                else:
+                    detail = (
+                        f"No new video frames for {stall_threshold:.0f} seconds. "
+                        f"The device screen may be static (scrcpy only sends "
+                        f"frames when the picture changes) or the seat link "
+                        f"may have stalled."
+                    )
+                self._on_error(
+                    f"Video stream stalled.\n\n{detail}\n\n"
+                    f"Try:\n"
+                    f"  • Tapping or swiping on the device to force a redraw\n"
+                    f"  • Waking the device (press Power)\n"
+                    f"  • Selecting a lower quality preset, then Apply\n"
+                    f"  • Retrying — the connection will be restarted",
+                    auto_close_ms=None,
+                )
+                return
+
+        # Check every 2 seconds.
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.timeout.connect(_check)
+        self._watchdog_timer.start(2000)
+
+    def _stop_frame_watchdog(self):
+        """Stop the frame-arrival watchdog timer."""
+        if self._watchdog_timer is not None:
+            try:
+                self._watchdog_timer.stop()
+                self._watchdog_timer.deleteLater()
+            except Exception:
+                pass
+            self._watchdog_timer = None
+
+    def _on_error(self, error_msg, auto_close_ms=3000):
+        """Show an error and (by default) auto-close the window after a few seconds.
+
+        Pass ``auto_close_ms=None`` to keep the window open and offer
+        the user a Retry / Close choice — useful when the failure is
+        likely transient (e.g. device showing a static screen).
+        """
+        print(f"\n{'─'*60}")
+        print(f"🔧 [scrcpy] _on_error called")
+        print(f"🔧 [scrcpy]   auto_close_ms: {auto_close_ms}")
+        print(f"🔧 [scrcpy]   message:")
+        for _ln in error_msg.splitlines():
+            print(f"🔧 [scrcpy]     {_ln}")
+        print(f"{'─'*60}\n")
+        try:
+            if self._closing:
+                print("🔧 [scrcpy] _on_error: already closing — ignoring")
+                return
+            # Guard against re-entrant calls: while the Retry dialog is
+            # open (modal), the old listener thread may exit with an
+            # exception and emit another error signal.  Ignore it.
+            if getattr(self, '_error_dialog_active', False):
+                return
+            self._error_dialog_active = True
             # Show disconnection message on the video display
             self.video.set_disconnected()
             self.status.showMessage(f"Error: {error_msg[:80]}")
@@ -1313,14 +1586,75 @@ class ScrcpyMirrorWindow(QMainWindow):
                 btn.setEnabled(False)
             # Removed: dpad button disabling (keyboard-controlled only)
             self.screenshot_btn.setEnabled(False)
-            # Keep window open briefly so user can see the message, then close
-            QTimer.singleShot(3000, self.close)
+
+            if auto_close_ms is None:
+                # Keep window open so the user can retry.
+                self._show_error_with_retry(error_msg)
+            else:
+                # Auto-close after a short delay so the user can read the message.
+                QTimer.singleShot(auto_close_ms, self.close)
+            # Dialog finished — allow future errors to be shown.
+            self._error_dialog_active = False
+        except RuntimeError:
+            pass
+
+    def _show_error_with_retry(self, error_msg):
+        """Show the error in a modal dialog with Retry / Native / Close buttons.
+
+        Used when the watchdog fired because no frames arrived — the
+        underlying cause is often transient (device asleep, static
+        screen) and a fresh retry usually succeeds.  If the embedded
+        mirror keeps failing, the user can fall back to the native
+        scrcpy binary for the same device.
+        """
+        try:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Mirror Error")
+            box.setText(error_msg)
+            # Standard Retry / Close buttons.
+            retry_btn = box.addButton(
+                "Retry", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+            # Optional "Open Native scrcpy" button — only shown when
+            # the parent provided a fallback callback.
+            native_btn = None
+            if self._on_fallback_native is not None:
+                native_btn = box.addButton(
+                    "Open Native scrcpy", QMessageBox.ButtonRole.ActionRole)
+            box.setDefaultButton(retry_btn)
+            box.exec()
+            if native_btn is not None and box.clickedButton() is native_btn:
+                # Close the embedded mirror first, then launch the
+                # native scrcpy binary for the same device.
+                self._closing = True
+                self._stop_frame_watchdog()
+                if self._client is not None:
+                    try:
+                        self._client.stop()
+                    except Exception:
+                        pass
+                    self._client = None
+                try:
+                    self._on_fallback_native(self.device_id)
+                except Exception:
+                    pass
+                self.close()
+            elif box.clickedButton() is retry_btn:
+                # Restart the client — Apply-style restart.
+                self._apply_settings()
+            else:
+                self.close()
         except RuntimeError:
             pass
 
     def _on_disconnect(self, error_msg):
+        print(f"\n{'─'*60}")
+        print(f"🔧 [scrcpy] _on_disconnect called: {error_msg}")
+        print(f"{'─'*60}\n")
         try:
             if self._closing:
+                print("🔧 [scrcpy] _on_disconnect: already closing — ignoring")
                 return
             # Show disconnection message on the video display
             self.video.set_disconnected()
@@ -1541,6 +1875,8 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
+        # Stop the frame-arrival watchdog so it doesn't fire on a deleted widget
+        self._stop_frame_watchdog()
         # Disconnect signals so no more callbacks fire on a deleted widget.
         try:
             self.signal.frame_ready.disconnect(self._on_frame)
