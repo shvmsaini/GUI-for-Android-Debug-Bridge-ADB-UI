@@ -1185,8 +1185,9 @@ class ScrcpyMirrorWindow(QMainWindow):
                 color: #e0e0e0;
                 border: 1px solid #555555;
                 border-radius: 4px;
-                padding: 4px 16px;
-                min-width: 60px;
+                padding: 6px 12px;
+                font-size: 10pt;
+                font-weight: bold;
             }}
             QMessageBox QPushButton:hover {{
                 background-color: {self._BTN_HOVER};

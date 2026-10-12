@@ -47,6 +47,33 @@ except ImportError:
 # Application version - single source of truth. Bump on release.
 APP_VERSION = "1.1.0"
 
+# Enable faulthandler to capture native crashes (SIGSEGV, SIGABRT, etc.)
+# This writes a traceback to a file on hard crashes that excepthook can't catch.
+import faulthandler
+import traceback as _traceback_mod
+
+# Determine the crash log directory early (same location as settings)
+if sys.platform == 'darwin':
+    _crash_log_dir = os.path.expanduser("~/Library/Application Support/ADB-GUI-UI")
+elif sys.platform == 'win32':
+    _crash_log_dir = os.path.join(os.environ.get('APPDATA', ''), 'ADB-GUI-UI')
+else:
+    _crash_log_dir = os.path.expanduser("~/.config/ADB-GUI-UI")
+
+# Ensure the directory exists
+try:
+    os.makedirs(_crash_log_dir, exist_ok=True)
+except Exception:
+    _crash_log_dir = tempfile.gettempdir()  # Fallback to temp dir
+
+# Path for faulthandler to write native crash traces
+_FAULTHANDLER_LOG_PATH = os.path.join(_crash_log_dir, "faulthandler_crash.log")
+try:
+    _faulthandler_file = open(_FAULTHANDLER_LOG_PATH, 'w', encoding='utf-8')
+    faulthandler.enable(_faulthandler_file)
+except Exception:
+    faulthandler.enable()  # If file open fails, use stderr
+
 
 class _SignalEmitter(QObject):
     """Thread-safe signal emitter for marshaling calls from background threads."""
@@ -1121,7 +1148,104 @@ class ADBManager:
                     self.adb_path = candidate
                     return True
         return False
-    
+
+    def ensure_reverse_tunnel_works(self, device_id):
+        """Workaround for adb bug where `adb reverse` fails with 'more than one device/emulator'.
+
+        adb 1.0.41 has a known bug where reverse tunnels fail on localhost
+        network connections, even when only one device is connected and
+        -s is used explicitly. The fix is to restart the adb server,
+        which clears any stale device state in adb's internal tracking.
+
+        This is called before starting the scrcpy mirror so we don't get
+        stuck on 'socket closed while reading scrcpy stream' errors.
+
+        Returns True if reverse tunnels work (either already worked or
+        we fixed them), False if the device is unreachable.
+        """
+        # Only relevant for network seat connections (localhost:port)
+        # where the bug manifests. USB/emulator devices don't hit this.
+        if not device_id.startswith('localhost:'):
+            return True
+
+        # Test if reverse tunnel already works
+        test_cmd = [self.adb_path, '-s', device_id,
+                    'reverse', 'localabstract:scrcpy_test_probe',
+                    'tcp:1']
+        try:
+            result = subprocess.run(test_cmd, capture_output=True,
+                                    text=True, timeout=5)
+            if result.returncode == 0:
+                # Works! Clean up the test tunnel and return.
+                subprocess.run([self.adb_path, '-s', device_id,
+                                'reverse', '--remove',
+                                'localabstract:scrcpy_test_probe'],
+                               capture_output=True, timeout=5)
+                return True
+
+            # Check if the failure is the bug we're fixing
+            err = (result.stderr or result.stdout or '').strip()
+            if 'more than one device' not in err.lower():
+                # Some other error (e.g. device not found). Don't restart
+                # adb server — let the caller handle it.
+                print(f"🔧 [adb] reverse test failed (not the 'more than one "
+                      f"device' bug): {err}")
+                return False
+
+            print(f"🔧 [adb] Hit the 'more than one device' bug — restarting "
+                  f"adb server to fix")
+
+        except subprocess.TimeoutExpired:
+            print(f"🔧 [adb] reverse test timed out — device may be unreachable")
+            return False
+        except Exception as e:
+            print(f"🔧 [adb] reverse test exception: {e}")
+            return False
+
+        # Kill and restart adb server to clear the stale state
+        try:
+            subprocess.run([self.adb_path, 'kill-server'],
+                           capture_output=True, timeout=5)
+            import time as _t
+            _t.sleep(0.5)  # Give the server a moment to die
+            subprocess.run([self.adb_path, 'start-server'],
+                           capture_output=True, timeout=5)
+            _t.sleep(0.5)
+        except Exception as e:
+            print(f"🔧 [adb] Failed to restart adb server: {e}")
+            return False
+
+        # Reconnect to the network seat
+        if ':' in device_id:
+            host, _, port = device_id.partition(':')
+            try:
+                subprocess.run([self.adb_path, 'connect', f'{host}:{port}'],
+                               capture_output=True, timeout=5)
+                _t.sleep(0.5)
+            except Exception as e:
+                print(f"🔧 [adb] Failed to reconnect to {device_id}: {e}")
+                return False
+
+        # Retry the reverse tunnel test
+        try:
+            result = subprocess.run(test_cmd, capture_output=True,
+                                    text=True, timeout=5)
+            if result.returncode == 0:
+                # Fixed! Clean up the test tunnel.
+                subprocess.run([self.adb_path, '-s', device_id,
+                                'reverse', '--remove',
+                                'localabstract:scrcpy_test_probe'],
+                               capture_output=True, timeout=5)
+                print(f"🔧 [adb] reverse tunnel works after adb server restart ✓")
+                return True
+            else:
+                err = (result.stderr or result.stdout or '').strip()
+                print(f"🔧 [adb] reverse still failing after restart: {err}")
+                return False
+        except Exception as e:
+            print(f"🔧 [adb] reverse retry exception: {e}")
+            return False
+
     def run_command(self, command, timeout=30):
         """Run ADB command and return result"""
         try:
@@ -1261,7 +1385,18 @@ class ADBManager:
                     except Exception:
                         pass
 
-        return devices
+        # Filter to only include usable devices (online or needing authorization).
+        # Exclude offline/unknown devices that can't be used and cause confusion.
+        # Status values: 'device' (online), 'offline' (unreachable), 'unknown' (no status),
+        # 'unauthorized' (needs permission), 'no device', etc.
+        usable_devices = [
+            d for d in devices
+            if d.get('status') in ('device', 'unauthorized')
+        ]
+
+        # If all devices were filtered out (all offline/unknown), return empty list
+        # rather than falling back to the unfiltered list
+        return usable_devices
 
     def get_device_info(self, device_id):
         """Get device information"""
@@ -2089,6 +2224,9 @@ class ADBGUI(QMainWindow):
         self.mirror_client = None
         self.mirror_thread = None
         self.mirror_closing = False
+        self.mirror_watchdog_timer = None  # QTimer probing mirror_client for first-frame stall
+        self.mirror_first_frame_received = False  # Latch set by _on_mirror_frame
+        self.mirror_last_frame_time = None  # Used by the in-window mirror watchdog
 
         if _VideoDisplayWidget is not None:
             self.mirror_video = _VideoDisplayWidget()
@@ -2348,6 +2486,13 @@ class ADBGUI(QMainWindow):
 
         adb_path = getattr(self.adb, 'adb_path', 'adb')
 
+        # Workaround adb 1.0.41 bug where 'adb reverse' fails with
+        # 'more than one device/emulator' on localhost:PORT connections.
+        # This clears any stale device state in adb's internal tracking
+        # so py_scrcpy_sdk can establish the reverse tunnel.
+        if hasattr(self.adb, 'ensure_reverse_tunnel_works'):
+            self.adb.ensure_reverse_tunnel_works(device_id)
+
         # py_scrcpy_sdk's native libraries (PyAV/FFmpeg, numpy C core) can
         # intermittently SIGSEGV during initialization on macOS. Retry a
         # few times — most attempts succeed.
@@ -2362,6 +2507,7 @@ class ADBGUI(QMainWindow):
                     max_fps=max_fps,
                     screenshot_path=self.settings.get('screenshot_path', ''),
                     seat_info=seat_context,
+                    on_fallback_native=lambda did: self.scrcpy_device(device_id=did),
                 )
                 win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
                 win.show()
@@ -4026,27 +4172,29 @@ class ADBGUI(QMainWindow):
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
-        
+
         file_path, _ = QFileDialog.getOpenFileName(self, "Select file to push")
         if not file_path:
             return
-        
+
         dest_path, ok = QInputDialog.getText(self, "Destination", "Enter destination path on device (e.g., /sdcard/file.txt):")
         if not ok or not dest_path:
             return
-        
+
         self.log(f"Pushing {file_path} to {dest_path}...")
         self.update_status("Pushing file...")
-        
+
         def do_push():
-            result = self.adb.run_command(f"{self.get_device_flag()} push {file_path} {dest_path}")
+            # Use shlex.quote to properly handle file paths with spaces
+            cmd = f"{self.get_device_flag()} push {shlex.quote(file_path)} {shlex.quote(dest_path)}"
+            result = self.adb.run_command(cmd)
             if result['success']:
                 self.log("File pushed successfully")
                 self.update_status("File pushed successfully")
             else:
                 self.log(f"Error: {result['stderr']}", "ERROR")
                 self.update_status("Failed to push file")
-        
+
         threading.Thread(target=do_push, daemon=True).start()
     
     def pull_file(self):
@@ -4054,27 +4202,29 @@ class ADBGUI(QMainWindow):
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
-        
+
         device_path, ok = QInputDialog.getText(self, "Source", "Enter file path on device (e.g., /sdcard/file.txt):")
         if not ok or not device_path:
             return
-        
+
         dest_path, _ = QFileDialog.getSaveFileName(self, "Save file as")
         if not dest_path:
             return
-        
+
         self.log(f"Pulling {device_path} to {dest_path}...")
         self.update_status("Pulling file...")
-        
+
         def do_pull():
-            result = self.adb.run_command(f"{self.get_device_flag()} pull {device_path} {dest_path}")
+            # Use shlex.quote to properly handle file paths with spaces
+            cmd = f"{self.get_device_flag()} pull {shlex.quote(device_path)} {shlex.quote(dest_path)}"
+            result = self.adb.run_command(cmd)
             if result['success']:
                 self.log("File pulled successfully")
                 self.update_status("File pulled successfully")
             else:
                 self.log(f"Error: {result['stderr']}", "ERROR")
                 self.update_status("Failed to pull file")
-        
+
         threading.Thread(target=do_pull, daemon=True).start()
 
     def open_file_explorer(self):
@@ -4272,7 +4422,9 @@ class ADBGUI(QMainWindow):
                         # Upload folder with its contents using adb push
                         folder_name = os.path.basename(lp.rstrip(os.sep))
                         # Push the folder itself: adb push <local_folder> <remote_dir>/
-                        res = self.adb.run_command(f"{self.get_device_flag()} push {lp} {dest_dir}/", timeout=300)
+                        # Use shlex.quote to properly handle paths with spaces
+                        cmd = f"{self.get_device_flag()} push {shlex.quote(lp)} {shlex.quote(dest_dir)}/"
+                        res = self.adb.run_command(cmd, timeout=300)
                         if res["success"]:
                             ok += 1
                             self.log(f"Uploaded folder: {folder_name}", "INFO")
@@ -4282,7 +4434,9 @@ class ADBGUI(QMainWindow):
                             self.log(f"Upload failed for folder {lp}: {err}", "ERROR")
                     else:
                         # Upload single file
-                        res = self.adb.run_command(f"{self.get_device_flag()} push {lp} {dest_dir}/", timeout=120)
+                        # Use shlex.quote to properly handle paths with spaces
+                        cmd = f"{self.get_device_flag()} push {shlex.quote(lp)} {shlex.quote(dest_dir)}/"
+                        res = self.adb.run_command(cmd, timeout=120)
                         if res["success"]:
                             ok += 1
                         else:
@@ -4377,7 +4531,9 @@ class ADBGUI(QMainWindow):
                 ok = 0
                 failed = 0
                 for rp in remote_paths:
-                    res = self.adb.run_command(f"{self.get_device_flag()} pull {rp} {dest}", timeout=300)
+                    # Use shlex.quote to properly handle paths with spaces
+                    cmd = f"{self.get_device_flag()} pull {shlex.quote(rp)} {shlex.quote(dest)}"
+                    res = self.adb.run_command(cmd, timeout=300)
                     if res["success"]:
                         ok += 1
                     else:
@@ -4529,16 +4685,18 @@ class ADBGUI(QMainWindow):
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
-        
+
         apk_path, _ = QFileDialog.getOpenFileName(self, "Select APK file", "", "APK files (*.apk);;All files (*.*)")
         if not apk_path:
             return
-        
+
         self.log(f"Installing {apk_path}...")
         self.update_status("Installing APK...")
-        
+
         def do_install():
-            result = self.adb.run_command(f"{self.get_device_flag()} install {apk_path}", timeout=120)
+            # Use shlex.quote to properly handle APK paths with spaces
+            cmd = f"{self.get_device_flag()} install {shlex.quote(apk_path)}"
+            result = self.adb.run_command(cmd, timeout=120)
             if result['success']:
                 self.log("APK installed successfully")
                 self.update_status("APK installed successfully")
@@ -4547,7 +4705,7 @@ class ADBGUI(QMainWindow):
                 self.log(f"Error: {result['stderr']}", "ERROR")
                 self.update_status("Failed to install APK")
                 QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to install APK:\n{result['stderr']}"))
-        
+
         threading.Thread(target=do_install, daemon=True).start()
     
     def uninstall_app(self):
@@ -4899,7 +5057,9 @@ class ADBGUI(QMainWindow):
 
             # Step 2: Pull the base APK to the user-selected location
             self.log(f"Pulling base APK to {local_apk}...")
-            result = self.adb.run_command(f"{self.get_device_flag()} pull {base_apk_path} {local_apk}")
+            # Use shlex.quote to properly handle paths with spaces
+            cmd = f"{self.get_device_flag()} pull {shlex.quote(base_apk_path)} {shlex.quote(local_apk)}"
+            result = self.adb.run_command(cmd)
 
             if result['success']:
                 file_size = os.path.getsize(local_apk) if os.path.exists(local_apk) else 0
@@ -5252,9 +5412,11 @@ class ADBGUI(QMainWindow):
                     
                     local_apk = os.path.join(apks_dir, filename)
                     local_apks.append(local_apk)
-                    
+
                     self.log(f"Pulling APK {i+1}/{len(apk_paths)}: {os.path.basename(apk_path)}...")
-                    result = self.adb.run_command(f"{self.get_device_flag()} pull {apk_path} {local_apk}")
+                    # Use shlex.quote to properly handle paths with spaces
+                    cmd = f"{self.get_device_flag()} pull {shlex.quote(apk_path)} {shlex.quote(local_apk)}"
+                    result = self.adb.run_command(cmd)
                     if not result['success']:
                         error_msg = result['stderr'] or "Unknown error"
                         self.log(f"Error pulling APK {i+1}: {error_msg}", "ERROR")
@@ -5281,18 +5443,19 @@ class ADBGUI(QMainWindow):
                     self.log("Continuing with installation despite uninstall error...", "WARNING")
                 else:
                     self.log("App uninstalled successfully")
-                
+
                 # Step 4: Install APK(s)
                 self.log(f"Installing {package_name}...")
-                
+
                 # Use install-multiple for split APKs, regular install for single APK
                 if len(local_apks) > 1:
                     # Install multiple APKs using install-multiple
-                    apk_list = ' '.join(local_apks)
+                    # Use shlex.quote to properly handle paths with spaces
+                    apk_list = ' '.join(shlex.quote(apk) for apk in local_apks)
                     result = self.adb.run_command(f"{self.get_device_flag()} install-multiple {apk_list}", timeout=180)
                 else:
                     # Single APK - use regular install
-                    result = self.adb.run_command(f"{self.get_device_flag()} install {local_apks[0]}", timeout=120)
+                    result = self.adb.run_command(f"{self.get_device_flag()} install {shlex.quote(local_apks[0])}", timeout=120)
                 
                 if result['success']:
                     self.log("App reinstalled successfully")
@@ -5911,6 +6074,10 @@ class ADBGUI(QMainWindow):
             return  # already running
 
         self.mirror_closing = False
+        # Reset watchdog latches for a fresh attempt.
+        self.mirror_first_frame_received = False
+        self.mirror_last_frame_time = None
+        self._stop_mirror_watchdog()
 
         # Eagerly import in the main thread to avoid native-lib init
         # races in background threads on macOS.
@@ -5923,6 +6090,19 @@ class ADBGUI(QMainWindow):
 
         device_id = self.current_device
         adb_path = getattr(self.adb, 'adb_path', 'adb')
+
+        # Workaround adb 1.0.41 bug where 'adb reverse' fails with
+        # 'more than one device/emulator' on localhost:PORT connections.
+        # This clears any stale device state in adb's internal tracking
+        # so py_scrcpy_sdk can establish the reverse tunnel.
+        if hasattr(self.adb, 'ensure_reverse_tunnel_works'):
+            self.adb.ensure_reverse_tunnel_works(device_id)
+
+        # Start the first-frame watchdog before the listener thread
+        # launches.  It runs on the Qt main thread (QTimer bound to
+        # self) and probes mirror_client.frame_counter / reader_error
+        # directly — same pattern as the standalone mirror window.
+        self._start_mirror_watchdog()
 
         def _thread():
             try:
@@ -5994,6 +6174,10 @@ class ADBGUI(QMainWindow):
     def _stop_in_window_mirror(self):
         """Stop the in-window scrcpy client."""
         self.mirror_closing = True
+        # Stop the first-frame watchdog so it doesn't fire after teardown.
+        self._stop_mirror_watchdog()
+        self.mirror_first_frame_received = False
+        self.mirror_last_frame_time = None
         if self.mirror_client is not None:
             try:
                 self.mirror_client.stop()
@@ -6016,6 +6200,10 @@ class ADBGUI(QMainWindow):
                 self.mirror_video.set_device_resolution(w, h)
             except Exception:
                 pass
+            # Mark first-frame for the watchdog.
+            import time as _t
+            self.mirror_last_frame_time = _t.time()
+            self.mirror_first_frame_received = True
         except RuntimeError:
             pass
 
@@ -6037,10 +6225,81 @@ class ADBGUI(QMainWindow):
     def _on_mirror_error(self, error_msg):
         """Mirror error — log it and switch back to logs."""
         try:
+            # Stop the watchdog so it doesn't fire after the user already saw this.
+            self._stop_mirror_watchdog()
+            self.mirror_first_frame_received = False
             self.log(f"Mirror error: {error_msg}", "ERROR")
             self.update_status("Mirror error — see logs")
         except RuntimeError:
             pass
+
+    def _start_mirror_watchdog(self):
+        """Probe mirror_client state every 2s and surface a clear error
+        when no frame has arrived within 10 seconds.
+
+        Without this, an emulator showing a static screen hangs the
+        in-window mirror at "Connecting…" / blank video indefinitely,
+        because the SDK's decode thread blocks in socket reads without
+        raising.  Mirrors the pattern used by the standalone window
+        (scrcpy_mirror.py:_start_frame_watchdog).
+        """
+        try:
+            if self.mirror_closing:
+                return
+            import time as _t
+            if self.mirror_last_frame_time is None:
+                self.mirror_last_frame_time = _t.time()
+
+            def _check():
+                if self.mirror_closing:
+                    return
+                # Already streaming? Stop the watchdog.
+                if self.mirror_first_frame_received:
+                    self._stop_mirror_watchdog()
+                    return
+
+                # Real SDK error? Surface it now.
+                client = self.mirror_client
+                if client is not None:
+                    reader_error = getattr(client, 'reader_error', None)
+                    if reader_error is not None:
+                        self._stop_mirror_watchdog()
+                        self._on_mirror_error(
+                            f"Video reader failed: {reader_error}"
+                        )
+                        return
+                    if getattr(client, 'frame_counter', 0) > 0:
+                        self.mirror_first_frame_received = True
+                        self._stop_mirror_watchdog()
+                        return
+
+                # No frame yet — check elapsed time.
+                elapsed = _t.time() - (self.mirror_last_frame_time or _t.time())
+                if elapsed > 10.0:
+                    self._stop_mirror_watchdog()
+                    self._on_mirror_error(
+                        "Video stream failed to start after 10 seconds. "
+                        "The device screen may be off (press the power "
+                        "button on the device) or showing a static image "
+                        "(tap the device to force a redraw)."
+                    )
+                    return
+
+            self.mirror_watchdog_timer = QTimer(self)
+            self.mirror_watchdog_timer.timeout.connect(_check)
+            self.mirror_watchdog_timer.start(2000)
+        except Exception:
+            pass
+
+    def _stop_mirror_watchdog(self):
+        """Stop the in-window mirror first-frame watchdog."""
+        if self.mirror_watchdog_timer is not None:
+            try:
+                self.mirror_watchdog_timer.stop()
+                self.mirror_watchdog_timer.deleteLater()
+            except Exception:
+                pass
+            self.mirror_watchdog_timer = None
 
     def _mirror_press_key(self, keycode):
         """Send a keyevent via the scrcpy control socket."""
@@ -6116,7 +6375,7 @@ class ADBGUI(QMainWindow):
         else:
             self.log(f"Failed to expand notifications: {result.get('stderr', '')}", "ERROR")
 
-    def scrcpy_device(self, bitrate='3m', max_fps=60):
+    def scrcpy_device(self, bitrate='3m', max_fps=60, device_id=None):
         """Mirror device screen using scrcpy.
 
         Defaults are tuned for *local* mirroring (emulator / USB-connected
@@ -6124,14 +6383,19 @@ class ADBGUI(QMainWindow):
         and 60 fps matches the typical emulator refresh rate so taps feel
         immediate. Pass bitrate='1m' for bandwidth-sensitive seat/remote
         connections.
+
+        ``device_id`` may be passed explicitly (used by the embedded
+        mirror's "Open Native scrcpy" fallback, which may fire after the
+        user has selected a different device in the main UI).
         """
-        if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
-            return
+        if device_id is None:
+            if not self.current_device:
+                QMessageBox.warning(self, "No Device", "Please select a device first")
+                return
+            device_id = self.current_device
 
         # Refuse duplicate scrcpy for the same device. If one is already
         # running, just bring its window to the front.
-        device_id = self.current_device
         existing = self.scrcpy_procs.get(device_id)
         if existing is not None:
             if existing.poll() is None:
@@ -6189,6 +6453,17 @@ class ADBGUI(QMainWindow):
             # Ensure scrcpy subprocess can find adb even when the GUI was launched
             # from a non-interactive shell that didn't source .zshrc / .bashrc.
             env = os.environ.copy()
+            # Sanitize env: subprocess.Popen requires all env values to be strings.
+            # Some GUI frameworks or parent processes can leave boolean values in
+            # os.environ (e.g. PyQt6 on certain platforms), which causes
+            # "expected str, bytes or os.PathLike object, not bool" errors.
+            for key, value in list(env.items()):
+                if not isinstance(value, str):
+                    # Convert to string, or drop the var if conversion fails
+                    try:
+                        env[key] = str(value)
+                    except Exception:
+                        del env[key]
             extra_paths = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']
             current = env.get('PATH', '')
             for p in extra_paths:
@@ -6221,15 +6496,21 @@ class ADBGUI(QMainWindow):
         # "Unexpected additional argument: <fps>".
         cmd_base.extend(['--max-fps', str(max_fps)])
 
+        # Sanitize: subprocess.Popen requires all args to be strings. If any
+        # arg is a bool/None/int, it causes "expected str, bytes or os.PathLike
+        # object, not X" errors. Convert defensively.
+        cmd_base = [str(arg) for arg in cmd_base]
+
         cmd_with_adb = None
         # Resolve adb_path: if it's just "adb" and not on PATH, try `which adb` ourselves.
         if isinstance(adb_path, str) and adb_path and not os.path.isabs(adb_path):
             resolved = shutil.which(adb_path)
             if resolved:
                 adb_path = resolved
-        if isinstance(adb_path, str) and adb_path and os.path.exists(adb_path):
-            # scrcpy uses "--adb <path>" (not "--adb=<path>") on many versions
-            cmd_with_adb = cmd_base + ['--adb', adb_path]
+
+        # Note: scrcpy 4.1+ removed the --adb flag. We use the ADB environment
+        # variable instead, which all modern scrcpy versions support. The
+        # env var is already set in the launch() function below.
 
         self.log(f"Launching scrcpy for {device_id}...")
         self.update_status("Launching scrcpy...")
@@ -6253,46 +6534,25 @@ class ADBGUI(QMainWindow):
 
         def do_launch():
             try:
-                if cmd_with_adb:
-                    # Start once, quickly detect unsupported option, then fall back.
-                    p = launch(cmd_with_adb, capture=True)
-                    time.sleep(0.25)
-                    if p.poll() is not None:
-                        stderr = (p.stderr.read() if p.stderr else '') or ''
-                        if 'unrecognized option' in stderr.lower() and '--adb' in stderr:
-                            self.log("scrcpy does not support '--adb'. Launching without it.", "WARNING")
-                            QTimer.singleShot(0, lambda: self.update_status("Launching scrcpy (fallback)..."))
-                            # Capture stderr on the fallback too so we don't fail silently.
-                            p2 = launch(cmd_base, capture=True)
-                            time.sleep(0.5)
-                            if p2.poll() is not None:
-                                err2 = (p2.stderr.read() if p2.stderr else '') or ''
-                                msg2 = err2.strip() or "scrcpy exited immediately."
-                                self.log(f"scrcpy failed to start: {msg2}", "ERROR")
-                                QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
-                                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{msg2}"))
-                            else:
-                                register_proc(p2)
-                                QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
-                                self._focus_scrcpy_window()
-                            return
-                        # Other immediate failure: surface the error
-                        err = stderr.strip() or "scrcpy exited immediately."
-                        self.log(f"scrcpy failed to start: {err}", "ERROR")
-                        QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
-                        QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{err}"))
-                        return
-
-                    # Running fine
-                    register_proc(p)
-                    QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
-                    self._focus_scrcpy_window()
+                # Launch scrcpy with stderr captured so we can surface real errors
+                # to the user. The ADB env var is set in launch() to tell scrcpy
+                # which adb binary to use (scrcpy 4.1+ removed the --adb flag).
+                p = launch(cmd_base, capture=True)
+                # Give scrcpy 1.5 seconds to initialize and start the video stream.
+                # If it exits within this window, it failed (e.g. device not found,
+                # wrong adb, missing dependencies). If it's still running, assume
+                # success and let the window-focus logic take over.
+                time.sleep(1.5)
+                if p.poll() is not None:
+                    stderr = (p.stderr.read() if p.stderr else '') or ''
+                    stdout = (p.stdout.read() if p.stdout else '') or ''
+                    err = (stderr + stdout).strip() or "scrcpy exited immediately."
+                    self.log(f"scrcpy failed to start: {err}", "ERROR")
+                    QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
+                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{err}\n\nMake sure the device is connected and scrcpy is installed."))
                     return
 
-                # No custom adb path; just run normally
-                # We still capture=False so scrcpy inherits the GUI's stdout,
-                # but we still get the Popen handle back so we can dedupe.
-                p = launch(cmd_base, capture=False)
+                # Running fine
                 register_proc(p)
                 QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
                 self._focus_scrcpy_window()
@@ -8175,13 +8435,188 @@ class ADBGUI(QMainWindow):
         dialog.exec()
 
 
+def _write_crash_report(exc_type, exc_value, exc_tb, source="main"):
+    """Write a crash report to disk with traceback, app log, and system info.
+
+    Returns the path to the crash report file, or None on failure.
+    """
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        crash_file = os.path.join(_crash_log_dir, f"crash_{timestamp}.log")
+
+        with open(crash_file, 'w', encoding='utf-8') as f:
+            # Header
+            f.write("=" * 70 + "\n")
+            f.write(f"ADB Tool v{APP_VERSION} Crash Report\n")
+            f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Source: {source}\n")
+            f.write(f"Python: {sys.version}\n")
+            f.write(f"Platform: {sys.platform}\n")
+            f.write("=" * 70 + "\n\n")
+
+            # Exception traceback
+            f.write("EXCEPTION TRACEBACK:\n")
+            f.write("-" * 70 + "\n")
+            if exc_tb:
+                for line in _traceback_mod.format_exception(exc_type, exc_value, exc_tb):
+                    f.write(line)
+            else:
+                f.write(f"{exc_type.__name__}: {exc_value}\n")
+            f.write("\n")
+
+            # Try to capture the app log from the live ADBGUI instance
+            try:
+                app = QApplication.instance()
+                if app:
+                    for widget in app.topLevelWidgets():
+                        if isinstance(widget, ADBGUI) and hasattr(widget, 'output_text'):
+                            f.write("APP LOG:\n")
+                            f.write("-" * 70 + "\n")
+                            log_text = widget.output_text.toPlainText()
+                            if log_text.strip():
+                                f.write(log_text)
+                            else:
+                                f.write("(no log output)\n")
+                            f.write("\n")
+                            break
+            except Exception:
+                pass
+
+            # Footer
+            f.write("=" * 70 + "\n")
+            f.write("Please share this report when requesting help.\n")
+
+        return crash_file
+    except Exception:
+        return None
+
+
+def _crash_excepthook(exc_type, exc_value, exc_tb):
+    """Global exception hook to catch unhandled exceptions and offer to save crash report."""
+    # Write crash report to disk
+    crash_file = _write_crash_report(exc_type, exc_value, exc_tb, source="main")
+
+    # Call the original excepthook to print to stderr
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    # Try to show a dialog if QApplication is alive
+    try:
+        app = QApplication.instance()
+        if app and crash_file:
+            message = (
+                "ADB Tool encountered an unexpected error and has crashed.\n\n"
+                f"A crash report has been saved to:\n{crash_file}\n\n"
+                "Would you like to save a copy or open the report?"
+            )
+            reply = QMessageBox.critical(
+                None,
+                "ADB Tool Crash",
+                message,
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Open |
+                QMessageBox.StandardButton.Discard
+            )
+
+            if reply == QMessageBox.StandardButton.Save:
+                # Let user pick a location to save it
+                path, _ = QFileDialog.getSaveFileName(
+                    None,
+                    "Save Crash Report",
+                    os.path.expanduser(f"~/adb_crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+                    "Log Files (*.log);;Text Files (*.txt);;All Files (*)"
+                )
+                if path:
+                    try:
+                        shutil.copy(crash_file, path)
+                        QMessageBox.information(None, "Saved", f"Crash report saved to:\n{path}")
+                    except Exception as e:
+                        QMessageBox.warning(None, "Save Failed", f"Could not save file:\n{e}")
+            elif reply == QMessageBox.StandardButton.Open:
+                # Try to open the file with the default application
+                try:
+                    if sys.platform == 'win32':
+                        os.startfile(crash_file)
+                    elif sys.platform == 'darwin':
+                        subprocess.run(['open', crash_file])
+                    else:  # Linux
+                        subprocess.run(['xdg-open', crash_file])
+                except Exception as e:
+                    QMessageBox.warning(None, "Open Failed", f"Could not open file:\n{e}")
+    except Exception:
+        # If showing dialog fails, just exit gracefully
+        pass
+
+
+def _check_for_previous_crash():
+    """On startup, check if there's a faulthandler crash log from the previous run."""
+    if os.path.exists(_FAULTHANDLER_LOG_PATH):
+        try:
+            with open(_FAULTHANDLER_LOG_PATH, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read().strip()
+
+            if content:
+                # There was a native crash in the previous run
+                message = (
+                    "ADB Tool appears to have crashed in the previous session "
+                    "(detected via native crash handler).\n\n"
+                    "A crash report has been saved. Would you like to save a copy "
+                    "or view it?"
+                )
+                reply = QMessageBox.warning(
+                    None,
+                    "Previous Crash Detected",
+                    message,
+                    QMessageBox.StandardButton.Save |
+                    QMessageBox.StandardButton.Open |
+                    QMessageBox.StandardButton.Discard
+                )
+
+                if reply == QMessageBox.StandardButton.Save:
+                    path, _ = QFileDialog.getSaveFileName(
+                        None,
+                        "Save Crash Report",
+                        os.path.expanduser(f"~/adb_crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+                        "Log Files (*.log);;Text Files (*.txt);;All Files (*)"
+                    )
+                    if path:
+                        try:
+                            shutil.copy(_FAULTHANDLER_LOG_PATH, path)
+                            QMessageBox.information(None, "Saved", f"Crash report saved to:\n{path}")
+                        except Exception as e:
+                            QMessageBox.warning(None, "Save Failed", f"Could not save file:\n{e}")
+                elif reply == QMessageBox.StandardButton.Open:
+                    try:
+                        if sys.platform == 'win32':
+                            os.startfile(_FAULTHANDLER_LOG_PATH)
+                        elif sys.platform == 'darwin':
+                            subprocess.run(['open', _FAULTHANDLER_LOG_PATH])
+                        else:
+                            subprocess.run(['xdg-open', _FAULTHANDLER_LOG_PATH])
+                    except Exception as e:
+                        QMessageBox.warning(None, "Open Failed", f"Could not open file:\n{e}")
+
+                # Clear the crash log for the next run
+                try:
+                    os.remove(_FAULTHANDLER_LOG_PATH)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 def main():
+    # Install the global exception hook to catch unhandled exceptions
+    sys.excepthook = _crash_excepthook
+
     app = QApplication(sys.argv)
     # App identity (shows in macOS menu bar/app switcher)
     app.setApplicationName("ADB GUI")
     app.setApplicationVersion(APP_VERSION)
     app.setApplicationDisplayName("ADB GUI")
     app.setOrganizationName("ADB GUI")
+
+    # Check for a crash from the previous run (native crash detected by faulthandler)
+    _check_for_previous_crash()
 
     # App/window icon: prefer bundled icon files, otherwise use a built-in Qt icon
     # When running as a macOS .app bundle, icons live in Contents/Resources/
