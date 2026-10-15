@@ -1703,6 +1703,13 @@ class ADBGUI(QMainWindow):
         # Accept the close event
         event.accept()
 
+    # ──────────────────────────────────────────────────────────────────
+    #  Drag & drop APK install
+    # ──────────────────────────────────────────────────────────────────
+    # Drop one or more .apk files anywhere on the main window to install
+    # them on the currently selected device. Uses an overlay label for
+    # visual feedback while dragging.
+
     def setup_ui(self):
         """Setup the modern user interface"""
         # Central widget
@@ -2259,6 +2266,10 @@ class ADBGUI(QMainWindow):
         # Set hand cursor on all buttons
         self.set_hand_cursor_on_buttons()
 
+        # Enable drag-and-drop APK install on the entire main window
+        self.setAcceptDrops(True)
+        self._apk_drop_overlay = None
+
     def set_hand_cursor_on_buttons(self):
         """Set hand pointer cursor on all buttons and list widgets"""
         from PyQt6.QtGui import QCursor
@@ -2271,6 +2282,128 @@ class ADBGUI(QMainWindow):
         # Set cursor on all QListWidgets
         for list_widget in self.findChildren(QListWidget):
             list_widget.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    # ── Drag & drop APK install ─────────────────────────────────────
+
+    def _has_apk_urls(self, mime):
+        """Return list of local .apk file paths in mime data, or []."""
+        try:
+            if not mime or not mime.hasUrls():
+                return []
+            paths = []
+            for url in mime.urls():
+                path = url.toLocalFile()
+                if path and path.lower().endswith('.apk'):
+                    paths.append(path)
+            return paths
+        except Exception:
+            return []
+
+    def dragEnterEvent(self, event):
+        """Accept drag if any URLs are .apk files."""
+        try:
+            apks = self._has_apk_urls(event.mimeData())
+            if apks:
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+                self._show_apk_drop_overlay(len(apks))
+                return
+        except Exception:
+            pass
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        """Keep overlay visible during drag movement."""
+        try:
+            apks = self._has_apk_urls(event.mimeData())
+            if apks:
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+                # Refresh overlay text in case the count changed
+                self._show_apk_drop_overlay(len(apks))
+                return
+        except Exception:
+            pass
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        """Hide overlay when drag leaves the window."""
+        try:
+            self._hide_apk_drop_overlay()
+        except Exception:
+            pass
+        event.accept()
+
+    def dropEvent(self, event):
+        """Install dropped APK files on the currently selected device."""
+        try:
+            self._hide_apk_drop_overlay()
+            apks = self._has_apk_urls(event.mimeData())
+            if not apks:
+                event.ignore()
+                return
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            self._install_apk_files(apks)
+        except Exception:
+            event.ignore()
+
+    def _show_apk_drop_overlay(self, count):
+        """Show a semi-transparent overlay on the main window while dragging APKs."""
+        if self._apk_drop_overlay is not None:
+            # Update text in case the count changed
+            try:
+                self._apk_drop_overlay.setText(
+                    f"📦\nDrop to Install {count} APK{'s' if count != 1 else ''}"
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            overlay = QLabel(self)
+            overlay.setText(f"📦\nDrop to Install {count} APK{'s' if count != 1 else ''}")
+            overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            overlay.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(40, 80, 160, 200);
+                    color: white;
+                    font-size: 28px;
+                    font-weight: bold;
+                    border: 6px dashed rgba(255, 255, 255, 220);
+                    border-radius: 20px;
+                    padding: 60px;
+                }
+            """)
+            overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            overlay.resize(self.size())
+            overlay.move(0, 0)
+            overlay.raise_()
+            overlay.show()
+            self._apk_drop_overlay = overlay
+        except Exception:
+            self._apk_drop_overlay = None
+
+    def _hide_apk_drop_overlay(self):
+        """Hide and remove the drop overlay if present."""
+        if self._apk_drop_overlay is None:
+            return
+        try:
+            self._apk_drop_overlay.hide()
+            self._apk_drop_overlay.deleteLater()
+        except Exception:
+            pass
+        finally:
+            self._apk_drop_overlay = None
+
+    def resizeEvent(self, event):
+        """Keep the drop overlay sized to the main window."""
+        try:
+            if self._apk_drop_overlay is not None:
+                self._apk_drop_overlay.resize(self.size())
+        except Exception:
+            pass
+        super().resizeEvent(event)
 
     def create_card(self, title):
         """Create a modern card container"""
@@ -4686,25 +4819,60 @@ class ADBGUI(QMainWindow):
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
 
-        apk_path, _ = QFileDialog.getOpenFileName(self, "Select APK file", "", "APK files (*.apk);;All files (*.*)")
-        if not apk_path:
+        apk_paths, _ = QFileDialog.getOpenFileNames(self, "Select APK file(s)", "", "APK files (*.apk);;All files (*.*)")
+        if not apk_paths:
             return
 
-        self.log(f"Installing {apk_path}...")
-        self.update_status("Installing APK...")
+        self._install_apk_files(apk_paths)
+
+    def _install_apk_files(self, apk_paths):
+        """Install one or more APK files in the currently selected device.
+
+        Called from both the file dialog (install_apk) and drag-and-drop.
+        Runs installs sequentially in a background thread.
+        """
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return
+
+        if not apk_paths:
+            return
+
+        # Filter to APK files only
+        apk_files = [p for p in apk_paths if isinstance(p, str) and p.lower().endswith('.apk')]
+        if not apk_files:
+            QMessageBox.warning(self, "Invalid File", "No APK files selected.")
+            return
+
+        device_label = self.current_device
+        total = len(apk_files)
+        self.log(f"Installing {total} APK(s) on {device_label}…")
+        self.update_status(f"Installing {total} APK(s)…")
 
         def do_install():
-            # Use shlex.quote to properly handle APK paths with spaces
-            cmd = f"{self.get_device_flag()} install {shlex.quote(apk_path)}"
-            result = self.adb.run_command(cmd, timeout=120)
-            if result['success']:
-                self.log("APK installed successfully")
-                self.update_status("APK installed successfully")
-                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", "APK installed successfully"))
-            else:
-                self.log(f"Error: {result['stderr']}", "ERROR")
-                self.update_status("Failed to install APK")
-                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to install APK:\n{result['stderr']}"))
+            for idx, apk_path in enumerate(apk_files, 1):
+                try:
+                    fname = os.path.basename(apk_path)
+                    self.update_status(f"Installing [{idx}/{total}] {fname}…")
+                    self.log(f"[{idx}/{total}] Installing {fname}…")
+                    cmd = f"{self.get_device_flag()} install {shlex.quote(apk_path)}"
+                    result = self.adb.run_command(cmd, timeout=120)
+                    if result['success']:
+                        self.log(f"✅ [{idx}/{total}] {fname} installed successfully")
+                    else:
+                        stderr = (result.get('stderr') or '').strip()
+                        self.log(f"❌ [{idx}/{total}] {fname} failed: {stderr[:200]}", "ERROR")
+                except Exception as e:
+                    self.log(f"❌ Error installing {apk_path}: {e}", "ERROR")
+
+            # Final status update
+            def _done():
+                self.update_status(f"Finished installing {total} APK(s) on {device_label}")
+                QMessageBox.information(
+                    self, "Install Complete",
+                    f"Finished installing {total} APK file(s) on {device_label}."
+                )
+            QTimer.singleShot(0, _done)
 
         threading.Thread(target=do_install, daemon=True).start()
     
