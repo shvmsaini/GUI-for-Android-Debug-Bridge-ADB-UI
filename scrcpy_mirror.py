@@ -238,8 +238,8 @@ class VideoDisplayWidget(QWidget):
             main_font.setPointSize(max(14, min(20, rect.width() // 18)))
             main_font.setBold(True)
             painter.setFont(main_font)
-            title_rect = rect.adjusted(0, 0, 0, -(rect.height() // 4))
-            painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter,
+            # Center the message both horizontally and vertically
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
                              "Waiting for video stream…")
             return
 
@@ -1040,6 +1040,8 @@ class ScrcpyMirrorWindow(QMainWindow):
         # Row 1: nav buttons
         self._nav_row1 = QHBoxLayout()
         self._nav_row1.setSpacing(6)
+        # Add leading stretch to center buttons horizontally
+        self._nav_row1.addStretch(1)
 
         buttons = [
             ("◀ Back", "back"),
@@ -1089,7 +1091,8 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.screenshot_btn.setStyleSheet(nav_btn_style)
         self._nav_row1.addWidget(self.screenshot_btn)
 
-        self._nav_row1.addStretch()
+        # Add trailing stretch to center buttons horizontally
+        self._nav_row1.addStretch(1)
         outer.addLayout(self._nav_row1)
 
         # Row 2: D-pad controls removed per user request
@@ -1146,15 +1149,26 @@ class ScrcpyMirrorWindow(QMainWindow):
             self.nav_bar_widget.updateGeometry()
 
     def _set_row1_stretch(self, on: bool):
-        """Toggle whether row 1 has a trailing stretch."""
-        # Take out the last stretch item if present
-        last = self._nav_row1.itemAt(self._nav_row1.count() - 1)
+        """Toggle whether row 1 has stretches for centering buttons.
+
+        When on, buttons are centered horizontally (leading + trailing stretch).
+        When off, stretches are removed so buttons align left.
+        """
         if on:
+            # Add leading stretch if not present
+            first = self._nav_row1.itemAt(0)
+            if first is None or first.spacerItem() is None:
+                self._nav_row1.insertStretch(0)
+            # Add trailing stretch if not present
+            last = self._nav_row1.itemAt(self._nav_row1.count() - 1)
             if last is None or last.spacerItem() is None:
-                self._nav_row1.addStretch()
+                self._nav_row1.addStretch(1)
         else:
-            if last is not None and last.spacerItem() is not None:
-                self._nav_row1.removeItem(last)
+            # Remove all stretch items
+            for i in range(self._nav_row1.count() - 1, -1, -1):
+                item = self._nav_row1.itemAt(i)
+                if item is not None and item.spacerItem() is not None:
+                    self._nav_row1.removeItem(item)
 
     def _stylesheet(self):
         return f"""
