@@ -5115,8 +5115,10 @@ class ADBGUI(QMainWindow):
         search_layout.addWidget(filter_checkbox)
         layout.addLayout(search_layout)
         
-        # List widget
+        # List widget (multi-select for batch uninstall)
         listbox = QListWidget()
+        listbox.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        listbox.setSelectionBehavior(QListWidget.SelectionBehavior.SelectRows)
         layout.addWidget(listbox)
         
         # Store original apps list in window attribute so refresh can access it
@@ -5234,12 +5236,8 @@ class ADBGUI(QMainWindow):
         # Buttons frame
         button_layout = QHBoxLayout()
         
-        def get_selected_package():
-            """Extract package name from listbox selection (handles app name, version, and [DISABLED] marker)"""
-            current_item = listbox.currentItem()
-            if not current_item:
-                return None
-            display_text = current_item.text()
+        def _parse_package(display_text):
+            """Extract package name from a listbox row (handles app name, version, and [DISABLED] marker)"""
             # Remove [DISABLED] marker if present
             display_text = display_text.replace(' [DISABLED]', '').strip()
             # Remove version string like " v1.0.0", " v4.2.0.172-online", etc
@@ -5250,100 +5248,107 @@ class ADBGUI(QMainWindow):
                 return package_name
             # Fallback: if no parentheses, assume it's just the package name
             return display_text
+
+        def get_selected_packages():
+            """Return package names for all selected rows (batch-aware)."""
+            items = listbox.selectedItems()
+            if not items:
+                # Fall back to the current item so single-click still works
+                current = listbox.currentItem()
+                items = [current] if current else []
+            return [_parse_package(it.text()) for it in items]
+
+        def get_selected_package():
+            """Extract package name from the current listbox selection."""
+            pkgs = get_selected_packages()
+            return pkgs[0] if pkgs else None
         
         def uninstall_selected():
-            """Uninstall selected app"""
-            package_name = get_selected_package()
-            if not package_name:
+            """Uninstall one or more selected apps (batch-aware)."""
+            packages = get_selected_packages()
+            if not packages:
                 QMessageBox.warning(self, "No Selection", "Please select an app to uninstall")
                 return
-            app_label = app_window.app_labels.get(package_name, package_name)
-            display_name = f"{app_label} ({package_name})" if app_label != package_name else package_name
-            reply = QMessageBox.question(self, "Confirm Uninstall", f"Uninstall {display_name}?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+            # Build display names for the confirm dialog
+            display_names = []
+            for pkg in packages:
+                label = app_window.app_labels.get(pkg, pkg)
+                display_names.append(f"{label} ({pkg})" if label != pkg else pkg)
+            bullets = "\n".join(f"  • {name}" for name in display_names)
+            reply = QMessageBox.question(
+                self, "Confirm Uninstall",
+                f"Uninstall {len(packages)} app(s)?\n\n{bullets}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            
-            self.log(f"Uninstalling {package_name}...")
-            self.update_status("Uninstalling app...")
-            
+
+            self.log(f"Uninstalling {len(packages)} app(s)...")
+            self.update_status(f"Uninstalling {len(packages)} app(s)...")
+
             def do_uninstall():
-                result = self.adb.run_command(f"{self.get_device_flag()} uninstall {package_name}")
-                if result['success']:
-                    # Check if stdout contains success message
-                    output = result['stdout'].strip() if result['stdout'] else ''
-                    if 'Success' in output or 'success' in output.lower() or output == '':
-                        self.log("App uninstalled successfully")
-                        self.update_status("App uninstalled successfully")
-                        # Remove from the stored apps list
-                        if package_name in app_window.original_apps:
-                            app_window.original_apps.remove(package_name)
-                        # Refresh the list
-                        QTimer.singleShot(0, lambda: update_list())
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", "App uninstalled successfully"))
+                succeeded = []        # fully uninstalled
+                user_uninstalled = []  # only removed for current user (--user 0)
+                failed = []            # (package, error)
+
+                for pkg in packages:
+                    self.log(f"Uninstalling {pkg}...")
+                    self.update_status(f"Uninstalling {pkg}...")
+                    result = self.adb.run_command(f"{self.get_device_flag()} uninstall {pkg}")
+                    output = (result.get('stdout') or '').strip()
+                    if result['success'] and ('Success' in output or 'success' in output.lower() or output == ''):
+                        self.log(f"✓ {pkg} uninstalled")
+                        succeeded.append(pkg)
+                        continue
+
+                    # Fallback: uninstall for current user (system apps without root)
+                    err = result.get('stderr') or result.get('stdout') or "Unknown error"
+                    self.log(f"Regular uninstall failed for {pkg}: {err}. Trying --user 0...", "WARNING")
+                    result_user = self.adb.run_command(f"{self.get_device_flag()} shell pm uninstall --user 0 {pkg}")
+                    out_u = (result_user.get('stdout') or '').strip()
+                    if result_user['success'] and ('Success' in out_u or 'success' in out_u.lower() or out_u == ''):
+                        self.log(f"✓ {pkg} uninstalled for current user")
+                        user_uninstalled.append(pkg)
                     else:
-                        # Sometimes ADB returns success but stdout has info
-                        self.log(f"Uninstall result: {output}")
-                        self.update_status("Uninstall completed")
-                        if package_name in app_window.original_apps:
-                            app_window.original_apps.remove(package_name)
-                        QTimer.singleShot(0, lambda: update_list())
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Uninstall completed:\n{output}"))
-                else:
-                    # Get error from stderr or stdout
-                    error_msg = result['stderr'] if result['stderr'] else result['stdout']
-                    if not error_msg or error_msg.strip() == '':
-                        error_msg = "Unknown error"
-                    
-                    self.log(f"Regular uninstall failed: {error_msg}", "WARNING")
-                    
-                    # Try uninstalling for current user (works for system apps without root)
-                    self.log("Attempting to uninstall for current user (--user 0)...")
-                    result_user = self.adb.run_command(f"{self.get_device_flag()} shell pm uninstall --user 0 {package_name}")
-                    
-                    if result_user['success']:
-                        output = result_user['stdout'].strip() if result_user['stdout'] else ''
-                        if 'Success' in output or 'success' in output.lower() or output == '':
-                            self.log("App uninstalled for current user successfully")
-                            self.update_status("App uninstalled for current user")
-                            # Remove from the stored apps list
-                            if package_name in app_window.original_apps:
-                                app_window.original_apps.remove(package_name)
-                            # Refresh the list
-                            QTimer.singleShot(0, lambda: update_list())
-                            # Thread-safe messagebox - use QTimer to call from main thread
-                            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App uninstalled for current user successfully!\n\nNote: System apps are only removed for your user account, not from the device."))
-                        else:
-                            self.log(f"Uninstall result: {output}")
-                            self.update_status("Uninstall completed")
-                            # Remove from the stored apps list
-                            if package_name in app_window.original_apps:
-                                app_window.original_apps.remove(package_name)
-                            # Refresh the list
-                            QTimer.singleShot(0, lambda: update_list())
-                            # Thread-safe messagebox - use QTimer to call from main thread
-                            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Uninstall completed:\n{output}"))
-                    else:
-                        # Both methods failed
-                        error_msg_user = result_user['stderr'] if result_user['stderr'] else result_user['stdout']
-                        self.log(f"Error: {error_msg}", "ERROR")
-                        self.log(f"User uninstall also failed: {error_msg_user}", "ERROR")
-                        self.log(f"Return code: {result['returncode']}", "ERROR")
-                        self.log(f"Full stdout: {result['stdout']}", "DEBUG")
-                        self.log(f"Full stderr: {result['stderr']}", "DEBUG")
-                        self.update_status("Failed to uninstall app")
-                        
-                        # Provide helpful message
-                        if 'DELETE_FAILED_INTERNAL_ERROR' in error_msg or 'system app' in error_msg.lower() or 'package is a system package' in error_msg.lower():
-                            help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}\n\nTried both regular and user uninstall methods.\nYou can try disabling it instead (use 'Disable Selected')."
-                        else:
-                            help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}"
-                        
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", help_text))
-            
+                        err_u = result_user.get('stderr') or result_user.get('stdout') or "Unknown error"
+                        self.log(f"✗ Failed to uninstall {pkg}: {err_u}", "ERROR")
+                        failed.append((pkg, err_u))
+
+                # Update the stored apps list for everything that was removed
+                removed = set(succeeded) | set(user_uninstalled)
+                if removed:
+                    app_window.original_apps = [a for a in app_window.original_apps if a not in removed]
+
+                # Drop cached label/version entries for removed apps so they can't
+                # sneak back into the list via stale data.
+                for pkg in removed:
+                    app_window.app_labels.pop(pkg, None)
+                    app_window.app_versions.pop(pkg, None)
+                    app_window.app_status.pop(pkg, None)
+
+                # Build summary
+                total_ok = len(succeeded) + len(user_uninstalled)
+                summary_lines = [f"Uninstalled {total_ok}/{len(packages)} app(s)."]
+                if user_uninstalled:
+                    summary_lines.append(f"  ({len(user_uninstalled)} for current user only — restorable via Reinstall)")
+                if failed:
+                    summary_lines.append("Failed:")
+                    summary_lines.extend(f"  • {p}: {e[:80]}" for p, e in failed)
+                summary = "\n".join(summary_lines)
+
+                self.log(summary)
+                self.update_status(f"Uninstalled {total_ok}/{len(packages)}")
+
+                def _refresh_after_uninstall():
+                    # Clear any stale selection, then rebuild the list from the
+                    # (now smaller) original_apps using the current search term.
+                    listbox.clearSelection()
+                    listbox.setCurrentItem(None)
+                    update_list()
+
+                QTimer.singleShot(0, _refresh_after_uninstall)
+                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Uninstall Complete", summary))
+
             threading.Thread(target=do_uninstall, daemon=True).start()
         
         def reinstall_selected():
@@ -5800,7 +5805,8 @@ class ADBGUI(QMainWindow):
             
             threading.Thread(target=do_reinstall, daemon=True).start()
         
-        uninstall_btn = QPushButton("Uninstall Selected")
+        uninstall_btn = QPushButton("🗑️ Uninstall Selected")
+        uninstall_btn.setToolTip("Select multiple apps with Ctrl/Cmd-click or Shift-click")
         uninstall_btn.clicked.connect(uninstall_selected)
         button_layout.addWidget(uninstall_btn)
 
@@ -5865,56 +5871,58 @@ class ADBGUI(QMainWindow):
         """Refresh the app list in the existing window"""
         # Update the stored apps list
         app_window.original_apps = apps.copy()
-        
-        # Load app labels for new apps if needed
+
+        def update_list():
+            """Update listbox with filtered apps — iterates app_window.original_apps so
+            any in-place mutations (e.g. after uninstall) are reflected."""
+            search_term = search_entry.text().lower()
+            # Get filter checkbox from the window
+            filter_checkbox = app_window.findChild(QCheckBox)
+            filter_disabled_value = filter_checkbox.isChecked() if filter_checkbox else False
+            listbox.clear()
+
+            for app in app_window.original_apps:
+                # Get app label (use package name as fallback)
+                app_label = app_window.app_labels.get(app, app) or app
+
+                # If label is same as package, just show package name (avoid "package (package)")
+                if app_label == app:
+                    display_label = app
+                else:
+                    display_label = f"{app_label} ({app})"
+
+                # Check if app is disabled
+                is_disabled = app_window.app_status.get(app, False)
+
+                # Apply disabled filter
+                if filter_disabled_value and not is_disabled:
+                    continue
+
+                # Check if search term matches app name or package name
+                matches = False
+                if not search_term:
+                    matches = True
+                elif search_term in str(app_label).lower() or search_term in app.lower():
+                    matches = True
+
+                if matches:
+                    display_name = display_label
+                    if is_disabled:
+                        display_name += " [DISABLED]"
+                    listbox.addItem(display_name)
+
+        # Load missing labels in background, then refresh the list once they arrive
         def load_missing_labels():
             for app in apps:
                 if app not in app_window.app_labels:
                     label = self.get_app_label(app)
                     app_window.app_labels[app] = label if label else app
             QTimer.singleShot(0, lambda: update_list())
-        
-        def update_list():
-            """Update listbox with filtered apps"""
-            search_term = search_entry.text().lower()
-            # Get filter checkbox from the window
-            filter_checkbox = app_window.findChild(QCheckBox)
-            filter_disabled_value = filter_checkbox.isChecked() if filter_checkbox else False
-            listbox.clear()
-            
-            for app in apps:
-                # Get app label (use package name as fallback)
-                app_label = app_window.app_labels.get(app, app)
-                
-                # If label is same as package, just show package name (avoid "package (package)")
-                if app_label == app:
-                    display_label = app
-                else:
-                    display_label = f"{app_label} ({app})"
-                
-                # Check if app is disabled
-                is_disabled = app_window.app_status.get(app, False)
-                
-                # Apply disabled filter
-                if filter_disabled_value and not is_disabled:
-                    continue
-                
-                # Check if search term matches app name or package name
-                matches = False
-                if not search_term:
-                    matches = True
-                elif search_term in app_label.lower() or search_term in app.lower():
-                    matches = True
-                
-                if matches:
-                    display_name = display_label
-                    if is_disabled:
-                        display_name += " [DISABLED]"
-                    listbox.addItem(display_name)
-        
+
         # Load missing labels in background
         threading.Thread(target=load_missing_labels, daemon=True).start()
-        # Update immediately with existing labels
+        # Update immediately with existing labels (so search by package name works
+        # even before labels finish loading)
         update_list()
     
     def show_app_details(self, package_name):

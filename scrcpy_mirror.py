@@ -241,15 +241,6 @@ class VideoDisplayWidget(QWidget):
             title_rect = rect.adjusted(0, 0, 0, -(rect.height() // 4))
             painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter,
                              "Waiting for video stream…")
-            # Subtitle: hint that the user can wake the device.
-            sub_font = main_font
-            sub_font.setBold(False)
-            sub_font.setPointSize(max(10, main_font.pointSize() - 4))
-            painter.setFont(sub_font)
-            painter.setPen(QColor("#bdbdbd"))
-            sub_rect = rect.adjusted(0, rect.height() // 3, 0, 0)
-            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter,
-                             "Wake the device (Power) or tap its screen.")
             return
 
         scaled = self._pixmap.scaled(
@@ -774,7 +765,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
             # Construct command
             adb_bin = self.adb_path if self.adb_path else 'adb'
-            cmd = [adb_bin, 'install', '-s', self.device_id, '-r', '-t', apk_path]
+            cmd = [adb_bin, '-s', self.device_id, 'install', '-r', '-t', apk_path]
             print(f"🔍 DEBUG: Running: {' '.join(cmd)}")
 
             # Connect output signal for real-time progress
