@@ -52,13 +52,17 @@ APP_VERSION = "1.1.0"
 import faulthandler
 import traceback as _traceback_mod
 
-# Determine the crash log directory early (same location as settings)
+# Determine the base directory for app data (used for both settings and crashes)
+# Use a consistent, clean directory name across all platforms
 if sys.platform == 'darwin':
-    _crash_log_dir = os.path.expanduser("~/Library/Application Support/ADB-GUI-UI")
+    _app_data_dir = os.path.expanduser("~/Library/Application Support/ADB-GUI-UI")
 elif sys.platform == 'win32':
-    _crash_log_dir = os.path.join(os.environ.get('APPDATA', ''), 'ADB-GUI-UI')
+    _app_data_dir = os.path.join(os.environ.get('APPDATA', ''), 'ADB-GUI-UI')
 else:
-    _crash_log_dir = os.path.expanduser("~/.config/ADB-GUI-UI")
+    _app_data_dir = os.path.expanduser("~/.config/ADB-GUI-UI")
+
+# Crash log directory (subdirectory for crash reports)
+_crash_log_dir = os.path.join(_app_data_dir, "crashes")
 
 # Ensure the directory exists
 try:
@@ -778,8 +782,7 @@ class SettingsDialog(QDialog):
         emoji_row = QHBoxLayout()
 
         # Common emojis for quick selection
-        common_emojis = ["📱", "🔧", "⚙️", "🔄", "📦", "🗑️", "📋", "💾", "🔍", "📊",
-                        "🚀", "⚡", "🔥", "💻", "🖥️", "🔌", "📡", "🪞", "📸", "🎨"]
+        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺"]
 
         self._add_emoji_buttons_to_layout(emoji_row, common_emojis)
 
@@ -885,8 +888,7 @@ class SettingsDialog(QDialog):
         emoji_row = QHBoxLayout()
 
         # Common emojis for quick selection
-        common_emojis = ["📱", "🔧", "⚙️", "🔄", "📦", "🗑️", "📋", "💾", "🔍", "📊",
-                        "🚀", "⚡", "🔥", "💻", "🖥️", "🔌", "📡", "🪞", "📸", "🎨"]
+        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺"]
 
         current_emoji = cmd.get('emoji', '📱')
 
@@ -909,10 +911,10 @@ class SettingsDialog(QDialog):
             btn = QPushButton(emoji)
             btn.setFixedSize(40, 40)
             btn.setFont(QFont('', 16))
-            btn.clicked.connect(lambda checked, e=emoji, sel_label=edit_emoji_selected, btns=edit_emoji_buttons: (
+            btn.clicked.connect(lambda checked, e=emoji, sel_label=edit_emoji_selected, btns=edit_emoji_buttons, b=btn: (
                 sel_label.setText(e),
-                [b.setStyleSheet("") for b in btns],
-                btn.setStyleSheet(f"border: 2px solid {self.colors['accent']}; border-radius: 6px;")
+                [button.setStyleSheet("") for button in btns],
+                b.setStyleSheet(f"border: 2px solid {self.colors['accent']}; border-radius: 6px;")
             ))
             emoji_row.addWidget(btn)
             edit_emoji_buttons.append(btn)
@@ -1504,25 +1506,11 @@ class ADBGUI(QMainWindow):
             # Running as script
             project_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # Settings storage - use user-writable location via QStandardPaths
-        # This ensures settings persist correctly when running from /Applications
-        app_name = "ADB-GUI-UI"
-        if sys.platform == 'darwin':
-            # macOS: ~/Library/Application Support/ADB-GUI-UI
-            settings_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
-            if not settings_dir:
-                # Fallback if QStandardPaths returns empty
-                settings_dir = os.path.expanduser("~/Library/Application Support/ADB-GUI-UI")
-        elif sys.platform == 'win32':
-            # Windows: %APPDATA%/ADB-GUI-UI
-            settings_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
-            if not settings_dir:
-                settings_dir = os.path.join(os.environ.get('APPDATA', ''), 'ADB-GUI-UI')
-        else:
-            # Linux: ~/.config/ADB-GUI-UI
-            settings_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
-            if not settings_dir:
-                settings_dir = os.path.expanduser("~/.config/ADB-GUI-UI")
+        # Settings storage - use consistent _app_data_dir across all platforms
+        settings_dir = os.path.expanduser("~/Library/Application Support/ADB-GUI-UI") if sys.platform == 'darwin' else (
+            os.path.join(os.environ.get('APPDATA', ''), 'ADB-GUI-UI') if sys.platform == 'win32' else
+            os.path.expanduser("~/.config/ADB-GUI-UI")
+        )
 
         # Create settings directory if it doesn't exist
         os.makedirs(settings_dir, exist_ok=True)
@@ -7324,9 +7312,104 @@ class ADBGUI(QMainWindow):
         # Update theme button text
         self.update_theme_button_text()
 
-    def open_settings(self):
+    def open_settings(self, initial_tab=None):
         """Open settings dialog"""
         dialog = SettingsDialog(self, self.settings)
+        dialog.exec()
+
+    def _show_add_template_command_dialog(self):
+        """Show dialog to add a new template command from the header"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Template Command")
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(15)
+
+        # Emoji selector
+        emoji_row = QHBoxLayout()
+        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺"]
+        selected_emoji = ["📱"]  # Track selected emoji
+
+        emoji_buttons = []
+        for emoji in common_emojis:
+            btn = QPushButton(emoji)
+            btn.setFixedSize(40, 40)
+            btn.setFont(QFont('', 14))
+            btn.clicked.connect(lambda checked, e=emoji, sel_list=selected_emoji, b=btn, buttons=emoji_buttons: (
+                sel_list.__setitem__(0, e),
+                [button.setStyleSheet("") for button in buttons],
+                b.setStyleSheet(f"border: 2px solid {self.colors['accent']}; border-radius: 6px;")
+            ))
+            emoji_row.addWidget(btn)
+            emoji_buttons.append(btn)
+
+        emoji_row.addStretch()
+        layout.addLayout(emoji_row)
+
+        # Title
+        title_label = QLabel("Command Title:")
+        layout.addWidget(title_label)
+
+        title_edit = QLineEdit()
+        title_edit.setPlaceholderText("e.g., Seat User, Reset ADB, Show Props")
+        layout.addWidget(title_edit)
+
+        # Snippet
+        snippet_label = QLabel("Bash Command Snippet:")
+        layout.addWidget(snippet_label)
+
+        variables_hint = QLabel(
+            "Available variables:\n"
+            "  $CURRENT_DEVICE  $ADB_PATH  $SELECTED_SEAT"
+        )
+        variables_hint.setStyleSheet("color: #666; font-size: 9pt; font-family: Consolas, monospace;")
+        variables_hint.setWordWrap(False)
+        layout.addWidget(variables_hint)
+
+        snippet_edit = QTextEdit()
+        snippet_edit.setPlaceholderText("e.g., adb -s $CURRENT_DEVICE shell am start -n aero.panasonic.test.seatUser/aero.panasonic.test.user.UserTest")
+        snippet_edit.setMinimumHeight(150)
+        snippet_edit.setFont(QFont('Consolas', 11))
+        layout.addWidget(snippet_edit)
+
+        # Buttons
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_btn)
+
+        add_btn = QPushButton("➕ Add Command")
+        add_btn.setProperty("accent", "true")
+
+        def on_add():
+            title = title_edit.text().strip()
+            snippet = snippet_edit.toPlainText().strip()
+            emoji = selected_emoji[0]
+
+            if not title or not snippet:
+                QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
+                return
+
+            # Get current template commands
+            template_commands = self.settings.get('template_commands', [])
+            template_commands.append({"title": title, "snippet": snippet, "emoji": emoji})
+            self.settings['template_commands'] = template_commands
+            self.save_settings()
+
+            # Refresh the header UI
+            self.refresh_template_commands_ui()
+            self.log(f"Added template command: {title}")
+            dialog.accept()
+
+        add_btn.clicked.connect(on_add)
+        button_row.addWidget(add_btn)
+
+        layout.addLayout(button_row)
         dialog.exec()
 
     def refresh_template_commands_ui(self):
@@ -7340,6 +7423,24 @@ class ADBGUI(QMainWindow):
         # Load template commands from settings
         template_commands = self.settings.get('template_commands', [])
 
+        # Add default template commands if none exist
+        if not template_commands:
+            default_commands = [
+                {
+                    "title": "Seat User",
+                    "snippet": "adb -s $CURRENT_DEVICE shell am start -n aero.panasonic.test.seatUser/aero.panasonic.test.user.UserTest",
+                    "emoji": "👤"
+                },
+                {
+                    "title": "Seat Service",
+                    "snippet": "adb -s $CURRENT_DEVICE shell am start -n aero.panasonic.inflight.app.seatback/aero.panasonic.android.seat.view.MainActivity",
+                    "emoji": "🔧"
+                }
+            ]
+            template_commands = default_commands
+            self.settings['template_commands'] = template_commands
+            self.save_settings()
+
         # Create buttons for each template command
         for cmd in template_commands:
             title = cmd.get('title', 'Command')
@@ -7347,6 +7448,16 @@ class ADBGUI(QMainWindow):
             emoji = cmd.get('emoji', '📱')
             btn = self._create_template_button(title, snippet, emoji)
             self.template_commands_layout.addWidget(btn)
+
+        # Add "+ Add Command" button
+        add_btn = QPushButton("➕ Add Command")
+        add_btn.setMaximumWidth(120)
+        add_btn.clicked.connect(self._on_add_command_header_clicked)
+        self.template_commands_layout.addWidget(add_btn)
+
+    def _on_add_command_header_clicked(self):
+        """Handler for Add Command button click in header - opens add command dialog directly"""
+        self._show_add_template_command_dialog()
 
     def _create_template_button(self, title, snippet, emoji="📱"):
         """Create a styled button for a template command"""
