@@ -43,6 +43,9 @@ except ImportError:
     _MirrorFrameSignal = None
     _check_embedded_mirror = None
 
+# Bundled seat.sh / portforwardRack.sh — deployed to ~/.cache/adb-gui-ui/scripts/
+import bundled_scripts
+
 
 # Application version - single source of truth. Bump on release.
 APP_VERSION = "1.1.0"
@@ -203,12 +206,83 @@ class SeatPortManager:
         return env
 
     def _get_seat_script_path(self):
-        """Get the configured seat.sh script path"""
-        return self.settings.get('seat_script_path', 'seat.sh')
+        """Resolve the seat.sh path — custom override or bundled fallback.
+
+        If a custom path is provided but missing/null, falls back to the
+        bundled script and emits a log if a log_callback is configured.
+        """
+        custom = self.settings.get('seat_script_path', '').strip()
+        # 'seat.sh' was the old PATH-reliant default; treat it as "use bundled"
+        if custom and custom != 'seat.sh':
+            if os.path.exists(custom):
+                return custom
+            # Custom path missing/no permissions — fall back internally
+            if self.log_callback:
+                self.log_callback(
+                    f"Custom seat.sh not found: {custom} — falling back to built-in script",
+                    "WARNING"
+                )
+                # Intentional drop-through to bundled
+        return bundled_scripts.get_seat_script_path()
 
     def _get_portforward_script_path(self):
-        """Get the configured portforward script path"""
-        return self.settings.get('portforward_script_path', '')
+        """Resolve the portforward script path — custom override or bundled fallback.
+
+        If a custom path is provided but missing/null, falls back to the
+        bundled script and emits a log if a log_callback is configured."""
+        custom = self.settings.get('portforward_script_path', '').strip()
+        if custom:
+            if os.path.exists(custom):
+                return custom
+            # Custom path missing/no permissions — fall back internally
+            if self.log_callback:
+                self.log_callback(
+                    f"Custom portforward script not found: {custom} — falling back to built-in script",
+                    "WARNING"
+                )
+                # Intentional drop-through to bundled
+        return bundled_scripts.get_portforward_script_path()
+
+    # ------------------------------------------------------------------
+    # Capability validation — make sure a custom script supports the
+    # sub-commands the GUI actually needs.  We run ``<script> --help``
+    # (both scripts print usage and exit 1 — no side effects) and grep
+    # the output for the required command names.
+    # ------------------------------------------------------------------
+
+    # Commands the GUI relies on for each script
+    _SEAT_REQUIRED_CMMANDS = ('auto-connect', 'devices', 'disconnect')
+    _PORTFORWARD_REQUIRED_COMMANDS = ('status', 'stop')
+
+    def validate_seat_script(self, script_path):
+        """Check that *script_path* supports the commands we need.
+
+        Returns ``(True, '')`` when OK, ``(False, 'missing: …')`` otherwise.
+        """
+        return self._validate_script(script_path, self._SEAT_REQUIRED_CMMANDS)
+
+    def validate_portforward_script(self, script_path):
+        """Check that *script_path* supports the commands we need."""
+        return self._validate_script(script_path, self._PORTFORWARD_REQUIRED_COMMANDS)
+
+    @staticmethod
+    def _validate_script(script_path, required_commands):
+        if not script_path or not os.path.exists(script_path):
+            return False, 'script not found'
+        try:
+            result = subprocess.run(
+                [script_path, '--help'],
+                capture_output=True, text=True, timeout=10,
+            )
+            # Both scripts print usage to stdout+stderr and exit 1
+            output = ((result.stdout or '') + ' ' + (result.stderr or '')).lower()
+        except Exception as exc:
+            return False, f'could not run --help: {exc}'
+
+        missing = [cmd for cmd in required_commands if cmd not in output]
+        if missing:
+            return False, 'missing: ' + ', '.join(missing)
+        return True, ''
 
     def load_history(self, entry_type='seat'):
         """Load connection history from the appropriate history file.
@@ -475,10 +549,23 @@ class SettingsDialog(QDialog):
 
         self.setWindowTitle("⚙️ Settings")
         self.setMinimumWidth(600)
+        self.setMaximumWidth(800)
+        self.setMinimumHeight(500)
         self.setModal(True)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(15)
+        # Main layout for dialog
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(0)
+
+        # Create scroll area for content that may exceed screen height
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        # Content widget for scroll area
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(15)
 
         # ADB Path section
         adb_group = QGroupBox("ADB Configuration")
@@ -497,7 +584,7 @@ class SettingsDialog(QDialog):
         adb_row.addWidget(adb_browse_btn)
 
         adb_layout.addLayout(adb_row)
-        layout.addWidget(adb_group)
+        content_layout.addWidget(adb_group)
 
         # Seat Script section
         seat_group = QGroupBox("Seat Management Script")
@@ -507,8 +594,12 @@ class SettingsDialog(QDialog):
         seat_layout.addWidget(seat_label)
 
         seat_row = QHBoxLayout()
-        self.seat_path_edit = QLineEdit(self.current_settings.get('seat_script_path', 'seat.sh'))
-        self.seat_path_edit.setPlaceholderText("Path to seat.sh (e.g., /usr/local/bin/seat.sh)")
+        # Empty means "use built-in"; migrate old 'seat.sh' default to empty
+        _seat_default = self.current_settings.get('seat_script_path', '')
+        if _seat_default == 'seat.sh':
+            _seat_default = ''
+        self.seat_path_edit = QLineEdit(_seat_default)
+        self.seat_path_edit.setPlaceholderText("Leave empty to use the built-in script")
         seat_row.addWidget(self.seat_path_edit)
 
         seat_browse_btn = QPushButton("📂 Browse")
@@ -516,7 +607,13 @@ class SettingsDialog(QDialog):
         seat_row.addWidget(seat_browse_btn)
 
         seat_layout.addLayout(seat_row)
-        layout.addWidget(seat_group)
+
+        seat_info = QLabel("Leave empty to use the built-in seat.sh. Set a custom path to override.")
+        seat_info.setStyleSheet("color: #666; font-size: 9pt;")
+        seat_info.setWordWrap(True)
+        seat_layout.addWidget(seat_info)
+
+        content_layout.addWidget(seat_group)
 
         # Port Forward Script section
         pf_group = QGroupBox("Port Forward Script")
@@ -527,7 +624,7 @@ class SettingsDialog(QDialog):
 
         pf_row = QHBoxLayout()
         self.pf_path_edit = QLineEdit(self.current_settings.get('portforward_script_path', ''))
-        self.pf_path_edit.setPlaceholderText("Path to port forwarding script (optional)")
+        self.pf_path_edit.setPlaceholderText("Leave empty to use the built-in script")
         pf_row.addWidget(self.pf_path_edit)
 
         pf_browse_btn = QPushButton("📂 Browse")
@@ -535,7 +632,13 @@ class SettingsDialog(QDialog):
         pf_row.addWidget(pf_browse_btn)
 
         pf_layout.addLayout(pf_row)
-        layout.addWidget(pf_group)
+
+        pf_info = QLabel("Leave empty to use the built-in portforwardRack.sh. Set a custom path to override.")
+        pf_info.setStyleSheet("color: #666; font-size: 9pt;")
+        pf_info.setWordWrap(True)
+        pf_layout.addWidget(pf_info)
+
+        content_layout.addWidget(pf_group)
 
         # Screenshots section
         screenshots_group = QGroupBox("📸 Screenshots")
@@ -569,7 +672,7 @@ class SettingsDialog(QDialog):
         screenshot_info.setWordWrap(True)
         screenshots_layout.addWidget(screenshot_info)
 
-        layout.addWidget(screenshots_group)
+        content_layout.addWidget(screenshots_group)
 
         # Security section
         security_group = QGroupBox("🔐 Security")
@@ -591,7 +694,7 @@ class SettingsDialog(QDialog):
         clear_pwd_btn.clicked.connect(self.clear_stored_passwords)
         security_layout.addWidget(clear_pwd_btn)
 
-        layout.addWidget(security_group)
+        content_layout.addWidget(security_group)
 
         # Template Commands section
         template_group = QGroupBox("📋 Template Commands")
@@ -624,7 +727,7 @@ class SettingsDialog(QDialog):
         template_buttons_row.addWidget(delete_template_btn)
 
         template_layout.addLayout(template_buttons_row)
-        layout.addWidget(template_group)
+        content_layout.addWidget(template_group)
 
         # Buttons
         button_row = QHBoxLayout()
@@ -645,7 +748,13 @@ class SettingsDialog(QDialog):
         save_btn.clicked.connect(self.save)
         button_row.addWidget(save_btn)
 
-        layout.addLayout(button_row)
+        content_layout.addLayout(button_row)
+
+        # Set content widget for scroll area
+        scroll_area.setWidget(content_widget)
+
+        # Add scroll area to main layout
+        main_layout.addWidget(scroll_area)
 
     def clear_stored_passwords(self):
         """Clear all stored passwords"""
@@ -1004,10 +1113,73 @@ class SettingsDialog(QDialog):
     def save(self):
         """Save settings"""
         if self.parent:
+            # Validate custom script paths before saving — but treat missing
+            # scripts as "will use bundled" rather than blocking the save.
+            seat_path = self.seat_path_edit.text().strip()
+            if seat_path and seat_path != 'seat.sh':
+                if not os.path.exists(seat_path):
+                    reply = QMessageBox.warning(
+                        self,
+                        "Seat Script Not Found",
+                        f"The selected seat script cannot be found:\n"
+                        f"  {seat_path}\n\n"
+                        f"Missing custom scripts fall back to the built-in seat.sh — this will not block\n"
+                        f"seat connections. You can fix the path later, or clear it to remove the custom override.",
+                        QMessageBox.StandardButton.Ok,
+                    )
+                    if reply != QMessageBox.StandardButton.Ok:
+                        return
+                else:
+                    valid, msg = self.parent.seat_port_manager.validate_seat_script(seat_path)
+                    if not valid:
+                        reply = QMessageBox.warning(
+                            self,
+                            "Seat Script Incompatible",
+                            f"The selected seat script is missing required commands:\n"
+                            f"  {msg}\n\n"
+                            f"Features like auto-connect, devices, and disconnect may not work.\n"
+                            f"Clear the path to use the built-in script.\n\n"
+                            f"Save anyway?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        )
+                        if reply != QMessageBox.StandardButton.Yes:
+                            return
+
+            pf_path = self.pf_path_edit.text().strip()
+            if pf_path:
+                if not os.path.exists(pf_path):
+                    reply = QMessageBox.warning(
+                        self,
+                        "Port Forward Script Not Found",
+                        f"The selected port forward script cannot be found:\n"
+                        f"  {pf_path}\n\n"
+                        f"Missing custom scripts fall back to the built-in portforwardRack.sh — this will\n"
+                        f"not block port forward connections. You can fix the path later, or clear it to remove\n"
+                        f"the custom override.",
+                        QMessageBox.StandardButton.Ok,
+                    )
+                    if reply != QMessageBox.StandardButton.Ok:
+                        return
+                else:
+                    valid, msg = self.parent.seat_port_manager.validate_portforward_script(pf_path)
+                    if not valid:
+                        reply = QMessageBox.warning(
+                            self,
+                            "Port Forward Script Incompatible",
+                            f"The selected port forward script is missing required commands:\n"
+                            f"  {msg}\n\n"
+                            f"Features like status and stop may not work.\n"
+                            f"Clear the path to use the built-in script.\n\n"
+                            f"Save anyway?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        )
+                        if reply != QMessageBox.StandardButton.Yes:
+                            return
+
             # Update parent's settings
             self.parent.settings['adb_path'] = self.adb_path_edit.text()
-            self.parent.settings['seat_script_path'] = self.seat_path_edit.text()
-            self.parent.settings['portforward_script_path'] = self.pf_path_edit.text()
+            self.parent.settings['seat_script_path'] = self.seat_path_edit.text().strip()
+            self.parent.settings['portforward_script_path'] = self.pf_path_edit.text().strip()
             self.parent.settings['template_commands'] = self.template_commands
             self.parent.save_settings()
 
@@ -1600,19 +1772,30 @@ class ADBGUI(QMainWindow):
         # Initialize Seat/Port Manager
         self.seat_port_manager = SeatPortManager(log_callback=self.log, settings=self.settings)
 
+        # Deploy bundled seat.sh / portforwardRack.sh so the app works
+        # out-of-the-box without external scripts on PATH.
+        try:
+            bundled_scripts.deploy()
+        except Exception as e:
+            self.log(f"Warning: could not deploy bundled scripts: {e}", "WARNING")
+
+        # Migrate the old PATH-reliant default ('seat.sh') to the bundled model.
+        if self.settings.get('seat_script_path', '').strip() == 'seat.sh':
+            self.settings['seat_script_path'] = ''
+            self.save_settings()
+        # Default script paths — empty means "use bundled"
+        if 'seat_script_path' not in self.settings:
+            self.settings['seat_script_path'] = ''
+            self.save_settings()
+        if 'portforward_script_path' not in self.settings:
+            self.settings['portforward_script_path'] = ''
+            self.save_settings()
+
         # Initialize Credential Manager
         self.credential_manager = CredentialManager()
 
         # Cached logcat text for filtering
         self._logcat_full_text = ""
-
-        # Default script paths
-        if 'seat_script_path' not in self.settings:
-            self.settings['seat_script_path'] = 'seat.sh'
-            self.save_settings()
-        if 'portforward_script_path' not in self.settings:
-            self.settings['portforward_script_path'] = ''
-            self.save_settings()
 
         self.setup_ui()
         self.update_adb_path_display()
@@ -3824,8 +4007,8 @@ class ADBGUI(QMainWindow):
 
         def do_connect():
             try:
-                # Get script path from settings
-                script_path = self.settings.get('seat_script_path', 'seat.sh')
+                # Resolve script path (custom override or bundled fallback)
+                script_path = self.seat_port_manager._get_seat_script_path()
 
                 # Build environment with adb in PATH so the script can find it
                 env = os.environ.copy()
@@ -3834,6 +4017,12 @@ class ADBGUI(QMainWindow):
                     adb_dir = os.path.dirname(adb_path)
                     if adb_dir:
                         env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
+
+                # Defensive: ensure script_path is non-empty and exists
+                if not script_path or not os.path.exists(script_path):
+                    self.log(f"Seat script missing or empty: {repr(script_path)}", "ERROR")
+                    self.update_status("seat.sh not found")
+                    return
 
                 # Use sshpass if available, otherwise try with stdin
                 if shutil.which('sshpass'):
@@ -3907,8 +4096,8 @@ class ADBGUI(QMainWindow):
 
         def do_disconnect():
             try:
-                # Get script path from settings
-                script_path = self.settings.get('seat_script_path', 'seat.sh')
+                # Resolve script path (custom override or bundled fallback)
+                script_path = self.seat_port_manager._get_seat_script_path()
 
                 # Build environment with adb in PATH so the script can find it
                 env = os.environ.copy()
@@ -3960,15 +4149,20 @@ class ADBGUI(QMainWindow):
 
         def do_connect():
             try:
-                # Get script path from settings
-                script_path = self.settings.get('portforward_script_path', '')
+                # Resolve script path (custom override or bundled fallback)
+                script_path = self.seat_port_manager._get_portforward_script_path()
 
-                # Check if script exists
+                # Check if script exists; fall back to bundled if not
                 if not os.path.exists(script_path):
-                    self.log(f"Port forward script not found: {script_path}", "ERROR")
-                    self.log("Please configure the correct path via Settings > Advanced", "ERROR")
-                    self.update_status("Port forward script not found")
-                    return
+                    fallback = bundled_scripts.get_portforward_script_path()
+                    if os.path.exists(fallback):
+                        self.log(f"Port forward script not found: {script_path} — falling back to built-in", "WARNING")
+                        script_path = fallback
+                    else:
+                        self.log(f"Port forward script not found: {script_path}", "ERROR")
+                        self.log("Please configure the correct path via Settings > Advanced", "ERROR")
+                        self.update_status("Port forward script not found")
+                        return
 
                 # Build environment with adb in PATH so the script can find it
                 env = os.environ.copy()
@@ -4090,13 +4284,18 @@ class ADBGUI(QMainWindow):
 
         def do_disconnect():
             try:
-                # Get script path from settings
-                script_path = self.settings.get('portforward_script_path', '')
+                # Resolve script path (custom override or bundled fallback)
+                script_path = self.seat_port_manager._get_portforward_script_path()
 
-                # Check if script exists
+                # Check if script exists; fall back to bundled if not
                 if not os.path.exists(script_path):
-                    self.log(f"Port forward script not found: {script_path}", "ERROR")
-                    return
+                    fallback = bundled_scripts.get_portforward_script_path()
+                    if os.path.exists(fallback):
+                        self.log(f"Port forward script not found: {script_path} — falling back to built-in", "WARNING")
+                        script_path = fallback
+                    else:
+                        self.log(f"Port forward script not found: {script_path}", "ERROR")
+                        return
 
                 # Build environment with adb in PATH so the script can find it
                 env = os.environ.copy()

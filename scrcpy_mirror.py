@@ -1772,26 +1772,31 @@ class ScrcpyMirrorWindow(QMainWindow):
             pass
 
     def _take_screenshot(self):
-        """Capture a screenshot of the current frame and save it."""
-        import os
-        import datetime
-        import subprocess
-        import sys
+        """Capture a screenshot of the current frame and save it.
 
+        Runs the adb calls on a background thread so the Qt main thread
+        (and the video stream) stay responsive — `adb pull` over network
+        or localhost links can easily take 20+ seconds, which would
+        otherwise freeze the whole mirror window.
+        """
         if self._client is None:
             return
 
-        # Determine screenshot save directory
-        # Priority: provided path > user setting > Desktop > project directory
-        screenshots_dir = self.screenshot_path or ''
+        # Snapshot everything we need from the Qt thread before crossing
+        # the thread boundary (avoids touching self.* from the worker).
+        adb_path = self.adb_path if self.adb_path else "adb"
+        device_id = self.device_id
 
+        # Determine screenshot save directory (same priority as before).
+        import os
+        import datetime
+        import subprocess
+        screenshots_dir = self.screenshot_path or ''
         if not screenshots_dir:
-            # Default to Desktop if available, otherwise project directory
             desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
             if os.path.exists(desktop):
                 screenshots_dir = desktop
             else:
-                # Fallback to executable/script directory
                 if getattr(sys, 'frozen', False):
                     project_dir = os.path.dirname(sys.executable)
                 else:
@@ -1799,57 +1804,102 @@ class ScrcpyMirrorWindow(QMainWindow):
                 screenshots_dir = os.path.join(project_dir, 'screenshots')
 
         os.makedirs(screenshots_dir, exist_ok=True)
-
-        # Generate filename with timestamp
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"screenshot_{timestamp}.png"
         dest_path = os.path.join(screenshots_dir, filename)
 
+        # Show the in-progress status immediately on the UI thread, then
+        # do all the actual work in the background.
         self.status.showMessage("Taking screenshot...")
 
-        adb_path = self.adb_path if self.adb_path else "adb"
-        # Use a list of arguments (not shell=True) to avoid any quoting
-        # issues with device IDs that contain special characters.
-        base_cmd = [adb_path]
-        if self.device_id:
-            base_cmd += ["-s", self.device_id]
+        def _do_capture():
+            """Background worker: runs adb, never touches Qt widgets."""
+            base_cmd = [adb_path]
+            if device_id:
+                base_cmd += ["-s", device_id]
 
-        try:
-            # Take screenshot on device
-            cmd = base_cmd + ["shell", "screencap", "-p", "/sdcard/screenshot.png"]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10
-            )
-            if result.returncode != 0:
-                self.status.showMessage(f"Screenshot failed: {result.stderr}")
-                return
+            try:
+                # screencap on device.
+                cmd = base_cmd + ["shell", "screencap", "-p", "/sdcard/screenshot.png"]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=60
+                )
+                if result.returncode != 0:
+                    err = result.stderr.strip() or "screencap failed"
+                    QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                        ok=False, dest_path=dest_path, filename=filename,
+                        error=err, skipped_pull=False,
+                    ))
+                    return
 
-            # Pull screenshot
-            cmd = base_cmd + ["pull", "/sdcard/screenshot.png", dest_path]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10
-            )
-            if result.returncode != 0:
-                self.status.showMessage(f"Screenshot failed: {result.stderr}")
-                return
+                # Pull to local. Generous timeout — localhost/network adb
+                # pulls can take 20+ seconds for a single frame.
+                cmd = base_cmd + ["pull", "/sdcard/screenshot.png", dest_path]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=300
+                )
+                if result.returncode != 0:
+                    err = result.stderr.strip() or "pull failed"
+                    QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                        ok=False, dest_path=dest_path, filename=filename,
+                        error=err, skipped_pull=True,
+                    ))
+                    return
 
-            # Delete from device
-            cmd = base_cmd + ["shell", "rm", "/sdcard/screenshot.png"]
-            subprocess.run(cmd, capture_output=True, timeout=5)
+                # Best-effort cleanup of the device-side file.
+                cmd = base_cmd + ["shell", "rm", "/sdcard/screenshot.png"]
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=10)
+                except Exception:
+                    pass  # cleanup is non-fatal
 
-            self.status.showMessage(f"Screenshot saved: {filename}")
+                QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                    ok=True, dest_path=dest_path, filename=filename,
+                    error=None, skipped_pull=False,
+                ))
+            except subprocess.TimeoutExpired as e:
+                QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                    ok=False, dest_path=dest_path, filename=filename,
+                    error=f"adb timed out after {e.timeout}s", skipped_pull=True,
+                ))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                    ok=False, dest_path=dest_path, filename=filename,
+                    error=str(e), skipped_pull=False,
+                ))
 
-            # Show success message
-            QMessageBox.information(
-                self, "Screenshot Saved",
-                f"Screenshot saved to:\n{dest_path}"
-            )
-        except Exception as e:
-            self.status.showMessage(f"Screenshot failed: {str(e)}")
+        threading.Thread(target=_do_capture, daemon=True).start()
+
+    def _on_screenshot_done(self, ok, dest_path, filename, error, skipped_pull):
+        """Qt-thread handler invoked by _take_screenshot's worker.
+
+        All UI updates (status bar, dialogs) happen here on the main thread.
+        """
+        if not ok:
+            # If pull failed, the screencap file may still be sitting on
+            # the device — try to clean it up so we don't leave litter.
+            if skipped_pull and self.adb_path and self.device_id:
+                try:
+                    import subprocess as _sp
+                    _sp.run(
+                        [self.adb_path, "-s", self.device_id,
+                         "shell", "rm", "/sdcard/screenshot.png"],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+            self.status.showMessage(f"Screenshot failed: {error}")
             QMessageBox.warning(
                 self, "Screenshot Failed",
-                f"Failed to take screenshot:\n{str(e)}"
+                f"Failed to take screenshot:\n{error}",
             )
+            return
+
+        self.status.showMessage(f"Screenshot saved: {filename}")
+        QMessageBox.information(
+            self, "Screenshot Saved",
+            f"Screenshot saved to:\n{dest_path}",
+        )
 
     # ──────────────────────────────────────────────────────────────────
     #  Keyboard shortcuts
