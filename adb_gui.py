@@ -858,18 +858,14 @@ class SettingsDialog(QDialog):
             layout.addWidget(btn)
 
     def _select_emoji(self, emoji):
-        """Handle emoji selection"""
-        self.emoji_selected.setText(emoji)
+        """Handle emoji selection from button click"""
+        # Update the input field
+        if hasattr(self, 'emoji_input'):
+            self.emoji_input.setText(emoji)
         # Highlight the selected emoji button
         for btn in getattr(self, 'emoji_buttons', []):
             if btn.text() == emoji:
-                btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: %s;
-                        border: 2px solid #007AFF;
-                        border-radius: 6px;
-                    }
-                """ % self.colors['accent'])
+                btn.setStyleSheet(f"border: 2px solid {self.colors['accent']}; border-radius: 6px;")
             else:
                 btn.setStyleSheet("")
 
@@ -888,30 +884,31 @@ class SettingsDialog(QDialog):
         emoji_label = QLabel("Emoji Icon:")
         layout.addWidget(emoji_label)
 
+        # Free emoji input
+        self.emoji_input = QLineEdit()
+        self.emoji_input.setText("📱")
+        self.emoji_input.setMaxLength(4)
+        self.emoji_input.setPlaceholderText("Type any emoji...")
+        self.emoji_input.setMinimumHeight(40)
+        self.emoji_input.setFont(QFont('', 18))
+        layout.addWidget(self.emoji_input)
+
         emoji_row = QHBoxLayout()
 
         # Common emojis for quick selection
-        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺"]
+        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺", "🔧", "⚙️", "🚀", "⚡", "🔥", "🎨"]
 
-        self._add_emoji_buttons_to_layout(emoji_row, common_emojis)
+        self.emoji_buttons = []
+        for emoji in common_emojis:
+            btn = QPushButton(emoji)
+            btn.setFixedSize(40, 40)
+            btn.setFont(QFont('', 16))
+            btn.clicked.connect(lambda checked, e=emoji: self._select_emoji(e))
+            emoji_row.addWidget(btn)
+            self.emoji_buttons.append(btn)
 
         emoji_row.addStretch()
         layout.addLayout(emoji_row)
-
-        # Currently selected emoji display
-        self.emoji_selected = QLabel("📱")
-        self.emoji_selected.setFont(QFont('', 24))
-        self.emoji_selected.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.emoji_selected.setStyleSheet(f"""
-            QLabel {{
-                background-color: {self.colors['card_bg']};
-                border: 2px solid {self.colors['border']};
-                border-radius: 8px;
-                padding: 10px;
-                min-width: 60px;
-            }}
-        """)
-        layout.addWidget(self.emoji_selected, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Title
         title_label = QLabel("Command Title:")
@@ -956,7 +953,7 @@ class SettingsDialog(QDialog):
         def on_add():
             title = title_edit.text().strip()
             snippet = snippet_edit.toPlainText().strip()
-            emoji = self.emoji_selected.text()
+            emoji = self.emoji_input.text()
 
             if not title or not snippet:
                 QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
@@ -994,34 +991,27 @@ class SettingsDialog(QDialog):
         emoji_label = QLabel("Emoji Icon:")
         layout.addWidget(emoji_label)
 
+        # Free emoji input
+        edit_emoji_input = QLineEdit()
+        edit_emoji_input.setText(cmd.get('emoji', '📱'))
+        edit_emoji_input.setMaxLength(4)
+        edit_emoji_input.setPlaceholderText("Type any emoji...")
+        edit_emoji_input.setMinimumHeight(40)
+        edit_emoji_input.setFont(QFont('', 18))
+        layout.addWidget(edit_emoji_input)
+
         emoji_row = QHBoxLayout()
 
         # Common emojis for quick selection
-        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺"]
-
-        current_emoji = cmd.get('emoji', '📱')
-
-        # Create edit emoji selection (using dialog-local state)
-        edit_emoji_selected = QLabel(current_emoji)
-        edit_emoji_selected.setFont(QFont('', 24))
-        edit_emoji_selected.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        edit_emoji_selected.setStyleSheet(f"""
-            QLabel {{
-                background-color: {self.colors['card_bg']};
-                border: 2px solid {self.colors['border']};
-                border-radius: 8px;
-                padding: 10px;
-                min-width: 60px;
-            }}
-        """)
+        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺", "🔧", "⚙️", "🚀", "⚡", "🔥", "🎨"]
 
         edit_emoji_buttons = []
         for emoji in common_emojis:
             btn = QPushButton(emoji)
             btn.setFixedSize(40, 40)
             btn.setFont(QFont('', 16))
-            btn.clicked.connect(lambda checked, e=emoji, sel_label=edit_emoji_selected, btns=edit_emoji_buttons, b=btn: (
-                sel_label.setText(e),
+            btn.clicked.connect(lambda checked, e=emoji, sel_input=edit_emoji_input, btns=edit_emoji_buttons, b=btn: (
+                sel_input.setText(e),
                 [button.setStyleSheet("") for button in btns],
                 b.setStyleSheet(f"border: 2px solid {self.colors['accent']}; border-radius: 6px;")
             ))
@@ -1030,8 +1020,6 @@ class SettingsDialog(QDialog):
 
         emoji_row.addStretch()
         layout.addLayout(emoji_row)
-
-        layout.addWidget(edit_emoji_selected, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Title
         title_label = QLabel("Command Title:")
@@ -1076,7 +1064,7 @@ class SettingsDialog(QDialog):
         def on_save():
             title = title_edit.text().strip()
             snippet = snippet_edit.toPlainText().strip()
-            emoji = edit_emoji_selected.text()
+            emoji = edit_emoji_input.text()
 
             if not title or not snippet:
                 QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
@@ -7527,9 +7515,18 @@ class ADBGUI(QMainWindow):
         layout = QVBoxLayout(dialog)
         layout.setSpacing(15)
 
+        # Free emoji input
+        emoji_input = QLineEdit()
+        emoji_input.setText("📱")
+        emoji_input.setMaxLength(4)
+        emoji_input.setPlaceholderText("Type any emoji...")
+        emoji_input.setMinimumHeight(40)
+        emoji_input.setFont(QFont('', 18))
+        layout.addWidget(emoji_input)
+
         # Emoji selector
         emoji_row = QHBoxLayout()
-        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺"]
+        common_emojis = ["📱", "📷", "💻", "🔑", "💾", "🔋", "📡", "🎧", "🔦", "📺", "🔧", "⚙️", "🚀", "⚡", "🔥", "🎨"]
         selected_emoji = ["📱"]  # Track selected emoji
 
         emoji_buttons = []
@@ -7537,7 +7534,8 @@ class ADBGUI(QMainWindow):
             btn = QPushButton(emoji)
             btn.setFixedSize(40, 40)
             btn.setFont(QFont('', 14))
-            btn.clicked.connect(lambda checked, e=emoji, sel_list=selected_emoji, b=btn, buttons=emoji_buttons: (
+            btn.clicked.connect(lambda checked, e=emoji, sel_input=emoji_input, sel_list=selected_emoji, b=btn, buttons=emoji_buttons: (
+                sel_input.setText(e),
                 sel_list.__setitem__(0, e),
                 [button.setStyleSheet("") for button in buttons],
                 b.setStyleSheet(f"border: 2px solid {self.colors['accent']}; border-radius: 6px;")
@@ -7588,7 +7586,7 @@ class ADBGUI(QMainWindow):
         def on_add():
             title = title_edit.text().strip()
             snippet = snippet_edit.toPlainText().strip()
-            emoji = selected_emoji[0]
+            emoji = emoji_input.text()
 
             if not title or not snippet:
                 QMessageBox.warning(dialog, "Invalid Input", "Both title and snippet are required")
