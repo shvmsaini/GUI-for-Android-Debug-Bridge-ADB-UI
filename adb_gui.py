@@ -10,6 +10,8 @@ import shutil
 import time
 import re
 from datetime import datetime
+from typing import Optional
+from subprocess import TimeoutExpired
 
 # Platform-specific imports
 if sys.platform == 'win32':
@@ -222,13 +224,16 @@ class MigrationWizard(QDialog):
     # seat.sh, seat1.sh, Seat.sh, etc. + tunnel/auto-connect/ac/connect commands
     # Also handles full paths: /opt/homebrew/bin/seat.sh, ~/seat.sh
     # Also handles 'sh /path/to/seat.sh' format from fish history
+    # Also handles 'bash /path/to/seat.sh' and ./seat.sh tunnel, etc.
     SEAT_PATTERNS = [
-        # Standard seat.sh patterns (with optional path prefix and 'sh' prefix)
+        # Standard seat.sh patterns (with optional path prefix, optional shell, and optional './')
         # Match: seat.sh tunnel SEAT GATEWAY [PORT]
+        # Match: ./seat.sh tunnel SEAT GATEWAY [PORT]
         # Match: /opt/homebrew/bin/seat.sh tunnel SEAT GATEWAY [PORT]
         # Match: sh /path/to/seat.sh tunnel SEAT GATEWAY [PORT]
+        # Match: bash /path/to/seat.sh tunnel SEAT GATEWAY [PORT]
         re.compile(
-            r'(?:sh\s+)?\S*seat\w*\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)\s*(?:(\d{4,5}))?$',
+            r'(?:(?:\S*(?:sh|bash)\s+)|(\.\/))?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)\s*(?:(\d{4,5}))?$',
             re.IGNORECASE
         ),
         # Legacy/simple pattern: tunnel SEAT GATEWAY [PORT]
@@ -909,7 +914,7 @@ class SeatPortManager:
     # ------------------------------------------------------------------
 
     # Commands the GUI relies on for each script
-    _SEAT_REQUIRED_CMMANDS = ('auto-connect', 'devices', 'disconnect')
+    _SEAT_REQUIRED_CMMANDS = ('auto-connect', 'devices', 'disconnect', 'setup-adbkey')
     _PORTFORWARD_REQUIRED_COMMANDS = ('status', 'stop')
 
     def validate_seat_script(self, script_path):
@@ -1078,6 +1083,50 @@ class SeatPortManager:
     def is_portforward_connected(self, gateway):
         """Check if port forward is connected"""
         return self.connected_portforward == gateway
+
+    def kill_seat_tunnel(self, seat, gateway=None):
+        """Kill any stale SSH tunnels associated with this seat.
+
+        `seat.sh auto-connect` runs `ssh -f -N -L <port>:<seat>:5555 <gateway>`,
+        which detaches a background ssh process that holds the local port
+        for the lifetime of the SSH connection.  A normal `seat.sh disconnect`
+        only calls `adb disconnect` — it does *not* kill this detached ssh.
+
+        Over time (or when the GUI was force-killed mid-session), orphan
+        tunnels accumulate and the saved port stays bound.  The next
+        `auto-connect` then fails with `bind [127.0.0.1]:<port>: Address
+        already in use`.
+
+        Call this before re-connecting, and whenever a seat's device is
+        detected as offline, so the local port is free for the retry.
+
+        Args:
+            seat: seat name (e.g. ``seat007``) — used to match the
+                ``-L *:<seat>:5555`` tunnel form.
+            gateway: optional SSH gateway host — used to also match any
+                ``-L`` or ``-J`` tunnels to that gateway (the install-key
+                ProxyJump uses ``-J``).
+        """
+        seat_re = re.escape(seat)
+        patterns = [
+            f'ssh.*-L.*:{seat_re}:5555',  # the auto-connect -L tunnel
+        ]
+        if gateway:
+            patterns.append(f'ssh.*-J.*{re.escape(gateway)}')  # install-key ProxyJump
+            patterns.append(f'ssh.*-L.*{re.escape(gateway)}')  # any -L via this gateway
+        for pat in patterns:
+            try:
+                subprocess.run(
+                    ['pkill', '-f', pat],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+        # Give the kernel a moment to release the bound port
+        try:
+            time.sleep(0.5)
+        except Exception:
+            pass
 
     def get_portforward_status(self):
         """Get current port forward status from script
@@ -3064,9 +3113,9 @@ class ADBGUI(QMainWindow):
         seat_group_layout = QVBoxLayout(seat_group)
         seat_group_layout.setContentsMargins(15, 20, 15, 15)
         seat_group_layout.setSpacing(4)
-        # Add search filter
-        seat_search_layout = QHBoxLayout()
-        seat_search_label = QLabel("Search:")
+        # Add header with search and add button
+        seat_header_layout = QHBoxLayout()
+        seat_header_layout.addWidget(QLabel("Search:"))
         self.seat_search_entry = QLineEdit()
         self.seat_search_entry.setPlaceholderText("Filter seats...")
         # Debounce search to avoid lag - only refresh 300ms after user stops typing
@@ -3075,9 +3124,27 @@ class ADBGUI(QMainWindow):
         self._seat_search_timer.setInterval(300)
         self._seat_search_timer.timeout.connect(lambda: self.refresh_seat_port_lists(refetch=False))
         self.seat_search_entry.textChanged.connect(self._seat_search_timer.start)
-        seat_search_layout.addWidget(seat_search_label)
-        seat_search_layout.addWidget(self.seat_search_entry)
-        seat_group_layout.addLayout(seat_search_layout)
+        seat_header_layout.addWidget(self.seat_search_entry)
+        seat_header_layout.addStretch()
+        # Add button to connect to a new seat
+        add_seat_btn = QPushButton("+ Connect New Seat")
+        add_seat_btn.setMaximumWidth(140)
+        add_seat_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        add_seat_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.colors['accent']};
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors['accent_hover']};
+            }}
+        """)
+        add_seat_btn.clicked.connect(self._show_add_seat_dialog)
+        seat_header_layout.addWidget(add_seat_btn)
+        seat_group_layout.addLayout(seat_header_layout)
         # Seat list container with scroll area
         self.seat_scroll_area = QScrollArea()
         self.seat_scroll_area.setWidgetResizable(True)
@@ -3098,9 +3165,9 @@ class ADBGUI(QMainWindow):
         portforward_group_layout = QVBoxLayout(portforward_group)
         portforward_group_layout.setContentsMargins(15, 20, 15, 15)
         portforward_group_layout.setSpacing(4)
-        # Add search filter
-        pf_search_layout = QHBoxLayout()
-        pf_search_label = QLabel("Search:")
+        # Add header with search and add button
+        pf_header_layout = QHBoxLayout()
+        pf_header_layout.addWidget(QLabel("Search:"))
         self.pf_search_entry = QLineEdit()
         self.pf_search_entry.setPlaceholderText("Filter port forwards...")
         # Debounce search to avoid lag - only refresh 300ms after user stops typing
@@ -3109,9 +3176,27 @@ class ADBGUI(QMainWindow):
         self._pf_search_timer.setInterval(300)
         self._pf_search_timer.timeout.connect(lambda: self.refresh_seat_port_lists(refetch=False))
         self.pf_search_entry.textChanged.connect(self._pf_search_timer.start)
-        pf_search_layout.addWidget(pf_search_label)
-        pf_search_layout.addWidget(self.pf_search_entry)
-        portforward_group_layout.addLayout(pf_search_layout)
+        pf_header_layout.addWidget(self.pf_search_entry)
+        pf_header_layout.addStretch()
+        # Add button to connect to a new port forward
+        add_pf_btn = QPushButton("+ New Port Forward")
+        add_pf_btn.setMaximumWidth(140)
+        add_pf_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        add_pf_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.colors['accent']};
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors['accent_hover']};
+            }}
+        """)
+        add_pf_btn.clicked.connect(self._show_add_portforward_dialog)
+        pf_header_layout.addWidget(add_pf_btn)
+        portforward_group_layout.addLayout(pf_header_layout)
         # Port forward list container with scroll area
         self.pf_scroll_area = QScrollArea()
         self.pf_scroll_area.setWidgetResizable(True)
@@ -3235,13 +3320,18 @@ class ADBGUI(QMainWindow):
         content_layout.addWidget(self.logs_group, 2)
         main_layout.addLayout(content_layout, 1)
         
-        # Status bar
+        # Status bar - fixed height to prevent growing too big with long messages
         self.status_bar = QLabel("Ready")
+        self.status_bar.setMaximumHeight(40)
+        self.status_bar.setMinimumHeight(30)
+        self.status_bar.setWordWrap(False)
+        self.status_bar.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.status_bar.setStyleSheet(f"""
             background-color: {self.colors['card_bg']};
             border: 1px solid {self.colors['border']};
-            padding: 8px 15px;
+            padding: 6px 15px;
             color: {self.colors['text_secondary']};
+            font-size: 10pt;
         """)
         main_layout.addWidget(self.status_bar)
 
@@ -3752,7 +3842,9 @@ class ADBGUI(QMainWindow):
             scrollbar.setValue(scrollbar.maximum())
 
     def update_status(self, message):
-        """Update status bar"""
+        """Update status bar - truncate long messages to keep bar height fixed"""
+        if message and len(message) > 120:
+            message = message[:117] + "..."
         self.status_bar.setText(message)
     
     def update_adb_path_display(self):
@@ -3815,6 +3907,42 @@ class ADBGUI(QMainWindow):
         # Cache for instant device-info lookups from the UI thread (avoids
         # running `adb devices -l` again on every button click).
         self.cached_devices = list(devices)
+
+        # Auto-disconnect offline devices
+        # An offline device means the seat tunnel died but state wasn't cleared
+        offline_devices = [d for d in devices if d.get('status') == 'offline']
+        if offline_devices:
+            self.log(f"Found {len(offline_devices)} offline device(s), auto-disconnecting", "INFO")
+            for offline_dev in offline_devices:
+                dev_id = offline_dev.get('id')
+                if not dev_id:
+                    continue
+                # Find which seat this device belongs to via seat.sh
+                seat_to_disconnect = None
+                seat_gateway = None
+                for dev_info in seat_sh_devices:
+                    if dev_info.get('device') == dev_id and dev_info.get('seat'):
+                        seat_to_disconnect = dev_info['seat']
+                        seat_gateway = dev_info.get('gateway')
+                        break
+
+                # Try to kill the adb connection to force cleanup
+                try:
+                    self.adb.run_command(f'disconnect {dev_id}')
+                except Exception:
+                    pass
+
+                # If we found a matching seat, mark it as disconnected
+                if seat_to_disconnect:
+                    self.seat_port_manager.mark_seat_disconnected(seat_to_disconnect)
+                    # Reap the orphaned SSH tunnel — `adb disconnect` does
+                    # not kill the `ssh -f -N -L <port>:<seat>:5555` process,
+                    # so without this the saved port stays bound and the
+                    # next reconnect attempt fails with "Address already in use".
+                    self.seat_port_manager.kill_seat_tunnel(seat_to_disconnect, seat_gateway)
+                    self.log(f"Auto-disconnected offline seat: {seat_to_disconnect}", "INFO")
+                else:
+                    self.log(f"Auto-disconnected offline device: {dev_id}", "INFO")
 
         # Reconcile seat connection state against actual adb devices.
         # A seat whose device (e.g. localhost:64491) is no longer in
@@ -4797,10 +4925,22 @@ class ADBGUI(QMainWindow):
         # Inherits the local defaults: 3 Mbps / 60 fps.
         self._open_mirror_window(device_id=device_id)
 
-    def connect_seat(self, seat, gateway):
+    def connect_seat(self, seat, gateway, install_adb_key=False, adb_key=None,
+                  device_password=None, mtc_password=None, root_password=None):
         """Connect to a seat"""
         self.log(f"Connecting to seat {seat} via {gateway}...")
         self.update_status(f"Connecting to {seat}...")
+
+        # Store for use in do_connect closure
+        self._pending_adb_key = adb_key if install_adb_key else None
+        self._pending_device_password = device_password
+        self._pending_mtc_password = mtc_password
+        self._pending_root_password = root_password
+
+        # Normalize gateway to ensure user@ prefix (fixes plain hostname inputs)
+        gateway = gateway.strip()
+        if '@' not in gateway:
+            gateway = f'user@{gateway}'
 
         # Parse user from gateway
         parts = gateway.split('@')
@@ -4818,6 +4958,12 @@ class ADBGUI(QMainWindow):
 
         def do_connect():
             try:
+                # Kill any stale SSH tunnels for this seat before connecting.
+                # `seat.sh auto-connect` runs `ssh -f -N -L <port>:<seat>:5555 <gw>`
+                # and does NOT reap it on disconnect; orphans keep the local port
+                # bound and cause "Address already in use" on the next attempt.
+                self.seat_port_manager.kill_seat_tunnel(seat, gateway)
+
                 # Resolve script path (custom override or bundled fallback)
                 script_path = self.seat_port_manager._get_seat_script_path()
 
@@ -4877,6 +5023,8 @@ class ADBGUI(QMainWindow):
                     "error",
                     "FAILED",
                     "failed",
+                    "Address already in use",  # Port conflict
+                    "cannot listen to port",     # Port is already bound
                 ]
                 has_error = (
                     returncode != 0
@@ -4886,6 +5034,25 @@ class ADBGUI(QMainWindow):
 
                 if not has_error:
                     self.seat_port_manager.mark_seat_connected(seat, gateway)
+                    # Install ADB key if requested
+                    adb_key = getattr(self, '_pending_adb_key', None)
+                    device_password = getattr(self, '_pending_device_password', None)
+                    mtc_password = getattr(self, '_pending_mtc_password', None)
+                    root_password = getattr(self, '_pending_root_password', None)
+                    if adb_key and device_password and root_password:
+                        # Wait for the seat port forward (5555) to become available
+                        # so adb devices shows the device IP
+                        time.sleep(2)
+                        threading.Thread(target=self._install_adb_key_on_seat,
+                                       args=(seat, gateway, adb_key, device_password,
+                                             mtc_password, root_password),
+                                       daemon=True).start()
+                        self.log("ADB key installation thread started", "INFO")
+                    else:
+                        self.log("Not installing ADB key (missing credentials or flag)", "INFO")
+
+                    # Add to history for quick access
+                    self.seat_port_manager.append_history(seat, '5555', gateway, 'seat')
                     self.log(f"Connected to seat {seat}", "INFO")
                     self.update_status(f"Connected to {seat}")
                     QTimer.singleShot(0, self.refresh_seat_port_lists)
@@ -4893,10 +5060,104 @@ class ADBGUI(QMainWindow):
                 else:
                     error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
                     self.log(f"Failed to connect to seat: {error}", "ERROR")
-                    self.update_status("Failed to connect")
+                    self.log("Not installing ADB key (connection failed)", "ERROR")
+                    self.update_status(f"Failed: {error}")
+                    # Auto-disconnect so a retry can re-bind the saved port:
+                    # kill any orphaned SSH tunnel for this seat, mark the seat
+                    # disconnected, and tear down the half-state adb device.
+                    try:
+                        script_path = self.seat_port_manager._get_seat_script_path()
+                        subprocess.run([script_path, 'disconnect', seat],
+                                       capture_output=True, text=True, timeout=15, env=env)
+                    except Exception:
+                        pass
+                    self.seat_port_manager.kill_seat_tunnel(seat, gateway)
+                    self.seat_port_manager.mark_seat_disconnected(seat)
+                    QTimer.singleShot(0, self.refresh_seat_port_lists)
+                    # Show dialog to user about the failure
+                    def show_error():
+                        msg = QMessageBox(self)
+                        msg.setIcon(QMessageBox.Icon.Critical)
+                        msg.setWindowTitle("Seat Connection Failed")
+                        msg.setText(f"Failed to connect to seat {seat}")
+                        msg.setInformativeText(error)
+                        msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Retry)
+                        msg.button(QMessageBox.StandardButton.Retry).setText("Retry")
+                        msg.setDefaultButton(QMessageBox.StandardButton.Retry)
+                        result = msg.exec()
+                        if result == QMessageBox.StandardButton.Retry:
+                            # Retry the connection
+                            self.connect_seat(seat, gateway,
+                                            install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
+                                            adb_key=getattr(self, '_pending_adb_key', None),
+                                            device_password=getattr(self, '_pending_device_password', None),
+                                            root_password=getattr(self, '_pending_root_password', None))
+                    QTimer.singleShot(0, show_error)
+            except TimeoutExpired as te:
+                # Command timed out - show specific message and disconnect
+                error = f"Connection timed out after {te.timeout} seconds. The seat.sh command is taking too long. Check your network connection or credentials."
+                self.log(f"Failed to connect to seat (timeout): {error}", "ERROR")
+                self.log("Not installing ADB key (connection failed)", "ERROR")
+                self.update_status("Failed: Connection timeout")
+                # Disconnect any stale port forward + reap the SSH tunnel
+                self.seat_port_manager.mark_seat_disconnected(seat)
+                self.seat_port_manager.kill_seat_tunnel(seat, gateway)
+                try:
+                    script_path = self.seat_port_manager._get_seat_script_path()
+                    subprocess.run([script_path, 'disconnect', seat],
+                                   capture_output=True, text=True, timeout=15, env=env)
+                except Exception:
+                    pass
+                QTimer.singleShot(0, self.refresh_seat_port_lists)
+                def show_timeout_error():
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Icon.Warning)
+                    msg.setWindowTitle("Seat Connection Timeout")
+                    msg.setText(f"Connection to seat {seat} timed out")
+                    msg.setInformativeText(error)
+                    msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Retry)
+                    msg.button(QMessageBox.StandardButton.Retry).setText("Retry")
+                    msg.setDefaultButton(QMessageBox.StandardButton.Retry)
+                    result = msg.exec()
+                    if result == QMessageBox.StandardButton.Retry:
+                        # Retry the connection
+                        self.connect_seat(seat, gateway,
+                                        install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
+                                        adb_key=getattr(self, '_pending_adb_key', None),
+                                        device_password=getattr(self, '_pending_device_password', None),
+                                        root_password=getattr(self, '_pending_root_password', None))
+                QTimer.singleShot(0, show_timeout_error)
             except Exception as e:
                 self.log(f"Error connecting to seat: {str(e)}", "ERROR")
+                self.log("Not installing ADB key (exception)", "ERROR")
                 self.update_status("Error connecting")
+                # Tear down any partial state so a retry starts clean
+                self.seat_port_manager.mark_seat_disconnected(seat)
+                self.seat_port_manager.kill_seat_tunnel(seat, gateway)
+                try:
+                    script_path = self.seat_port_manager._get_seat_script_path()
+                    subprocess.run([script_path, 'disconnect', seat],
+                                   capture_output=True, text=True, timeout=15, env=env)
+                except Exception:
+                    pass
+                QTimer.singleShot(0, self.refresh_seat_port_lists)
+                def show_error():
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Icon.Critical)
+                    msg.setWindowTitle("Seat Connection Error")
+                    msg.setText(f"Error connecting to seat {seat}")
+                    msg.setInformativeText(str(e))
+                    msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Retry)
+                    msg.button(QMessageBox.StandardButton.Retry).setText("Retry")
+                    result = msg.exec()
+                    if result == QMessageBox.StandardButton.Retry:
+                        # Retry the connection
+                        self.connect_seat(seat, gateway,
+                                        install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
+                                        adb_key=getattr(self, '_pending_adb_key', None),
+                                        device_password=getattr(self, '_pending_device_password', None),
+                                        root_password=getattr(self, '_pending_root_password', None))
+                QTimer.singleShot(0, show_error)
 
         threading.Thread(target=do_connect, daemon=True).start()
 
@@ -4936,6 +5197,259 @@ class ADBGUI(QMainWindow):
                 self.update_status("Error disconnecting")
 
         threading.Thread(target=do_disconnect, daemon=True).start()
+
+    def _install_adb_key_on_seat(self, seat, gateway, adb_key, device_password, mtc_password=None, root_password=None):
+        """Install ADB public key on the seat via ``seat.sh setup-adbkey``.
+
+        The actual ssh -> mtc@device -> sudo su[/su -] -> append key flow lives
+        in seat.sh so the escalation logic (sudo su vs sudo su + su -) is
+        owned by the script. This method is just a thin wrapper that:
+          - resolves the script path
+          - exposes the ADB pubkey via ADB_PUBKEY env var
+          - hands the gateway / mtc / sudo passwords through sshpass / SSH_ASKPASS
+          - surfaces stdout/stderr to the app log
+        """
+        self.log(f"Installing ADB key on seat {seat} via seat.sh setup-adbkey...", "INFO")
+
+        # Strip any user@ prefix from the gateway so the script sees a bare
+        # hostname (matching auto-connect's convention).
+        gateway_host = gateway.split('@', 1)[1] if '@' in gateway else gateway
+
+        try:
+            script_path = self.seat_port_manager._get_seat_script_path()
+            if not script_path or not os.path.exists(script_path):
+                self.log(f"Seat script missing or empty: {repr(script_path)}", "ERROR")
+                return
+
+            # Build env: adb in PATH + ADB_PUBKEY
+            env = os.environ.copy()
+            adb_path = self.settings.get('adb_path', '')
+            if adb_path:
+                adb_dir = os.path.dirname(adb_path)
+                if adb_dir:
+                    env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
+            env['ADB_PUBKEY'] = adb_key
+
+            cmd = [script_path, 'setup-adbkey', seat, gateway_host,
+                   '--gateway-password', device_password]
+            # mtc_password is only needed when bct is NOT available on the
+            # gateway (direct ProxyJump to mtc@<seat>). Pass it when we have
+            # it so the script isn't prompted again.
+            if mtc_password:
+                cmd.extend(['--mtc-password', mtc_password])
+            # root_password is the sudo su - password on the seat. Fall back
+            # to mtc_password if not provided (most setups use the same).
+            sudo_pwd = root_password or mtc_password or device_password
+            cmd.extend(['--sudo-password', sudo_pwd])
+
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=60, env=env)
+            if result.returncode == 0:
+                self.log(f"ADB key installed on seat {seat}", "INFO")
+                if result.stdout.strip():
+                    self.log(f"Output: {result.stdout.strip()}", "INFO")
+            else:
+                error = result.stderr.strip() or result.stdout.strip() \
+                    or f"exit code {result.returncode}"
+                self.log(f"Failed to install ADB key: {error}", "ERROR")
+        except subprocess.TimeoutExpired:
+            self.log(f"ADB key install on seat {seat} timed out", "ERROR")
+        except Exception as e:
+            self.log(f"Error installing ADB key: {str(e)}", "ERROR")
+
+    def _show_add_seat_dialog(self):
+        """Show dialog to connect to a new seat"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Connect to New Seat")
+        dialog.setMinimumWidth(450)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # Seat name
+        layout.addWidget(QLabel("Seat Name/IP:"))
+        seat_name_edit = QLineEdit()
+        seat_name_edit.setPlaceholderText("e.g., ac-541-1241")
+        layout.addWidget(seat_name_edit)
+
+        # Gateway (user@hostname format)
+        layout.addWidget(QLabel("Gateway (user@hostname):"))
+        gateway_edit = QLineEdit()
+        Gateway = "ac-541-1241" if len(self.seat_search_entry.text().strip()) > 3 else "example"
+        gateway_value = f"user@{Gateway}-gateway"
+        gateway_edit.setPlaceholderText(f"e.g., {gateway_value}")
+        layout.addWidget(gateway_edit)
+
+        hint = QLabel("ⓘ Enter seat name and gateway in user@hostname format")
+        hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
+        layout.addWidget(hint)
+        layout.addStretch()
+
+        # Install ADB keys section
+        adb_key_cb = QCheckBox("Install ADB keys on seat")
+        adb_key_cb.setToolTip("Install your ADB public key to /data/misc/adb/adb_keys on the seat")
+        layout.addWidget(adb_key_cb)
+
+        adb_key_edit = QLineEdit()
+        adb_key_edit.setPlaceholderText("ADB public key (empty to auto-detect from ~/.android/adbkey.pub)")
+        adb_key_edit.setEnabled(False)
+
+        def toggle_adb_key_field(state):
+            adb_key_edit.setEnabled(state == Qt.CheckState.Checked.value)
+            if state == Qt.CheckState.Checked.value and not adb_key_edit.text():
+                # Auto-detect from ~/.android/adbkey.pub
+                adbkey_pub = os.path.expanduser("~/.android/adbkey.pub")
+                if os.path.exists(adbkey_pub):
+                    try:
+                        with open(adbkey_pub, 'r') as f:
+                            adb_key_edit.setText(f.read().strip())
+                    except Exception:
+                        pass
+
+        adb_key_cb.stateChanged.connect(toggle_adb_key_field)
+        layout.addWidget(adb_key_edit)
+
+        layout.addStretch()
+
+        # Buttons
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_btn)
+
+        connect_btn = QPushButton("Connect")
+        connect_btn.setProperty("accent", "true")
+
+        def on_connect():
+            seat_name = seat_name_edit.text().strip()
+            gateway = gateway_edit.text().strip()
+
+            if not seat_name or not gateway:
+                QMessageBox.warning(dialog, "Input Required", "Please enter both seat name and gateway")
+                return
+
+            install_adb_key = adb_key_cb.isChecked()
+            adb_key = adb_key_edit.text().strip() if install_adb_key else None
+
+            # Ask for the gateway SSH password (for SSH to user@<gateway>)
+            gateway_password, ok = QInputDialog.getText(
+                dialog, "Gateway Password",
+                f"Enter SSH password for {gateway}:",
+                QLineEdit.EchoMode.Password
+            )
+            if not ok or not gateway_password:
+                return
+
+            mtc_password = None
+            root_password = None
+            if install_adb_key:
+                # Ask for the mtc user's SSH password on the seat
+                # (only used when bct is NOT available on the gateway).
+                mtc_password, ok = QInputDialog.getText(
+                    dialog, "MTC Password",
+                    f"Enter SSH password for mtc@{seat_name}:",
+                    QLineEdit.EchoMode.Password
+                )
+                if not ok or not mtc_password:
+                    return
+
+                # Ask for the sudo su - password on the seat
+                root_password, ok = QInputDialog.getText(
+                    dialog, "Sudo Password",
+                    "Enter sudo su - password for the seat (mtc user):",
+                    QLineEdit.EchoMode.Password
+                )
+                if not ok or not root_password:
+                    return
+
+            # Use the existing connect_seat method (pass adb_key as extra arg).
+            # Note: connect_seat's "device_password" parameter is the gateway
+            # SSH password (used by sshpass for the gateway auth). The mtc
+            # SSH password is the seat's mtc-user login password.
+            self.connect_seat(seat_name, gateway, install_adb_key=install_adb_key,
+                            adb_key=adb_key, device_password=gateway_password,
+                            mtc_password=mtc_password,
+                            root_password=root_password)
+            dialog.accept()
+
+        connect_btn.clicked.connect(on_connect)
+        button_row.addWidget(connect_btn)
+
+        layout.addLayout(button_row)
+        dialog.exec()
+
+    def _show_add_portforward_dialog(self):
+        """Show dialog to connect to a new port forward"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Connect to New Port Forward")
+        dialog.setMinimumWidth(450)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # Rack hostname
+        layout.addWidget(QLabel("Rack Hostname:"))
+        rack_edit = QLineEdit()
+        rack_edit.setPlaceholderText("e.g., rack01.dv.example.com")
+        layout.addWidget(rack_edit)
+
+        # Headend
+        layout.addWidget(QLabel("Headend:"))
+        partition_edit = QLineEdit()
+        partition_edit.setPlaceholderText("e.g., 172.17.4.4")
+        partition_edit.setText("")
+        layout.addWidget(partition_edit)
+
+        # Username
+        layout.addWidget(QLabel("Username:"))
+        user_edit = QLineEdit()
+        user_edit.setPlaceholderText("e.g., user")
+        user_edit.setText("user")
+        layout.addWidget(user_edit)
+
+        hint = QLabel("ⓘ Enter rack hostname, headend, and username")
+        hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
+        layout.addWidget(hint)
+        layout.addStretch()
+
+        # Buttons
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_btn)
+
+        connect_btn = QPushButton("Connect")
+        connect_btn.setProperty("accent", "true")
+
+        def on_connect():
+            rack = rack_edit.text().strip()
+            partition = partition_edit.text().strip()
+            user = user_edit.text().strip()
+
+            if not rack or not partition or not user:
+                QMessageBox.warning(dialog, "Input Required", "Please enter all fields")
+                return
+
+            # Gateway format: user@rack
+            gateway = f"{user}@{rack}"
+
+            # Use the existing connect_portforward method
+            self.connect_portforward(gateway, partition, user)
+            dialog.accept()
+
+        connect_btn.clicked.connect(on_connect)
+        button_row.addWidget(connect_btn)
+
+        layout.addLayout(button_row)
+        dialog.exec()
 
     def connect_portforward(self, gateway, partition, user):
         """Connect port forward using the configured portforward_script_path."""
@@ -4983,6 +5497,19 @@ class ADBGUI(QMainWindow):
                     if adb_dir:
                         env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
 
+                # First, stop any existing port forward
+                self.log("Stopping any existing port forward before connecting...", "INFO")
+                stop_cmd = [script_path, 'stop']
+                stop_result = subprocess.run(stop_cmd, capture_output=True, text=True, timeout=30, env=env)
+                if stop_result.returncode != 0:
+                    self.log(f"Warning: Could not stop existing port forward: {stop_result.stderr or stop_result.stdout}", "WARNING")
+                else:
+                    self.log("Stopped existing port forward", "INFO")
+                    self.seat_port_manager.mark_portforward_disconnected()
+
+                # Wait a moment for ports to be released
+                time.sleep(1)
+
                 # Use sshpass if available, otherwise try with SSH_ASKPASS
                 if shutil.which('sshpass'):
                     cmd = ['sshpass', '-p', password, script_path, gateway_host, partition, user]
@@ -5029,59 +5556,15 @@ class ADBGUI(QMainWindow):
 
                 if not has_error:
                     self.seat_port_manager.mark_portforward_connected(gateway)
+                    # Add to history for quick access (rack is the seat field, partition is stored as rack)
+                    self.seat_port_manager.append_history(gateway_host, partition, user, 'portforward')
                     self.log(f"Port forward connected for {gateway}", "INFO")
                     self.update_status(f"Port forward connected")
                     QTimer.singleShot(0, self.refresh_seat_port_lists)
                 else:
                     error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
-
-                    # Check if error is due to ports already in use - if so, stop existing and retry
-                    if "Address already in use" in error or "cannot listen to port" in error:
-                        self.log("Ports already in use - stopping existing port forward...", "WARNING")
-
-                        # Stop existing port forward
-                        stop_cmd = [script_path, 'stop']
-                        stop_result = subprocess.run(stop_cmd, capture_output=True, text=True, timeout=30, env=env)
-
-                        if stop_result.returncode == 0:
-                            self.log("Previous port forward stopped, retrying...", "INFO")
-                            self.seat_port_manager.mark_portforward_disconnected()
-
-                            # Wait a moment for ports to be released
-                            time.sleep(1)
-
-                            # Retry the connection
-                            if shutil.which('sshpass'):
-                                retry_cmd = ['sshpass', '-p', password, script_path, gateway_host, partition, user]
-                                retry_result = subprocess.run(retry_cmd, capture_output=True, text=True, timeout=30, env=env)
-                            else:
-                                retry_cmd = [script_path, gateway_host, partition, user]
-                                retry_result = subprocess.run(retry_cmd, capture_output=True, text=True, timeout=30, env=env)
-
-                            retry_stderr = retry_result.stderr or ""
-                            retry_stdout = retry_result.stdout or ""
-                            retry_has_error = (
-                                retry_result.returncode != 0
-                                or any(ind.lower() in retry_stderr.lower() for ind in error_indicators)
-                                or any(ind.lower() in retry_stdout.lower() for ind in error_indicators)
-                            )
-                            if not retry_has_error:
-                                self.seat_port_manager.mark_portforward_connected(gateway)
-                                self.log(f"Port forward connected for {gateway}", "INFO")
-                                self.update_status(f"Port forward connected")
-                                QTimer.singleShot(0, self.refresh_seat_port_lists)
-                                return
-                            else:
-                                retry_error = retry_stderr.strip() or retry_stdout.strip() or f"Script exited with code {retry_result.returncode}"
-                                self.log(f"Failed to set up port forward after retry: {retry_error}", "ERROR")
-                                self.update_status("Failed to set up port forward")
-                        else:
-                            self.log("Failed to stop existing port forward", "ERROR")
-                            self.log(f"Failed to set up port forward: {error}", "ERROR")
-                            self.update_status("Failed to set up port forward")
-                    else:
-                        self.log(f"Failed to set up port forward: {error}", "ERROR")
-                        self.update_status("Failed to set up port forward")
+                    self.log(f"Failed to set up port forward: {error}", "ERROR")
+                    self.update_status("Failed to set up port forward")
             except Exception as e:
                 self.log(f"Error setting up port forward: {str(e)}", "ERROR")
                 self.update_status("Error setting up port forward")
@@ -5401,6 +5884,29 @@ class ADBGUI(QMainWindow):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        # Root mode toggle
+        root_row = QHBoxLayout()
+        root_cb = QCheckBox("🔒 Root Mode")
+        root_cb.setChecked(False)
+        root_cb.setToolTip("Require root privileges to list/modify protected directories like /var, /data, /etc")
+        root_cb.setStyleSheet("QCheckBox { font-size: 11pt; } QCheckBox::indicator { width: 20px; height: 20px; }")
+        root_row.addWidget(root_cb)
+        root_row.addStretch()
+        revert_btn = QPushButton("👤 Revert to user")
+        revert_btn.setVisible(False)
+        root_row.addWidget(revert_btn)
+        layout.addLayout(root_row)
+
+        # Toggle root mode and button visibility
+        root_cb.stateChanged.connect(lambda state: (
+            revert_btn.setVisible(state == Qt.CheckState.Checked.value),
+            root_flag.__setitem__(0, state == Qt.CheckState.Checked.value)
+        ))
+        revert_btn.clicked.connect(lambda: (
+            root_cb.setChecked(False),
+            root_flag.__setitem__(0, False)
+        ))
+
         # File list (use DeviceFileListWidget to support drag-and-drop file uploads)
         listbox = DeviceFileListWidget()
         layout.addWidget(listbox, 1)
@@ -5440,12 +5946,16 @@ class ADBGUI(QMainWindow):
         def selected_items():
             return listbox.selectedItems()
 
+        # Root mode state
+        root_flag = [False]  # mutable list so inner scopes can update it
+
         def refresh_listing():
             p = current_path()
             listbox.clear()
             listbox.addItem("Loading…")
 
             def do_ls():
+                nonlocal p  # Allow fallback to user path on failure
                 try:
                     # Portable listing for older Android "toolbox" (may not support ls flags like -1/-p).
                     # We append "/" for directories ourselves.
@@ -5461,8 +5971,33 @@ class ADBGUI(QMainWindow):
                         "done"
                     )
                     # Note: avoid complicated quoting here; /sdcard paths normally have no spaces
-                    cmd = f'{self.get_device_flag()} shell sh -c {sh_quote(script)} sh {p}'
-                    res = self.adb.run_command(cmd)
+                    if root_flag[0]:
+                        # Root mode: try adb root first, then su fallback
+                        # Build the basic adb shell command first
+                        basic_cmd = f'{self.get_device_flag()} shell sh -c {sh_quote(script)} sh {p}'
+
+                        # First, try enabling adb root (works on userdebug/emulator)
+                        self.adb.run_command(f"{self.get_device_flag()} root")
+                        time.sleep(1)
+
+                        # Test if adb root worked
+                        res = self.adb.run_command(basic_cmd)
+
+                        # Check result - if still permission denied, try su
+                        if res and not res.get("success"):
+                            stderr = (res.get("stderr", "") + res.get("stdout", "")).lower()
+                            if "permission denied" in stderr or "denied" in stderr:
+                                # Try su -c (rooted devices)
+                                su_check = self.adb.run_command(f"{self.get_device_flag()} shell which su")
+                                if su_check and su_check.get("success") and su_check.get("stdout"):
+                                    # su exists, use it
+                                    full_cmd = f'{self.get_device_flag()} shell su -c {sh_quote(basic_cmd)}'
+                                    res = self.adb.run_command(full_cmd)
+                    else:
+                        # Normal non-root mode - use regular shell
+                        cmd = f'{self.get_device_flag()} shell sh -c {sh_quote(script)} sh {p}'
+                        res = self.adb.run_command(cmd)
+
 
                     def apply():
                         listbox.clear()
@@ -5553,7 +6088,7 @@ class ADBGUI(QMainWindow):
                         # Upload folder with its contents using adb push
                         folder_name = os.path.basename(lp.rstrip(os.sep))
                         # Push the folder itself: adb push <local_folder> <remote_dir>/
-                        # Use shlex.quote to properly handle paths with spaces
+                        # Note: adb push does not support 'su -c' prefix
                         cmd = f"{self.get_device_flag()} push {shlex.quote(lp)} {shlex.quote(dest_dir)}/"
                         res = self.adb.run_command(cmd, timeout=300)
                         if res["success"]:
@@ -5565,7 +6100,7 @@ class ADBGUI(QMainWindow):
                             self.log(f"Upload failed for folder {lp}: {err}", "ERROR")
                     else:
                         # Upload single file
-                        # Use shlex.quote to properly handle paths with spaces
+                        # Note: adb push does not support 'su -c' prefix
                         cmd = f"{self.get_device_flag()} push {shlex.quote(lp)} {shlex.quote(dest_dir)}/"
                         res = self.adb.run_command(cmd, timeout=120)
                         if res["success"]:
@@ -5662,7 +6197,7 @@ class ADBGUI(QMainWindow):
                 ok = 0
                 failed = 0
                 for rp in remote_paths:
-                    # Use shlex.quote to properly handle paths with spaces
+                    # Note: adb pull does not support 'su -c' prefix
                     cmd = f"{self.get_device_flag()} pull {shlex.quote(rp)} {shlex.quote(dest)}"
                     res = self.adb.run_command(cmd, timeout=300)
                     if res["success"]:
@@ -5715,7 +6250,8 @@ class ADBGUI(QMainWindow):
                 failed = 0
                 for t in targets:
                     # rm -rf handles both files and dirs
-                    res = self.adb.run_command(f"{self.get_device_flag()} shell rm -rf {sh_quote(t)}")
+                    cmd = f"{self.get_device_flag()} shell {'su -c ' if root_flag[0] else ''}rm -rf {sh_quote(t)}"
+                    res = self.adb.run_command(cmd)
                     if res["success"]:
                         ok += 1
                     else:
@@ -5739,7 +6275,9 @@ class ADBGUI(QMainWindow):
             self.update_status("Creating folder…")
 
             def do_mkdir():
-                res = self.adb.run_command(f"{self.get_device_flag()} shell mkdir -p {sh_quote(dest)}")
+                # Respect root mode if enabled
+                cmd = f"{self.get_device_flag()} shell {'su -c ' if root_flag[0] else ''}mkdir -p {sh_quote(dest)}"
+                res = self.adb.run_command(cmd)
                 if res["success"]:
                     ui.call.emit(refresh_listing)
                     ui.call.emit(lambda: self.update_status("Folder created"))
@@ -5782,7 +6320,8 @@ class ADBGUI(QMainWindow):
             self.update_status("Renaming…")
 
             def do_rename():
-                res = self.adb.run_command(f"{self.get_device_flag()} shell mv -f {sh_quote(old_path)} {sh_quote(new_path)}")
+                cmd = f"{self.get_device_flag()} shell {'su -c ' if root_flag[0] else ''}mv -f {sh_quote(old_path)} {sh_quote(new_path)}"
+                res = self.adb.run_command(cmd)
                 if res["success"]:
                     ui.call.emit(refresh_listing)
                     ui.call.emit(lambda: self.update_status("Renamed"))

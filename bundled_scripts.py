@@ -99,6 +99,29 @@ COMMANDS:
     Assigns a free local port and saves the mapping.
     Example: $0 auto-connect seat001 user@gateway
 
+  setup-adbkey <seat> <gateway>
+                     [--gateway-password <pwd>]
+                     [--mtc-password <pwd>]
+                     [--sudo-password <pwd>]
+    SSH from <gateway> into the seat (uses 'bct login -h <seat>' if available,
+    otherwise ProxyJump as mtc@<seat>), escalate to root via 'sudo su -', and
+    append the ADB public key (env ADB_PUBKEY, or ~/.android/adbkey.pub) to
+    /data/misc/adb/adb_keys on the device.
+
+    Flags:
+      --gateway-password  Password for SSH to user@<gateway>.
+      --mtc-password      Password for SSH to mtc@<seat> (only when bct is
+                          NOT available on the gateway).
+      --sudo-password     Password for 'sudo su -' on the seat (mtc user).
+
+    Either flag may be omitted; missing passwords are prompted for
+    interactively. Prompt order is:
+      1. gateway password first
+      2. (only if bct is NOT available) mtc SSH password for the seat
+      3. sudo su - password for the seat
+
+    Used by the GUI's "Connect New Seat" flow.
+
   history [purge]
     Show seat connection history from $PORT_MAP_FILE.
     Use 'history purge' to clear all saved connections.
@@ -305,6 +328,239 @@ case "$1" in
         cat "$PORT_MAP_FILE"
         ;;
 
+    setup-adbkey)
+        # Install the local ADB public key into /data/misc/adb/adb_keys on the
+        # device behind a seat.
+        #
+        # Password flow (per the user's request):
+        #   1. ALWAYS ask for the gateway password first (SSH to user@<gateway>).
+        #   2. Detect whether 'bct' is available on the gateway.
+        #   3a. If bct is set up: only ask for the sudo su - password
+        #       (bct handles the seat login transparently).
+        #   3b. If bct is NOT set up (direct ProxyJump to mtc@<seat>):
+        #       ask for the mtc user's SSH password to log into the seat,
+        #       then ask for the sudo su - password.
+        #   4. Echo the exact SSH command that will be executed, then run it.
+        SEAT="$2"
+        GATEWAY="$3"
+        shift 3
+        GATEWAY_PASSWORD=""
+        MTC_PASSWORD=""
+        SUDO_PASSWORD=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --gateway-password)  GATEWAY_PASSWORD="$2"; shift 2 ;;
+                --mtc-password)      MTC_PASSWORD="$2"; shift 2 ;;
+                --sudo-password)     SUDO_PASSWORD="$2"; shift 2 ;;
+                *)                   echo "Unknown flag: $1" >&2; exit 2 ;;
+            esac
+        done
+
+        if [[ -z "$SEAT" || -z "$GATEWAY" ]]; then
+            echo "usage: $0 setup-adbkey <seat> <gateway> [--gateway-password <pwd>] [--mtc-password <pwd>] [--sudo-password <pwd>]" >&2
+            exit 2
+        fi
+
+        # Resolve ADB public key: env var first, then ~/.android/adbkey.pub.
+        ADB_PUBKEY_VAL="${ADB_PUBKEY:-}"
+        if [[ -z "$ADB_PUBKEY_VAL" && -f "$HOME/.android/adbkey.pub" ]]; then
+            ADB_PUBKEY_VAL="$(cat "$HOME/.android/adbkey.pub")"
+        fi
+        if [[ -z "$ADB_PUBKEY_VAL" ]]; then
+            echo "No ADB public key found. Set ADB_PUBKEY or place one at ~/.android/adbkey.pub." >&2
+            exit 1
+        fi
+
+        # Step 1: prompt for the gateway password (SSH auth to user@<gateway>).
+        # The gateway argument may already be "user@host"; show it as-is.
+        if [[ -z "$GATEWAY_PASSWORD" ]]; then
+            if [[ -t 0 ]]; then
+                echo -n "Enter SSH password for $GATEWAY: " >&2
+                read -s GATEWAY_PASSWORD
+                echo >&2
+            else
+                echo "Gateway password not provided. Use --gateway-password <password>." >&2
+                exit 2
+            fi
+        fi
+
+        echo "Connecting to seat $SEAT via gateway $GATEWAY..." >&2
+
+        # Build a one-shot askpass helper that returns the GATEWAY password.
+        ASKPASS_FILE="$(mktemp -t adb_gui_askpass_gateway.XXXXXX)"
+        cat > "$ASKPASS_FILE" <<EOF
+#!/bin/sh
+printf '%s\n' "$GATEWAY_PASSWORD"
+EOF
+        chmod 700 "$ASKPASS_FILE"
+
+        # Use sshpass if available for the gateway auth (cleanest),
+        # otherwise SSH_ASKPASS with the helper file.
+        if command -v sshpass >/dev/null 2>&1; then
+            SSH_PREFIX=(sshpass -p "$GATEWAY_PASSWORD")
+            echo "Using sshpass for gateway authentication" >&2
+        else
+            SSH_PREFIX=(env SSH_ASKPASS="$ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force DISPLAY=:0)
+            echo "Using SSH_ASKPASS for gateway authentication" >&2
+        fi
+
+        # Detect which SSH path to use: bct or direct ProxyJump.
+        # The <gateway> argument may be either "user@host" or just "host".
+        if [[ "$GATEWAY" == *@* ]]; then
+            GATEWAY_TARGET="$GATEWAY"
+        else
+            GATEWAY_TARGET="user@$GATEWAY"
+        fi
+
+        # First check if bct exists on the gateway, then use it
+        # We test by running a simple command on the gateway.
+        echo "Detecting gateway privileges and bct availability..." >&2
+        BCT_CHECK=$("${SSH_PREFIX[@]}" \
+            ssh -o StrictHostKeyChecking=accept-new \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                "$GATEWAY_TARGET" \
+                "bash -lc 'command -v bct' 2>/dev/null || command -v bct 2>/dev/null || which bct 2>/dev/null || ls /usr/local/bin/bct /usr/bin/bct /opt/*/bct 2>/dev/null" 2>/dev/null) || true
+
+        USE_BCT=""
+        if [[ -n "$BCT_CHECK" ]]; then
+            USE_BCT="yes"
+            echo "Found bct on gateway; will use 'bct login -h $SEAT' (only sudo password needed)" >&2
+        else
+            echo "bct not found on gateway; using direct SSH as mtc@$SEAT (mtc + sudo passwords needed)" >&2
+        fi
+
+        # Step 2a (no bct path only): prompt for mtc user's SSH password on the seat.
+        if [[ -z "$USE_BCT" && -z "$MTC_PASSWORD" ]]; then
+            if [[ -t 0 ]]; then
+                echo -n "Enter SSH password for mtc@$SEAT: " >&2
+                read -s MTC_PASSWORD
+                echo >&2
+            else
+                echo "mtc password not provided. Use --mtc-password <password>." >&2
+                rm -f "$ASKPASS_FILE"
+                exit 2
+            fi
+        fi
+
+        # Step 2b / 3 (both paths): prompt for sudo su - password on the seat.
+        if [[ -z "$SUDO_PASSWORD" ]]; then
+            if [[ -t 0 ]]; then
+                echo -n "Enter sudo su - password for seat: " >&2
+                read -s SUDO_PASSWORD
+                echo >&2
+            else
+                echo "Sudo password not provided. Use --sudo-password <password> or run with a tty." >&2
+                rm -f "$ASKPASS_FILE"
+                exit 2
+            fi
+        fi
+
+        # Remote command - written to a temporary file, then read and executed.
+        # This avoids complex quoting issues with nested heredocs.
+        REMOTE_SCRIPT_FILE="$(mktemp -t adb_gui_remote.XXXXXX)"
+        cat > "$REMOTE_SCRIPT_FILE" <<'REMOTEOF'
+#!/bin/bash
+set -e
+
+# Read sudo password from stdin (piped via the local shell).
+read -r SUDO_PASSWORD
+
+echo "[seat] escalating to root with sudo su -..."
+
+# Escalate to root via sudo su - and install the ADB key.
+echo "$SUDO_PASSWORD" | sudo -S su -c '
+    if [ "$(id -u)" = "0" ]; then
+        mkdir -p /data/misc/adb
+        chmod 700 /data/misc/adb
+        cat >> /data/misc/adb/adb_keys
+        chmod 600 /data/misc/adb/adb_keys
+        echo "__ADBGUI_MARKER__"
+    else
+        echo "[seat] ERROR: sudo su - did not give root" >&2
+        exit 1
+    fi
+'
+REMOTEOF
+
+        # Read the script for passing via ssh
+        REMOTE_SCRIPT=$(cat "$REMOTE_SCRIPT_FILE")
+        rm -f "$REMOTE_SCRIPT_FILE"
+
+# Step 4: echo the exact SSH command to be run, then run it.
+        # Use StrictHostKeyChecking=accept-new so the seat's host key is
+        # auto-accepted on first connect (no manual 'yes' needed).
+        # We pass the remote script as a single-quoted bash -c argument so
+        # stdin is free to receive only the sudo password.
+        # NOTE: We use -T (no tty) instead of -tt because sshpass requires
+        # no TTY allocation. sudo -S works fine without a TTY since we pipe
+        # the password via stdin.
+        if [[ -n "$USE_BCT" ]]; then
+            # bct is available on gateway - chain: ssh gateway, then bct login, then run script
+            # bct handles seat login; we only need sudo password piped in.
+            echo "Running: ssh $GATEWAY_TARGET \"bct login -h $SEAT && bash -c '<script>'\"" >&2
+            OUTPUT=$(printf '%s\n' "$SUDO_PASSWORD" | \
+                "${SSH_PREFIX[@]}" \
+                ssh -T \
+                    -o StrictHostKeyChecking=accept-new \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=30 \
+                    "$GATEWAY_TARGET" \
+                    "bct login -h $SEAT && bash -c $(printf '%q' "$REMOTE_SCRIPT")" \
+                ) 2>&1 || true
+        else
+            # Fall back to ProxyJump: ssh gateway, then ssh to seat as mtc.
+            # For the no-bct path, use sshpass for BOTH the gateway and seat
+            # mtc password (with ProxyJump, sshpass handles the gateway auth
+            # and SSH_ASKPASS handles the seat auth).
+            echo "Running: ssh -J $GATEWAY_TARGET mtc@$SEAT \"bash -c '<script>'\"" >&2
+
+            # Set up a separate askpass file for the seat's mtc password.
+            # SSH will use this SSH_ASKPASS for the seat's auth prompt when
+            # sshpass handles the gateway auth.
+            SEAT_ASKPASS_FILE="$(mktemp -t adb_gui_askpass_seat.XXXXXX)"
+            cat > "$SEAT_ASKPASS_FILE" <<EOF2
+#!/bin/sh
+printf '%s\n' "$MTC_PASSWORD"
+EOF2
+            chmod 700 "$SEAT_ASKPASS_FILE"
+            SEAT_SSH_ENV=(env SSH_ASKPASS="$SEAT_ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force DISPLAY=:0)
+
+            # Pipe just the sudo password to ssh's stdin; the script content
+            # is passed as a bash -c argument, so stdin is free.
+            OUTPUT=$(printf '%s\n' "$SUDO_PASSWORD" | \
+                "${SSH_PREFIX[@]}" \
+                "${SEAT_SSH_ENV[@]}" \
+                ssh -T \
+                    -o StrictHostKeyChecking=accept-new \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=30 \
+                    -J "$GATEWAY_TARGET" \
+                    "mtc@$SEAT" \
+                    "bash -c $(printf '%q' "$REMOTE_SCRIPT")" \
+                ) 2>&1 || true
+
+            # Clean up seat askpass file
+            rm -f "$SEAT_ASKPASS_FILE"
+        fi
+
+        # Clean up askpass file
+        rm -f "$ASKPASS_FILE"
+
+        # Check for success
+        if echo "$OUTPUT" | grep -q "__ADBGUI_MARKER__"; then
+            echo "ADB key installed successfully on seat $SEAT"
+            exit 0
+        fi
+
+        # If we didn't get the marker, show what happened
+        echo "Failed to install ADB key on seat $SEAT" >&2
+        echo "--- SSH output ---" >&2
+        echo "$OUTPUT" >&2
+        echo "--- end ---" >&2
+        exit 1
+        ;;
+
     history)
         case "$2" in
             purge)
@@ -328,7 +584,7 @@ case "$1" in
         ;;
 
     *)
-        echo "usage: $0 {connect [<port>]|disconnect [<port>|seatXXX|all|offline]|list|list-ports|logcat|tunnel <seat> <server> [<port>]|auto-connect <seat> <server>|history [purge]}"
+        echo "usage: $0 {connect [<port>]|disconnect [<port>|seatXXX|all|offline]|list|list-ports|logcat|tunnel <seat> <server> [<port>]|auto-connect <seat> <server>|setup-adbkey <seat> <gateway>|history [purge]}" >&2
         ;;
 esac
 '''
