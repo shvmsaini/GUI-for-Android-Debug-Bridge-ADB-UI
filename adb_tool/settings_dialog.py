@@ -32,6 +32,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QD
 # Bundled seat.sh / portforwardRack.sh
 import bundled_scripts
 from .constants import APP_VERSION
+from .adb_manager import ADBManager
 
 
 class SettingsDialog(QDialog):

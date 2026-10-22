@@ -5,6 +5,7 @@ import threading
 import time
 import shlex
 import shutil
+import re
 from datetime import datetime
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
 from PyQt6.QtWidgets import (
@@ -25,6 +26,164 @@ import bundled_scripts
 
 class SeatMixin:
     """Mixin class providing seat and port forward management."""
+
+    # Sentinel block we insert into ~/.ssh/config for each trusted gateway.
+    # We delimit with our own comment markers so we can find/remove our entries
+    # on the next connect without disturbing other Host blocks the user has.
+    _SSH_CONFIG_BEGIN = "# >>> adb-gui-ui trusted-gateway (BEGIN) >>>"
+    _SSH_CONFIG_END = "# <<< adb-gui-ui trusted-gateway (END) <<<"
+
+    def _is_gateway_trusted(self, gateway):
+        """Return True if the user has opted in to trusting this gateway's cert."""
+        trusted = self.settings.get('trusted_gateways', {}) or {}
+        return bool(trusted.get(gateway, False))
+
+    def _apply_trusted_gateway_config(self, gateway):
+        """Add a per-gateway Host block to ~/.ssh/config that disables strict
+        host-key checking for THIS gateway only. Returns True if applied.
+
+        We manage the entries we wrote under sentinel comments, so re-running
+        this is idempotent and we don't clobber the user's existing config.
+        """
+        if not self._is_gateway_trusted(gateway):
+            return False
+
+        ssh_dir = os.path.expanduser("~/.ssh")
+        config_path = os.path.join(ssh_dir, "config")
+
+        # Only the bare hostname should be matched (not user@host). ssh
+        # matches Host patterns against the host portion only.
+        host = gateway.split('@', 1)[-1] if '@' in gateway else gateway
+
+        entry = (
+            f"{self._SSH_CONFIG_BEGIN}\n"
+            f"Host {host}\n"
+            f"    StrictHostKeyChecking no\n"
+            f"    UserKnownHostsFile /dev/null\n"
+            f"    LogLevel ERROR\n"
+            f"{self._SSH_CONFIG_END}\n"
+        )
+
+        # Ensure ~/.ssh exists
+        try:
+            os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+        except Exception:
+            pass
+
+        existing = ""
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    existing = f.read()
+            except Exception:
+                existing = ""
+
+        # Strip any previous block we wrote (idempotent)
+        start = existing.find(self._SSH_CONFIG_BEGIN)
+        end = existing.find(self._SSH_CONFIG_END)
+        if start != -1 and end != -1:
+            # include trailing newline after END marker
+            after = existing.find('\n', end)
+            if after != -1:
+                existing = existing[:start] + existing[after + 1:]
+            else:
+                existing = existing[:start]
+
+        new_content = existing.rstrip('\n') + '\n' + entry
+
+        try:
+            with open(config_path, 'w') as f:
+                f.write(new_content)
+            os.chmod(config_path, 0o600)
+        except Exception as e:
+            self.log(f"Could not update ~/.ssh/config: {e}", "ERROR")
+            return False
+
+        return True
+
+    def _start_seat_device_watcher(self, seat, port='5555', max_wait=30, interval=2):
+        """Poll adb devices until the seat's device finishes authorizing.
+
+        Right after `seat.sh auto-connect`, `adb connect localhost:<port>`
+        succeeds but the device is reported as ``offline`` while the phone
+        completes the adb-key authorization handshake — typically a few
+        seconds, longer the first time (or if the user hasn't tapped "Allow
+        USB debugging?" yet). We poll every ``interval`` seconds for up to
+        ``max_wait`` seconds:
+
+        * If the seat's device (``localhost:<port>``) transitions to
+          ``device``, log a confirmation and stop polling.
+        * If we hit the timeout, log a warning pointing at the phone prompt
+          so the user knows where to look.
+        * If the user disconnects the seat in the meantime, the watcher's
+          seat is no longer in ``connected_seats`` and we stop.
+
+        ``port`` is the actual adb port seat.sh picked (e.g. 60100) so we
+        can match the right device — important if multiple seats are
+        connected at once.
+        """
+        # Cancel any previous watcher — there should only be one seat
+        # connecting at a time, but if the user rapid-clicks we don't
+        # want stacked timers all polling `adb devices`.
+        prev = getattr(self, '_seat_device_watcher', None)
+        if prev is not None:
+            try:
+                prev.stop()
+            except Exception:
+                pass
+
+        watcher = QTimer(self)
+        watcher.setInterval(interval * 1000)
+        self._seat_device_watcher = watcher
+        self._seat_device_watcher_seat = seat
+
+        # Match exactly this seat's adb device (`localhost:<port>`), not any
+        # seat tunnel — otherwise with multiple seats online we'd log
+        # success against the wrong one.
+        seat_device_id = f"localhost:{port}"
+        elapsed = {'secs': 0}
+
+        def tick():
+            elapsed['secs'] += interval
+
+            # Bail if the user disconnected the seat while we were polling.
+            if not self.seat_port_manager.is_seat_connected(seat):
+                watcher.stop()
+                return
+
+            devices = self.adb.get_devices(silent=True)
+            seat_device_online = any(
+                d.get('id') == seat_device_id and d.get('status') == 'device'
+                for d in devices
+            )
+
+            if seat_device_online:
+                watcher.stop()
+                self.log(f"Seat device online — {seat} ready to use", "INFO")
+                self.update_status(f"Connected to {seat} — device ready")
+                # Force a refresh so the UI reflects the new status.
+                QTimer.singleShot(0, lambda: self.refresh_devices(silent=False))
+                return
+
+            if elapsed['secs'] >= max_wait:
+                watcher.stop()
+                self.log(
+                    f"Seat {seat} tunnel is up but device ({seat_device_id}) "
+                    f"is still offline after {max_wait}s. Check the phone "
+                    f"for an 'Allow USB debugging?' prompt and tap Allow.",
+                    "WARNING"
+                )
+                self.update_status(
+                    f"Connected to {seat} — waiting for phone authorization"
+                )
+                return
+
+            # Still waiting — refresh the UI on each tick so the device list
+            # updates as the phone finishes authorizing.
+            QTimer.singleShot(0, lambda: self.refresh_devices(silent=True))
+
+        watcher.timeout.connect(tick)
+        watcher.start()
 
     def refresh_seat_port_lists(self, refetch=True):
         """Refresh seat and port forward lists.
@@ -503,6 +662,30 @@ class SeatMixin:
                     if adb_dir:
                         env['PATH'] = adb_dir + os.pathsep + env.get('PATH', '')
 
+                # Per-process known_hosts file so seat connections don't
+                # pollute ~/.ssh/known_hosts (and don't get blocked by stale
+                # entries there). Strict host-key checking is preserved by
+                # default — we just isolate the store.
+                import tempfile as _tempfile
+                _kh_fd, _kh_path = _tempfile.mkstemp(prefix='adb_gui_known_hosts_', suffix='.txt')
+                os.close(_kh_fd)
+                env['SSH_KNOWN_HOSTS'] = _kh_path
+
+                # Per-gateway trust override: if the user has opted in via
+                # Settings → Security → Trust this gateway's cert, we add
+                # a Host block to ~/.ssh/config so ssh skips cert validation
+                # for THIS gateway only. This is required because seat.sh
+                # shells out to ssh with default strict checking, and some
+                # seat gateways serve host certs whose CA chain has expired.
+                # We only modify the config when a trusted gateway is
+                # actually in use; untrusted gateways get default behavior.
+                if self._apply_trusted_gateway_config(gateway):
+                    self.log(
+                        f"Using trusted-cert override for {gateway} "
+                        "(host cert verification disabled for this gateway only)",
+                        "WARNING"
+                    )
+
                 # Defensive: ensure script_path is non-empty and exists
                 if not script_path or not os.path.exists(script_path):
                     self.log(f"Seat script missing or empty: {repr(script_path)}", "ERROR")
@@ -536,7 +719,15 @@ class SeatMixin:
                     except:
                         pass
 
-                # Check for success: returncode 0 AND no obvious error messages
+                # Check for success: returncode 0 AND no obvious error messages.
+                #
+                # OpenSSH prints things like "verify error:num=10:certificate has
+                # expired" as *warnings* — it still continues and exits 0. The
+                # bare substring "error" used to catch those and falsely mark
+                # the seat as failed. So we only look for phrases that genuinely
+                # mean failure (connection/auth/SSH refusal), and we look for an
+                # explicit success marker as well so we don't get tripped up by
+                # unrelated noise in stdout/stderr.
                 error_indicators = [
                     "Connection refused",
                     "Could not resolve hostname",
@@ -547,20 +738,34 @@ class SeatMixin:
                     "Network is unreachable",
                     "No route to host",
                     "ssh: ",
-                    "Error",
-                    "error",
-                    "FAILED",
-                    "failed",
                     "Address already in use",  # Port conflict
                     "cannot listen to port",     # Port is already bound
+                    "FAILED",
                 ]
+                success_marker = "connected to localhost:"
+                combined = (stderr or '') + (stdout or '')
+                combined_lower = combined.lower()
+
+                # Strip out OpenSSH's "verify error:num=10:certificate has
+                # expired" lines — they're warnings, not failures. OpenSSH
+                # already prints a follow-up "verify return:1" indicating the
+                # cert was accepted despite the expiry note.
+                filtered = "\n".join(
+                    line for line in combined.splitlines()
+                    if "verify error:" not in line
+                    and "notafter=" not in line.lower()
+                ).lower()
+
                 has_error = (
                     returncode != 0
-                    or any(ind.lower() in stderr.lower() for ind in error_indicators)
-                    or any(ind.lower() in stdout.lower() for ind in error_indicators)
+                    or any(ind.lower() in filtered for ind in error_indicators)
                 )
+                # Negative success markers trump a positive one — if the script
+                # printed both "connected to localhost:..." and an actual error,
+                # treat as failure.
+                succeeded = success_marker.lower() in combined_lower
 
-                if not has_error:
+                if not has_error and succeeded:
                     self.seat_port_manager.mark_seat_connected(seat, gateway)
                     # Install ADB key if requested
                     adb_key = getattr(self, '_pending_adb_key', None)
@@ -580,11 +785,38 @@ class SeatMixin:
                         self.log("Not installing ADB key (missing credentials or flag)", "INFO")
 
                     # Add to history for quick access
-                    self.seat_port_manager.append_history(seat, '5555', gateway, 'seat')
+                    # Pull the *actual* adb port from the script's stdout
+                    # — seat.sh picks a free port dynamically ("Assigned new
+                    # port 60100 to <seat>" / "Reusing port 60100 for <seat>"),
+                    # so hardcoding '5555' here would have `get_top_entries`
+                    # overwrite the real port seat.sh saved and show the
+                    # wrong number in the seat panel.
+                    _port_match = re.search(
+                        r"(?:Assigned new port|Reusing port)\s+(\d+)",
+                        stdout or '',
+                    )
+                    actual_port = _port_match.group(1) if _port_match else '5555'
+                    self.seat_port_manager.append_history(seat, actual_port, gateway, 'seat')
                     self.log(f"Connected to seat {seat}", "INFO")
                     self.update_status(f"Connected to {seat}")
                     QTimer.singleShot(0, self.refresh_seat_port_lists)
                     QTimer.singleShot(500, self.refresh_devices)  # Refresh devices after seat connection
+
+                    # Watch for the seat's device to finish the adb-key
+                    # authorization handshake. After a fresh seat connect, the
+                    # device shows up as `offline` in `adb devices` for a few
+                    # seconds while the phone completes the handshake (or waits
+                    # for the user to tap "Allow USB debugging?"). The 5s
+                    # auto-refresh eventually picks this up, but that's slow
+                    # feedback for the user — and if they DON'T tap Allow, the
+                    # device stays `offline` forever with no hint why. Polling
+                    # every 2s for up to 30s gives us a quick "device online"
+                    # confirmation when the phone authorizes, plus a clear
+                    # timeout warning pointing at the phone prompt when it
+                    # doesn't. The watcher keys on the seat's actual adb
+                    # port so it doesn't get confused by *other* seat tunnels
+                    # that happen to be online.
+                    self._start_seat_device_watcher(seat, port=actual_port)
                 else:
                     error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
                     self.log(f"Failed to connect to seat: {error}", "ERROR")

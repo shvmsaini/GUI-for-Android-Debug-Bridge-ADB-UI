@@ -6,6 +6,9 @@
 
 PyQt6>=6.6.0
 
+# SSH/SFTP for Gateway Manager (browse files on connected seat gateways)
+paramiko>=3.0.0
+
 # Optional: Embedded scrcpy mirror with navigation buttons
 # Requires ffmpeg and pkg-config on macOS: brew install ffmpeg pkg-config
 # Also requires Python 3.10+ (we patch slots=True for 3.9 compat at install)

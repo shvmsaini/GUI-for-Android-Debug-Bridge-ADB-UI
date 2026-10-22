@@ -77,11 +77,27 @@ class DeviceMixin:
         # running `adb devices -l` again on every button click).
         self.cached_devices = list(devices)
 
-        # Auto-disconnect offline devices
-        # An offline device means the seat tunnel died but state wasn't cleared
-        offline_devices = [d for d in devices if d.get('status') == 'offline']
+        # Auto-disconnect offline devices that were *previously* online. We do
+        # NOT disconnect a device on its very first observation as offline —
+        # `adb` reports `offline` for a few seconds after a fresh
+        # `adb connect`, while the phone is still in the middle of the
+        # authorization handshake. Disconnecting it then kills the connection
+        # before the phone ever has a chance to authorize, so the seat
+        # appears connected (SSH tunnel up) but the device stays `offline`
+        # forever. Only after we've seen the device as `device` at least
+        # once do we treat a subsequent `offline` as a tunnel drop.
+        if not hasattr(self, '_device_ever_online'):
+            self._device_ever_online = {}  # device_id -> bool
+        for d in devices:
+            if d.get('status') == 'device':
+                self._device_ever_online[d['id']] = True
+
+        offline_devices = [
+            d for d in devices
+            if d.get('status') == 'offline' and self._device_ever_online.get(d.get('id'))
+        ]
         if offline_devices:
-            self.log(f"Found {len(offline_devices)} offline device(s), auto-disconnecting", "INFO")
+            self.log(f"Found {len(offline_devices)} offline device(s) that were previously online, auto-disconnecting", "INFO")
             for offline_dev in offline_devices:
                 dev_id = offline_dev.get('id')
                 if not dev_id:
@@ -163,8 +179,23 @@ class DeviceMixin:
                 device_list.append(display_str)
                 device_display_map[display_str] = device_id
 
-            # Only log if device list changed
-            devices_changed = current_device_ids != new_device_ids
+            # Detect any change worth rebuilding buttons for: device IDs
+            # added/removed, OR a device's status flipped (e.g. a freshly-
+            # connected seat device went from `offline` to `device` after
+            # the phone authorized the adb key). Without the status check
+            # the device button would stay labeled the same even though
+            # the underlying state changed — leaving the user thinking
+            # the device is still unusable.
+            current_device_statuses = {}
+            if hasattr(self, '_cached_device_statuses'):
+                current_device_statuses = self._cached_device_statuses
+            new_device_statuses = {d['id']: d.get('status') for d in devices}
+            self._cached_device_statuses = new_device_statuses
+
+            devices_changed = (
+                current_device_ids != new_device_ids
+                or current_device_statuses != new_device_statuses
+            )
 
             # Store device_display_map as instance variable for future comparisons
             self.device_display_map = device_display_map
@@ -236,9 +267,17 @@ class DeviceMixin:
                     # If SEAT is available from seat.sh, use it as primary name with DEVICE as port
                     if seat_name:
                         if gateway_name:
-                            device_display = f"💺 {seat_name}\n📡 {gateway_name}\n📱 {device_id}"
+                            # Show a status dot so the user can tell at a glance
+                            # whether the seat's device is actually online. The
+                            # phone needs to authorize the adb key before a
+                            # freshly-connected seat device flips from `offline`
+                            # to `device`; until then it's stuck in "offline"
+                            # even though the SSH tunnel is up.
+                            status_dot = "🟢" if d.get('status') == 'device' else "🟡"
+                            device_display = f"{status_dot} 💺 {seat_name}\n📡 {gateway_name}\n📱 {device_id}"
                         else:
-                            device_display = f"💺 {seat_name}\n📱 {device_id}"
+                            status_dot = "🟢" if d.get('status') == 'device' else "🟡"
+                            device_display = f"{status_dot} 💺 {seat_name}\n📱 {device_id}"
                     else:
                         device_display = f"📱 {display_name}\n{device_id}"
 
@@ -250,6 +289,17 @@ class DeviceMixin:
                     btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
                     btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
                     btn.clicked.connect(lambda checked, did=device_id: self.select_device_button(did))
+                    # Tooltip explains the status dot, so a 🟡 (offline) seat
+                    # device tells the user to tap "Allow USB debugging?" on
+                    # the phone instead of just looking broken.
+                    if d.get('status') == 'offline' and seat_name:
+                        btn.setToolTip(
+                            f"🟡 Seat device not yet authorized.\n"
+                            f"Check the phone for an 'Allow USB debugging?' prompt.\n"
+                            f"Status: {d.get('status', 'unknown')}"
+                        )
+                    else:
+                        btn.setToolTip(f"Status: {d.get('status', 'unknown')}")
 
                     # Apply styling with NO border (removes visual gap)
                     if device_id == self.current_device:

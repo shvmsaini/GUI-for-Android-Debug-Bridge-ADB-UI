@@ -70,13 +70,14 @@ from adb_tool.app_methods import AppMixin
 from adb_tool.seat_methods import SeatMixin
 from adb_tool.file_methods import FileMixin
 from adb_tool.theme_methods import ThemeMixin
+from adb_tool.gateway_methods import GatewayMixin
 
 
 # Note: Classes that were extracted to adb_tool/ modules are now imported above.
 # The main ADBGUI class (which contains the UI setup and device operations)
 # remains in this file as it's tightly coupled and benefits from being in one place.
 
-class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMixin, ThemeMixin, QMainWindow):
+class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMixin, ThemeMixin, GatewayMixin, QMainWindow):
     """Main GUI Application"""
     
     # Signal for showing custom dialog (must be defined at class level)
@@ -426,7 +427,22 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         ops_widget = QWidget()
         ops_layout = QVBoxLayout(ops_widget)
         ops_layout.setSpacing(6)
-        
+
+        # Gateway Manager — SSH/SFTP browser over connected seat gateways
+        gateway_group = QGroupBox("🌐 Gateway Manager")
+        gateway_group.setObjectName("gatewayGroup")
+        gateway_group_layout = QVBoxLayout(gateway_group)
+        gateway_group_layout.setContentsMargins(15, 15, 15, 5)
+        gateway_group_layout.setSpacing(4)
+        gateway_btn = QPushButton("🗂️ Open Gateway Explorer…")
+        gateway_btn.setToolTip(
+            "Browse files on a connected seat's gateway over SSH/SFTP.\n"
+            "Uses saved SSH password from Keychain. Upload and download via SCP."
+        )
+        gateway_btn.clicked.connect(self.open_gateway_explorer)
+        gateway_group_layout.addWidget(gateway_btn)
+        ops_layout.addWidget(gateway_group)
+
         # File operations
         file_group = QGroupBox("📁 File Transfer")
         file_group.setObjectName("fileGroup")  # Apply modern styling
