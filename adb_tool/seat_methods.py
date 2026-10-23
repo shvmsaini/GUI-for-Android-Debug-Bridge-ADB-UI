@@ -499,18 +499,31 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
 
 
 def _push_adb_key(sh, adb_keys, log):
-    """Append the user's adb public key to /data/misc/adb/adb_keys.
+    """Append the user's adb public key to /data/misc/adb/adb_keys and run
+    the post-install setup so the seat's adbd trusts the new key.
 
-    Dedups by the leading token of the key (the base64 blob) so re-running
-    is idempotent. Preserves any other entries already on the device.
+    Dedups by the full key line so re-running is idempotent. Preserves any
+    other entries already on the device.
+
+    Post-install steps (per the user's request — these run as root on the
+    seat and are best-effort; failures are logged but don't abort):
+      1. export ANDROID_DATA=/data; export PATH=$PATH:/system/bin
+         — some seat images need ANDROID_DATA set to touch /data paths
+      2. ulimit -v unlimited
+         — some seat images impose per-process VM limits that break
+           operations on large /data files
+      3. setprop persist.service.adb.enable 1
+         — ensures adbd is enabled across reboots
+
+    After these, ``setprop ctl.restart adbd`` is issued by the caller
+    (see ``_install_adb_key_on_seat``) so adbd re-reads the freshly-appended
+    key on its next start. Without that, the running adbd still doesn't
+    know about the new key and the host side keeps seeing `unauthorized`.
     """
     line = _clean_adb_key_line(adb_keys)
     if not line:
         raise _SeatSshError("adb key is empty")
-    token = line.split()[0]
-    if not re.fullmatch(r"[A-Za-z0-9+/=]+", token) or not re.fullmatch(
-        r"[A-Za-z0-9+/=@._:\- ]+", line
-    ):
+    if not re.fullmatch(r"[A-Za-z0-9+/=@._:\- ]+", line):
         raise _SeatSshError(
             "adb key contains unexpected characters — paste the contents of "
             "~/.android/adbkey.pub."
@@ -518,12 +531,13 @@ def _push_adb_key(sh, adb_keys, log):
 
     f = _ADB_KEYS_FILE
 
-    # Dedup check: `grep -qF` exits 0 if found. The token check is loose —
-    # different hosts' keys share the same key type but differ in the base64
-    # blob. Comparing the full line is the only reliable dedup.
+    # Dedup check: `grep -qF` exits 0 if found. Different hosts' keys share
+    # the same key type but differ in the base64 blob, so we compare the
+    # full line — that's the only reliable dedup.
     _, code = sh.run(f"grep -qF '{line}' {f} 2>/dev/null", timeout=15)
     if code == 0:
-        log("KEYS: key already on seat — skipping", "INFO")
+        log("KEYS: key already on seat — running post-install setup", "INFO")
+        _run_post_install_setup(sh, log)
         return
     log("KEYS: key not on seat, appending...", "INFO")
 
@@ -543,6 +557,38 @@ def _push_adb_key(sh, adb_keys, log):
     if code != 0:
         raise _SeatSshError(f"Could not verify the key in {f}")
     log("KEYS: key written and verified", "INFO")
+
+    _run_post_install_setup(sh, log)
+
+
+def _run_post_install_setup(sh, log):
+    """Run the seat-side post-install setup the user requested. Each step
+    is best-effort: failures are logged at WARNING level but don't abort
+    the install (the key is already written by the time we get here).
+    """
+    # 1. ANDROID_DATA + PATH — needed before running anything that touches
+    #    /data paths on some seat images.
+    out, code = sh.run(
+        "export ANDROID_DATA=/data; export PATH=$PATH:/system/bin",
+        timeout=10,
+    )
+    if code != 0:
+        log(f"KEYS: post-install export ANDROID_DATA failed: {out.strip()}",
+            "WARNING")
+
+    # 2. ulimit -v unlimited — some seat images impose per-process VM limits
+    #    that break operations on /data.
+    out, code = sh.run("ulimit -v unlimited", timeout=10)
+    if code != 0:
+        log(f"KEYS: post-install ulimit failed: {out.strip()}", "WARNING")
+
+    # 3. persist.service.adb.enable — ensure adbd stays enabled across
+    #    reboots on seat images that default to disabled.
+    out, code = sh.run("setprop persist.service.adb.enable 1", timeout=10)
+    if code != 0:
+        log(f"KEYS: post-install setprop failed: {out.strip()}", "WARNING")
+    else:
+        log("KEYS: post-install setup complete", "INFO")
 
 
 class SeatMixin:
@@ -1541,11 +1587,19 @@ class SeatMixin:
                 sh = _seat_root_shell_via_mtc(jump, seat, mtc_password, log=self.log)
                 _push_adb_key(sh, adb_key, log=self.log)
                 self.log(f"ADB key installed on seat {seat}", "INFO")
-                # After appending the key, force adb to re-handshake with the
-                # seat so the device flips back to `device` (was likely showing
-                # yellow 🟡 until it re-authorizes with the freshly-appended key).
-                # adbd reads /data/misc/adb/adb_keys at startup, so a running
-                # adbd won't notice the new key until we disconnect + reconnect.
+                # Restart adbd on the seat so it re-reads /data/misc/adb/adb_keys
+                # at startup and accepts the host's public key. Without this,
+                # the running adbd doesn't notice the freshly-appended key and
+                # the host side keeps seeing `unauthorized` (yellow 🟡).
+                #
+                # We do NOT use `adb kill-server` on the host — that would drop
+                # every other connected device. Restarting adbd on the device
+                # only kills the seat's tunnel, which is exactly what we want.
+                out, code = sh.run("setprop ctl.restart adbd", timeout=10)
+                self.log(f"KEYS: setprop ctl.restart adbd exit={code} "
+                         f"out={out.strip()!r}", "DEBUG")
+                # After appending the key, reconnect on the host side so the
+                # adb client re-handshakes with the freshly-restarted adbd.
                 QTimer.singleShot(
                     0,
                     lambda: self._reconnect_seat_device_after_install(seat_dev),
@@ -1590,13 +1644,30 @@ class SeatMixin:
         """Force adb to re-handshake the seat device so the freshly-appended
         ADB key takes effect. Schedules refresh_devices() once complete.
         Must be called on the GUI thread.
+
+        We previously tried `adb disconnect` + `adb connect` immediately
+        after writing the key, but that left the host-side adb server's
+        cached "unauthorized" mapping in place — the device would stay
+        yellow 🟡 even though its adb_keys file had the right key. The
+        working sequence (verified by the user) is:
+
+          1. setprop ctl.restart adbd   ← done on the seat before we get here
+          2. wait ~3s for adbd to come back up
+          3. adb disconnect localhost:<port>
+          4. adb connect    localhost:<port>
+          5. refresh_devices
+
+        `kill-server` would also work but disconnects every other device,
+        which we explicitly want to avoid.
         """
         self.log(f"Reconnecting {seat_dev} to pick up new ADB key...", "INFO")
 
         def do_reconnect():
+            # Give adbd a moment to come back up after ctl.restart.
+            time.sleep(3)
             try:
                 self.adb.run_command(f"disconnect {seat_dev}")
-                time.sleep(0.3)
+                time.sleep(0.5)
                 self.adb.run_command(f"connect {seat_dev}")
             except Exception as e:
                 self.log(f"Reconnect {seat_dev} failed: {e}", "WARNING")
