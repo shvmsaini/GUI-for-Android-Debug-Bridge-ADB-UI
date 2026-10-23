@@ -34,11 +34,20 @@ s.close()
 EOF
 }
 
+# Find a saved entry by seat name.  Format: SEAT|PORT|GATEWAY|TS
+# (four pipe-separated fields, no '=' anywhere).
 getSavedPort() {
     local SEAT="$1"
-    awk -F'[=|]' -v seat="$SEAT" '$1==seat {print $2}' "$PORT_MAP_FILE"
+    awk -F'|' -v seat="$SEAT" '$1==seat {print $2; exit}' "$PORT_MAP_FILE"
 }
 
+getSavedGateway() {
+    local SEAT="$1"
+    awk -F'|' -v seat="$SEAT" '$1==seat {print $3; exit}' "$PORT_MAP_FILE"
+}
+
+# Persist a seat -> port/gateway mapping. Sole owner of $PORT_MAP_FILE.
+# Format: SEAT|PORT|GATEWAY|TS  (one line per entry).
 savePort() {
     local SEAT="$1"
     local PORT="$2"
@@ -47,15 +56,9 @@ savePort() {
 
     TS=$(date +%s)
 
-    grep -v "^${SEAT}=" "$PORT_MAP_FILE" > "${PORT_MAP_FILE}.tmp"
-    echo "${SEAT}=${PORT}|${GATEWAY}|${TS}" >> "${PORT_MAP_FILE}.tmp"
-    mv "${PORT_MAP_FILE}.tmp" "$PORT_MAP_FILE"
-}
-
-removePort() {
-    local SEAT="$1"
-
-    grep -v "^${SEAT}=" "$PORT_MAP_FILE" > "${PORT_MAP_FILE}.tmp"
+    # Drop any prior entry for this seat, then append the fresh one.
+    grep -v "^${SEAT}|" "$PORT_MAP_FILE" > "${PORT_MAP_FILE}.tmp"
+    echo "${SEAT}|${PORT}|${GATEWAY}|${TS}" >> "${PORT_MAP_FILE}.tmp"
     mv "${PORT_MAP_FILE}.tmp" "$PORT_MAP_FILE"
 }
 
@@ -162,11 +165,6 @@ EOF
     exit 1
 }
 
-getSavedGateway() {
-    local SEAT="$1"
-    awk -F'[=|]' -v seat="$SEAT" '$1==seat {print $3}' "$PORT_MAP_FILE"
-}
-
 function adbDisconnect()
 {
     TARGET="$1"
@@ -246,7 +244,9 @@ case "$1" in
                 PORT=$(getSavedPort "$TARGET")
                 if [ -n "$PORT" ]; then
                     adbDisconnect "$PORT"
-                    removePort "$TARGET"
+                    # Also remove the saved entry for this seat
+                    grep -v "^${TARGET}|" "$PORT_MAP_FILE" > "${PORT_MAP_FILE}.tmp"
+                    mv "${PORT_MAP_FILE}.tmp" "$PORT_MAP_FILE"
                 else
                     adbDisconnect "$TARGET"
                 fi
@@ -271,7 +271,9 @@ case "$1" in
             if [[ "$DEVICE" =~ localhost:([0-9]+) ]]; then
                 PORT="${BASH_REMATCH[1]}"
 
-                INFO=$(awk -F'[=|]' -v port="$PORT" '$2==port {print $1 "|" $3}' "$PORT_MAP_FILE")
+                # Format: SEAT|PORT|GATEWAY|TS. Look up the line whose
+                # PORT field matches and pull SEAT+GATEWAY from it.
+                INFO=$(awk -F'|' -v port="$PORT" '$2==port {print $1 "|" $3; exit}' "$PORT_MAP_FILE")
 
                 if [ -n "$INFO" ]; then
                     SEAT="${INFO%%|*}"
@@ -664,8 +666,10 @@ saveHistory() {
     local GW="$1"; local HE="$2"; local USR="$3"
     local TS; TS=$(date +%s)
     touch "$HISTORY_FILE"
-    grep -v "^${GW}=" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
-    echo "${GW}=${HE}|${USR}|${TS}" >> "${HISTORY_FILE}.tmp"
+    # Sole owner of $HISTORY_FILE. Format: RACK|HEAD|USER|TS
+    # (four pipe-separated fields, no '=' anywhere).
+    grep -v "^${GW}|" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
+    echo "${GW}|${HE}|${USR}|${TS}" >> "${HISTORY_FILE}.tmp"
     mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
 }
 
@@ -713,17 +717,14 @@ if [[ "$1" == "history" ]]; then
     fi
 
     # List all historical connections in JSON format
-    # One line per entry
+    # One line per entry (format: RACK|HEAD|USER|TS).
     echo "["
     FIRST=true
 
-    while IFS='=' read -r gate rest; do
-        if [[ -z "$gate" ]]; then
+    while IFS='|' read -r rack head user ts; do
+        if [[ -z "$rack" ]]; then
             continue
         fi
-
-        # Split "head|user|ts" on '|'
-        IFS='|' read -r head user ts <<< "$rest"
 
         if [[ "$FIRST" = true ]]; then
             FIRST=false
@@ -732,7 +733,7 @@ if [[ "$1" == "history" ]]; then
         fi
 
         cat <<EOF
-    {"rack":"$gate","headend":"$head","user":"$user","timestamp":$ts}
+    {"rack":"$rack","headend":"$head","user":"$user","timestamp":$ts}
 EOF
     done < "$HISTORY_FILE"
 

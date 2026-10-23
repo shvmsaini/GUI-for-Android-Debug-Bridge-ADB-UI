@@ -1,11 +1,13 @@
 import os
 import sys
 import subprocess
+from subprocess import TimeoutExpired
 import threading
 import time
 import shlex
 import shutil
 import re
+import tempfile
 from datetime import datetime
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
 from PyQt6.QtWidgets import (
@@ -13,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget, QLineEdit, QCheckBox, QComboBox, QTableWidgetItem, QSizePolicy, QFrame,
     QScrollArea, QGroupBox, QTextEdit, QListWidget, QListWidgetItem, QTabWidget,
     QMainWindow, QGridLayout, QButtonGroup, QRadioButton, QCompleter, QDialogButtonBox,
-    QApplication, QHeaderView
+    QApplication, QHeaderView, QInputDialog
 )
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QDrag
 
@@ -136,6 +138,7 @@ class SeatMixin:
         watcher.setInterval(interval * 1000)
         self._seat_device_watcher = watcher
         self._seat_device_watcher_seat = seat
+        self.log(f"Starting device watcher for {seat} (port {port})", "DEBUG")
 
         # Match exactly this seat's adb device (`localhost:<port>`), not any
         # seat tunnel — otherwise with multiple seats online we'd log
@@ -152,6 +155,8 @@ class SeatMixin:
                 return
 
             devices = self.adb.get_devices(silent=True)
+            # Log what we're polling against
+            self.log(f"Device watcher: waiting for {seat_device_id} ({elapsed['secs']}/{max_wait}s)...", "INFO")
             seat_device_online = any(
                 d.get('id') == seat_device_id and d.get('status') == 'device'
                 for d in devices
@@ -264,6 +269,7 @@ class SeatMixin:
                 if key not in existing_seat_keys:
                     # Extract port from device string (e.g., "localhost:64491" -> "64491")
                     port = device.split(':')[-1] if ':' in device else ''
+                    # History is owned by seat.sh — we just show live state here.
                     top_seats.append({
                         'seat': seat_name,
                         'port': port,
@@ -342,10 +348,23 @@ class SeatMixin:
             btn.clicked.connect(lambda checked=False, e=entry: self._on_seat_clicked(e))
 
             if btn_connected:
-                # Connected: Green background, red on hover (to indicate disconnect)
+                # Show yellow/orange ONLY when seat.sh reports the device as
+                # "offline". Other non-"device" states (e.g. unauthorized,
+                # no permissions) keep the green "connected" color — they
+                # mean the seat tunnel is up and the device just needs
+                # the user to tap "Allow USB debugging?".
+                device_status = entry.get('status', '').strip().lower()
+                if device_status == 'offline':
+                    btn_bg = self.colors['warning']
+                    tooltip_extra = "\n\n⚠️ Device is offline (per seat.sh devices) — phone not reachable."
+                else:
+                    btn_bg = self.colors['success']
+                    tooltip_extra = ""
+                hover_bg = self.colors['error']
+                # Connected: Green (online / unauthorized) or yellow (offline). Red on hover = disconnect.
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background-color: {self.colors['success']};
+                        background-color: {btn_bg};
                         color: white;
                         font-weight: bold;
                         text-align: left;
@@ -353,14 +372,14 @@ class SeatMixin:
                         border: none;
                     }}
                     QPushButton:hover {{
-                        background-color: {self.colors['error']};
+                        background-color: {hover_bg};
                         color: white;
                     }}
                 """)
-                # Update tooltip to indicate action and show full gateway name if truncated
                 tooltip_text = "Click to disconnect"
                 if len(entry['gateway']) > 40:
                     tooltip_text += f"\n\nFull gateway: {entry['gateway']}"
+                tooltip_text += tooltip_extra
                 btn.setToolTip(tooltip_text)
             else:
                 # Disconnected: Default background, blue on hover (indicates connect)
@@ -559,8 +578,29 @@ class SeatMixin:
             # Disconnect
             self.disconnect_seat(entry['seat'])
         else:
-            # Connect
-            self.connect_seat(entry['seat'], entry['gateway'])
+            # Connect — fire `seat.sh auto-connect` internally without any
+            # prompt dialog. Password must already be in Keychain for this
+            # gateway; if not, log a clear error and bail rather than
+            # blocking the GUI thread with a popup.
+            gateway_norm = entry['gateway'].strip()
+            if '@' not in gateway_norm:
+                gateway_norm = f'user@{gateway_norm}'
+            parts = gateway_norm.split('@')
+            user = parts[0] if len(parts) == 2 else 'user'
+            gateway_host = parts[1] if len(parts) == 2 else gateway_norm
+            password = self.credential_manager.get_password(gateway_host, user)
+            if not password:
+                self.log(
+                    f"No password stored for {user}@{gateway_host} — "
+                    f"set it in Settings → Security first",
+                    "ERROR",
+                )
+                self.update_status(f"No password for {gateway_host}")
+                return
+            self.connect_seat(
+                entry['seat'], entry['gateway'],
+                device_password=password, mtc_password=password, root_password=password,
+            )
 
     def _on_portforward_clicked(self, entry):
         """Handle port forward button click"""
@@ -692,80 +732,83 @@ class SeatMixin:
                     self.update_status("seat.sh not found")
                     return
 
-                # Use sshpass if available, otherwise try with stdin
-                if shutil.which('sshpass'):
-                    cmd = ['sshpass', '-p', password, script_path, 'auto-connect', seat, gateway]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-                    stdout, stderr = result.stdout, result.stderr
-                    returncode = result.returncode
-                else:
-                    # Fallback: pass password via SSH_ASKPASS
-                    askpass_script = f"#!/bin/sh\necho {password}\n"
-                    askpass_file = '/tmp/adb_gui_askpass.sh'
-                    with open(askpass_file, 'w') as f:
-                        f.write(askpass_script)
-                    os.chmod(askpass_file, 0o755)
-                    env['SSH_ASKPASS'] = askpass_file
-                    env['SSH_ASKPASS_REQUIRE'] = 'force'
-
-                    cmd = [script_path, 'auto-connect', seat, gateway]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-                    stdout, stderr = result.stdout, result.stderr
-                    returncode = result.returncode
-
-                    # Clean up
-                    try:
-                        os.remove(askpass_file)
-                    except:
-                        pass
-
-                # Check for success: returncode 0 AND no obvious error messages.
+                # Use SSH_ASKPASS to feed the password to ssh. DO NOT use
+                # sshpass: sshpass holds open a pty to ssh that, when the
+                # script's `ssh -f -N -L ...` forks the tunnel child, ends
+                # up reaping it as soon as sshpass exits — the tunnel dies
+                # immediately and the device shows up as `offline` even
+                # though `seat.sh auto-connect` returned 0.
                 #
-                # OpenSSH prints things like "verify error:num=10:certificate has
-                # expired" as *warnings* — it still continues and exits 0. The
-                # bare substring "error" used to catch those and falsely mark
-                # the seat as failed. So we only look for phrases that genuinely
-                # mean failure (connection/auth/SSH refusal), and we look for an
-                # explicit success marker as well so we don't get tripped up by
-                # unrelated noise in stdout/stderr.
-                error_indicators = [
-                    "Connection refused",
-                    "Could not resolve hostname",
-                    "nodename nor servname",
-                    "Permission denied",
-                    "Host key verification failed",
-                    "Connection timed out",
-                    "Network is unreachable",
-                    "No route to host",
-                    "ssh: ",
-                    "Address already in use",  # Port conflict
-                    "cannot listen to port",     # Port is already bound
-                    "FAILED",
-                ]
-                success_marker = "connected to localhost:"
-                combined = (stderr or '') + (stdout or '')
-                combined_lower = combined.lower()
+                # SSH_ASKPASS, by contrast, is invoked by ssh itself as a
+                # one-shot helper process and closes cleanly once ssh has
+                # the password; the forked tunnel child detaches properly
+                # and survives after the script exits.
+                askpass_file = '/tmp/adb_gui_askpass.sh'
+                askpass_script = f"#!/bin/sh\necho {password}\n"
+                with open(askpass_file, 'w') as f:
+                    f.write(askpass_script)
+                os.chmod(askpass_file, 0o755)
+                env['SSH_ASKPASS'] = askpass_file
+                env['SSH_ASKPASS_REQUIRE'] = 'force'
+                # DISPLAY must be set for SSH_ASKPASS_REQUIRE=force to take
+                # effect on macOS even though there's no real X server —
+                # ssh only consults SSH_ASKPASS when it thinks it's not on
+                # a tty AND DISPLAY is non-empty.
+                env.setdefault('DISPLAY', ':0')
 
-                # Strip out OpenSSH's "verify error:num=10:certificate has
-                # expired" lines — they're warnings, not failures. OpenSSH
-                # already prints a follow-up "verify return:1" indicating the
-                # cert was accepted despite the expiry note.
-                filtered = "\n".join(
-                    line for line in combined.splitlines()
-                    if "verify error:" not in line
-                    and "notafter=" not in line.lower()
-                ).lower()
+                cmd = [script_path, 'auto-connect', seat, gateway]
+                # IMPORTANT: redirect stdout/stderr to temp files instead of
+                # using capture_output=True. seat.sh runs `ssh -f -N -L ...`
+                # which forks a long-lived tunnel daemon. When invoked via
+                # vrack's ~/.ssh/config ProxyCommand (openssl s_client), the
+                # tunnel daemon inherits the ProxyCommand's stdin/stdout
+                # pipes. subprocess.run(capture_output=True) holds the read
+                # ends of those pipes via communicate(), so it blocks until
+                # the daemon closes them — which it never does. That race
+                # causes our 30s timeout even though the seat actually
+                # connected (verified: adb devices shows the port as
+                # `device` shortly after, with no further action).
+                #
+                # Writing to temp files decouples us from the daemon's pipes.
+                _stdout_fd, _stdout_path = tempfile.mkstemp(prefix='adb_gui_seat_out_', suffix='.log')
+                _stderr_fd, _stderr_path = tempfile.mkstemp(prefix='adb_gui_seat_err_', suffix='.log')
+                os.close(_stdout_fd)
+                os.close(_stderr_fd)
+                try:
+                    with open(_stdout_path, 'w') as _out_f, open(_stderr_path, 'w') as _err_f:
+                        result = subprocess.run(
+                            cmd,
+                            stdout=_out_f,
+                            stderr=_err_f,
+                            text=True,
+                            timeout=30,
+                            env=env,
+                        )
+                    with open(_stdout_path, 'r') as _out_f:
+                        stdout = _out_f.read()
+                    with open(_stderr_path, 'r') as _err_f:
+                        stderr = _err_f.read()
+                    returncode = result.returncode
+                finally:
+                    try: os.remove(_stdout_path)
+                    except Exception: pass
+                    try: os.remove(_stderr_path)
+                    except Exception: pass
 
-                has_error = (
-                    returncode != 0
-                    or any(ind.lower() in filtered for ind in error_indicators)
-                )
-                # Negative success markers trump a positive one — if the script
-                # printed both "connected to localhost:..." and an actual error,
-                # treat as failure.
-                succeeded = success_marker.lower() in combined_lower
+                # Clean up the askpass file
+                try:
+                    os.remove(askpass_file)
+                except Exception:
+                    pass
 
-                if not has_error and succeeded:
+                # Success or failure is solely determined by `seat.sh` return code.
+                # 0 means success; anything else means failure. Period.
+                # Do NOT second-guess—ignore all stderr/stdout strings including
+                # cert warnings, host keys, protocol middleboxes, or random
+                # logging. `seat.sh` already handled those internally and still
+                # exits 0 when it got a working SSH tunnel and opened adb.
+                succeeded = (returncode == 0)
+                if succeeded:
                     self.seat_port_manager.mark_seat_connected(seat, gateway)
                     # Install ADB key if requested
                     adb_key = getattr(self, '_pending_adb_key', None)
@@ -784,20 +827,19 @@ class SeatMixin:
                     else:
                         self.log("Not installing ADB key (missing credentials or flag)", "INFO")
 
-                    # Add to history for quick access
-                    # Pull the *actual* adb port from the script's stdout
-                    # — seat.sh picks a free port dynamically ("Assigned new
-                    # port 60100 to <seat>" / "Reusing port 60100 for <seat>"),
-                    # so hardcoding '5555' here would have `get_top_entries`
-                    # overwrite the real port seat.sh saved and show the
-                    # wrong number in the seat panel.
+                    # History is owned by seat.sh — it calls savePort inside
+                    # auto-connect and persists the mapping to ~/.cache/adb-seat-ports.
+                    # We just read it back via get_top_entries on refresh.
+                    # Pull the actual adb port from stdout for the seat-panel label.
                     _port_match = re.search(
                         r"(?:Assigned new port|Reusing port)\s+(\d+)",
                         stdout or '',
                     )
                     actual_port = _port_match.group(1) if _port_match else '5555'
-                    self.seat_port_manager.append_history(seat, actual_port, gateway, 'seat')
-                    self.log(f"Connected to seat {seat}", "INFO")
+                    if _port_match:
+                        self.log(f"Seat connected on port {actual_port}", "INFO")
+                    else:
+                        self.log(f"Connected to seat {seat} (defaulting to port {actual_port})", "INFO")
                     self.update_status(f"Connected to {seat}")
                     QTimer.singleShot(0, self.refresh_seat_port_lists)
                     QTimer.singleShot(500, self.refresh_devices)  # Refresh devices after seat connection
@@ -816,7 +858,14 @@ class SeatMixin:
                     # doesn't. The watcher keys on the seat's actual adb
                     # port so it doesn't get confused by *other* seat tunnels
                     # that happen to be online.
-                    self._start_seat_device_watcher(seat, port=actual_port)
+                    #
+                    # IMPORTANT: the watcher is a QTimer(parent=self), and Qt
+                    # forbids creating QObjects with a GUI-thread parent from
+                    # a background thread. do_connect runs in a worker
+                    # thread, so we must defer watcher creation to the GUI
+                    # thread via QTimer.singleShot(0, ...).
+                    QTimer.singleShot(0, lambda s=seat, p=actual_port: self._start_seat_device_watcher(s, port=p))
+                    self.log(f"Seat connection flow complete for {seat} on port {actual_port}; watcher will start on GUI thread", "INFO")
                 else:
                     error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
                     self.log(f"Failed to connect to seat: {error}", "ERROR")
@@ -1063,8 +1112,8 @@ class SeatMixin:
 
                 if not has_error:
                     self.seat_port_manager.mark_portforward_connected(gateway)
-                    # Add to history for quick access (rack is the seat field, partition is stored as rack)
-                    self.seat_port_manager.append_history(gateway_host, partition, user, 'portforward')
+                    # History is owned by portforwardRack.sh — it calls saveHistory
+                    # internally on successful start. We just read it back.
                     self.log(f"Port forward connected for {gateway}", "INFO")
                     self.update_status(f"Port forward connected")
                     QTimer.singleShot(0, self.refresh_seat_port_lists)

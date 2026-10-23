@@ -174,8 +174,36 @@ class DeviceMixin:
                 else:
                     display_name = "Unknown Device"
 
-                # Format: "Device Name (ID)"
-                display_str = f"{display_name} ({device_id})"
+                # If this device comes from a seat tunnel, append seat name and
+                # gateway (rack) so the user can tell seats apart at a glance.
+                seat_for_device = None
+                gateway_for_device = None
+                try:
+                    for seat, gateway in (self.seat_port_manager.connected_seats or {}).items():
+                        # Look up the port that seat.sh assigned to this seat.
+                        port = None
+                        try:
+                            history = self.seat_port_manager.load_history('seat') or []
+                            for h in history:
+                                if h.get('seat') == seat:
+                                    p = h.get('port')
+                                    if p:
+                                        port = str(p)
+                                        break
+                        except Exception:
+                            port = None
+                        if port and device_id.endswith(f":{port}"):
+                            seat_for_device = seat
+                            gateway_for_device = gateway
+                            break
+                except Exception:
+                    pass
+                if seat_for_device and gateway_for_device:
+                    host = gateway_for_device.split('@', 1)[-1]
+                    display_str = f"{display_name} ({device_id}) — seat {seat_for_device} @ {host}"
+                else:
+                    # Format: "Device Name (ID)"
+                    display_str = f"{display_name} ({device_id})"
                 device_list.append(display_str)
                 device_display_map[display_str] = device_id
 

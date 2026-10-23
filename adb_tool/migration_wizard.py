@@ -633,7 +633,20 @@ class MigrationWizard(QDialog):
                                 # This ensures uniqueness and preserves ordering
                                 port = str(50000 + (ts % 10000) + idx)
 
-                            f.write(f"{entry['seat']}={port}|{gateway_full}|{ts}\n")
+                            # Validate: all fields must be present.
+                            # Refuse to write malformed entries like
+                            # "seat=" (no port) or "=port|gw|ts" (no seat).
+                            if not entry['seat'] or not port or not gateway_full or not ts:
+                                continue
+
+                            # Dedupe by port: if this port is already taken,
+                            # bump it to the next free slot.
+                            while int(port) in existing_ports:
+                                port = str(int(port) + 1)
+                            existing_ports.add(int(port))
+
+                            # Canonical format: SEAT|PORT|GATEWAY|TS
+                            f.write(f"{entry['seat']}|{port}|{gateway_full}|{ts}\n")
             except Exception as e:
                 QMessageBox.warning(self, "Import Error", f"Failed to write seat history: {e}")
                 return
@@ -648,7 +661,19 @@ class MigrationWizard(QDialog):
                     for idx, entry in enumerate(selected_racks):
                         if entry['rack'] not in self.existing_racks:
                             ts = base_ts + idx
-                            f.write(f"{entry['rack']}={entry.get('headend', '172.17.4.4')}|{entry['user']}|{ts}\n")
+                            rack = entry['rack']
+                            headend = entry.get('headend', '172.17.4.4')
+                            user = entry['user']
+
+                            # Validate: every field must be non-empty. A
+                            # malformed entry like "rack=head|" (no user,
+                            # no timestamp) is worse than missing — it
+                            # poisons load_history's parser. Drop it.
+                            if not rack or not headend or not user or not ts:
+                                continue
+
+                            # Canonical format: RACK|HEAD|USER|TS
+                            f.write(f"{rack}|{headend}|{user}|{ts}\n")
             except Exception as e:
                 QMessageBox.warning(self, "Import Error", f"Failed to write portforward history: {e}")
                 return

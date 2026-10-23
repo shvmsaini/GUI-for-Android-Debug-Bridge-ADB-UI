@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget, QLineEdit, QCheckBox, QComboBox, QTableWidgetItem, QSizePolicy, QFrame,
     QScrollArea, QGroupBox, QTextEdit, QListWidget, QListWidgetItem, QTabWidget,
     QMainWindow, QGridLayout, QButtonGroup, QRadioButton, QCompleter, QDialogButtonBox,
-    QApplication, QHeaderView, QInputDialog
+    QApplication, QHeaderView, QProgressDialog, QTableWidget, QInputDialog
 )
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QDrag
 
@@ -240,7 +240,7 @@ class GatewayMixin:
             label = f"{seat} → {host} ({user})"
             out.append((label, host, user))
 
-        return out
+        return sorted(out, key=lambda g: (0 if g[1] in (self.adb.get_devices(silent=True) or []) else 1), reverse=True)
 
     def open_gateway_explorer(self):
         """Open an SSH/SFTP file explorer for a connected seat's gateway."""
@@ -255,12 +255,51 @@ class GatewayMixin:
 
         # Let the user pick which gateway
         labels = [g[0] for g in gateways]
+        default_index = 0
+        # Prefer:
+        # 1) if current_device (last clicked) is set and has a gateway matching,
+        # 2) then any gateway whose seat's device is currently online,
+        # 3) otherwise, first gateway
+        seat_sh = self.seat_port_manager.get_devices_from_seat_sh() or []
+        current_adb_devices = self.adb.get_devices(silent=True) or []
+        current_device = getattr(self, 'current_device', None)
+        self.log(f"Gateway: picking gateway; current_device={current_device}, adb devices={current_adb_devices}", "INFO")
+        def find_default():
+            best_idx = 0
+            # Candidate list: gateways by seat name
+            seat_to_gateway = {}
+            for idx, (label, host, user) in enumerate(gateways):
+                seat = label.split('→', 1)[0].strip()
+                seat_to_gateway[seat] = (idx, host, user)
+            # Map: seat → current device (from seat.sh)
+            seat_to_device = {}
+            for entry in seat_sh:
+                seat = entry.get('seat', '')
+                device = entry.get('device', '')
+                if seat:
+                    seat_to_device[seat] = device
+            # Rule 1: if current_device matches a seat's device, pick that seat's gateway.
+            if current_device:
+                for seat, device in seat_to_device.items():
+                    if device == current_device and seat in seat_to_gateway:
+                        reason = f"matched current_device={current_device} to seat {seat} → gateway {seat_to_gateway[seat][1]}"
+                        self.log(f"Gateway: selected index={seat_to_gateway[seat][0]} because {reason}", "INFO")
+                        return seat_to_gateway[seat][0]
+            # Rule 2: if any seat's device is currently online, pick first such gateway.
+            for seat, device in seat_to_device.items():
+                if device and device in current_adb_devices and seat in seat_to_gateway:
+                    self.log(f"Gateway: selected first online idx={seat_to_gateway[seat][0]} (seat {seat} device {device})", "INFO")
+                    return seat_to_gateway[seat][0]
+            # Rule 3: pick first gateway.
+            return 0
+        default_index = find_default()
+        self.log(f"Gateway: gateway picker will default to index={default_index} label={labels[default_index] if default_index < len(labels) else 'N/A'}", "INFO")
         label, ok = QInputDialog.getItem(
             self,
             "Select Gateway",
             "Connected gateway to browse:",
             labels,
-            0,
+            default_index,
             False,
         )
         if not ok or not label:
@@ -452,10 +491,10 @@ class GatewayMixin:
 
         # Buttons
         btn_row = QHBoxLayout()
-        upload_btn = QPushButton("⬆️ Upload…")
-        download_btn = QPushButton("⬇️ Download…")
+        upload_btn = QPushButton("⬆️ Upload")
+        download_btn = QPushButton("⬇️ Download")
         delete_btn = QPushButton("🗑️ Delete")
-        mkdir_btn = QPushButton("📁 New Folder…")
+        mkdir_btn = QPushButton("📁 New Folder")
         rename_btn = QPushButton("📝 Rename")
         close_btn = QPushButton("Close")
 
@@ -464,10 +503,9 @@ class GatewayMixin:
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(mkdir_btn)
         btn_row.addWidget(rename_btn)
-        copy_btn = QPushButton("📱 Copy to Seat…")
+        copy_btn = QPushButton("📱 Copy to Seat")
         edit_btn = QPushButton("✏️ Edit")
         btn_row.addWidget(copy_btn)
-        edit_btn = QPushButton("✏️ Edit")
         btn_row.addWidget(edit_btn)
         btn_row.addStretch()
         close_btn = QPushButton("Close")
@@ -694,31 +732,79 @@ class GatewayMixin:
             self.log(f"Gateway: downloading {len(remote_paths)} item(s) to {dest}…")
             self.update_status("Downloading…")
 
+            # Get total size upfront so we can show a progress dialog
+            total_bytes = [0]
+            def compute_size():
+                total = 0
+                for rp, is_dir, name in remote_paths:
+                    try:
+                        total += _sftp_size(sftp, rp, is_dir)
+                    except Exception:
+                        pass
+                total_bytes[0] = total
+            threading.Thread(target=compute_size, daemon=True).start()
+
+            progress = QProgressDialog(f"Downloading {len(remote_paths)} item(s)…", "Cancel", 0, 100, explorer)
+            progress.setWindowTitle("Downloading")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(500)
+            progress.setValue(0)
+            cancel_flag = [False]
+            progress.canceled.connect(lambda: cancel_flag.__setitem__(0, True))
+
             def do_pull():
                 ok = 0
                 failed = 0
+                bytes_done = [0]
                 for rp, is_dir, name in remote_paths:
+                    if cancel_flag[0]:
+                        break
                     try:
                         local_target = os.path.join(dest, name)
                         if is_dir:
                             self._sftp_download_dir(sftp, rp, local_target)
                         else:
-                            sftp.get(rp, local_target)
+                            size = _sftp_size(sftp, rp, False)
+                            def cb(transferred, _total=size, _bytes=bytes_done):
+                                _bytes[0] += transferred
+                                pct = (100 * _bytes[0] // total_bytes[0]) if total_bytes[0] else 0
+                                ui.call.emit(lambda p=pct, n=name: progress.setValue(p) or progress.setLabelText(f"Downloading {n}…"))
+                            sftp.get(rp, local_target, callback=cb)
                         ok += 1
                     except Exception as e:
                         failed += 1
                         self.log(f"Gateway download failed for {rp}: {e}", "ERROR")
 
                 def done():
-                    self.update_status("Download complete")
+                    try:
+                        progress.close()
+                    except Exception:
+                        pass
+                    self.update_status("Download complete" if not cancel_flag[0] else "Download cancelled")
                     QMessageBox.information(
-                        self, "Download complete",
+                        self, "Download complete" if not cancel_flag[0] else "Download cancelled",
                         f"Downloaded: {ok}\nFailed: {failed}\n\nDestination:\n{dest}"
                     )
 
                 ui.call.emit(done)
 
             threading.Thread(target=do_pull, daemon=True).start()
+
+        def _sftp_size(self_sftp_unused, path, is_dir):
+            """Return total size of a path. Sum of all files for dirs."""
+            try:
+                if not is_dir:
+                    return sftp.stat(path).st_size
+                total = 0
+                for attr in sftp.listdir_attr(path):
+                    if attr.filename in ('.', '..'):
+                        continue
+                    child = path.rstrip('/') + '/' + attr.filename
+                    child_is_dir = (attr.st_mode & 0o170000) == 0o040000
+                    total += _sftp_size(self_sftp_unused, child, child_is_dir)
+                return total
+            except Exception:
+                return 0
 
         def _sftp_download_dir(sftp, remote_dir, local_dir):
             """Recursively download a remote directory via SFTP."""
@@ -889,8 +975,9 @@ class GatewayMixin:
                     with sftp.open(remote_path, 'r') as f:
                         text = f.read().decode('utf-8', errors='replace')
                     ui.call.emit(lambda: load_done(text))
-                except Exception as e:
-                    ui.call.emit(lambda: load_err(str(e)))
+                except Exception as exc:
+                    msg = str(exc)
+                    ui.call.emit(lambda: load_err(msg))
 
             threading.Thread(target=do_load, daemon=True).start()
 
@@ -1024,6 +1111,7 @@ class GatewayMixin:
         rename_btn.clicked.connect(rename_clicked)
         copy_btn.clicked.connect(copy_to_seat_clicked)
         up_btn.clicked.connect(go_up)
+        refresh_btn.clicked.connect(refresh_listing)
         terminal_btn.clicked.connect(open_in_terminal)
         edit_btn.clicked.connect(edit_file_clicked)
         close_btn.clicked.connect(explorer.close)

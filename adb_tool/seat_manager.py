@@ -150,6 +150,14 @@ class SeatPortManager:
 
         Returns:
             List of history entries with seat, port, gateway, timestamp fields.
+
+        Canonical line format (no '=' anywhere, 4 pipe-separated fields):
+          Seat:         SEAT|PORT|GATEWAY|TS
+          Portforward:  RACK|HEAD|USER|TS
+
+        Any line that doesn't split into exactly 4 fields is rejected
+        (this also drops legacy `=`-prefixed lines and any malformed
+        entries like "172.17.144.5=65415" with no user/timestamp).
         """
         history_file = self.seat_history_file if entry_type == 'seat' else self.portforward_history_file
         entries = []
@@ -162,26 +170,31 @@ class SeatPortManager:
                     line = line.strip()
                     if not line:
                         continue
-                    # Format: SEAT=PORT|GATEWAY|TS
-                    # For portforward: RACK=PORT|USER|TS → reconstruct as RACK=PORT|USER@RACK|TS
-                    parts = line.split('=')
-                    if len(parts) != 2:
-                        continue
-                    seat = parts[0]
-                    rest = parts[1].split('|')
-                    if len(rest) != 3:
-                        continue
-                    port, gateway, ts = rest
-                    try:
-                        ts_int = int(ts)
-                    except:
+
+                    parts = line.split('|')
+                    if len(parts) != 4:
+                        # Reject anything that isn't exactly 4 pipe-separated
+                        # fields.  This silently drops legacy `=`-prefixed
+                        # entries and malformed lines — no point trying to
+                        # salvage them, they'll be re-written in the new
+                        # format on next connect.
                         continue
 
-                    # For portforward entries, reconstruct gateway as user@hostname
-                    if entry_type == 'portforward':
-                        # gateway field contains user, seat field contains rack hostname
-                        # Reconstruct as user@rack for consistency with UI expectations
+                    if entry_type == 'seat':
+                        seat, port, gateway, ts = parts
+                    else:  # portforward
+                        # RACK|HEAD|USER|TS → we surface it to the UI as
+                        # {seat=rack, port='', gateway=user@rack}
+                        seat, port, gateway, ts = parts
                         gateway = f"{gateway}@{seat}"
+                        port = ''
+
+                    # Timestamp must be a valid integer. Drop the line
+                    # if it's anything else (NaN, empty, junk).
+                    try:
+                        ts_int = int(ts)
+                    except (ValueError, TypeError):
+                        continue
 
                     entries.append({
                         'seat': seat,
@@ -231,28 +244,16 @@ class SeatPortManager:
         return []
 
     def append_history(self, seat, port, gateway, entry_type='seat'):
-        """Append a new entry to the appropriate history file.
-
-        Args:
-            seat: Seat name
-            port: Port number
-            gateway: Gateway host
-            entry_type: 'seat' or 'portforward' to determine which file to write.
+        """Deprecated. History is now owned by the bundled scripts (seat.sh,
+        portforwardRack.sh) which write to ~/.cache/adb-seat-ports and
+        ~/.cache/portforward-racks respectively.  This stub is kept for
+        backwards compatibility with any callers that still reference it.
         """
-        ts = int(time.time())
-        line = f"{seat}={port}|{gateway}|{ts}\n"
-
-        history_file = self.seat_history_file if entry_type == 'seat' else self.portforward_history_file
-
-        try:
-            # Ensure the cache directory exists
-            if not os.path.exists(self.history_dir):
-                os.makedirs(self.history_dir)
-            with open(history_file, 'a') as f:
-                f.write(line)
-        except Exception as e:
-            if self.log_callback:
-                self.log_callback(f"Error writing to {entry_type} history: {e}", "ERROR")
+        if self.log_callback:
+            self.log_callback(
+                "append_history is a no-op: bundled scripts own history now",
+                "WARNING"
+            )
 
     def is_seat_connected(self, seat):
         """Check if a seat is currently connected"""

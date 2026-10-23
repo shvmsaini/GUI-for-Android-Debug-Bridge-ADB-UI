@@ -413,7 +413,15 @@ def write_history_files(seat_entries, portforward_entries, confirm=True):
                         timestamp = int(time.time())
                         port = entry['port'] if entry['port'] else str(int(timestamp) % 10000 + 50000)
                         gateway_full = f"{entry['gateway_user']}@{entry['gateway_host']}"
-                        line = f"{entry['seat']}={port}|{gateway_full}|{timestamp}\n"
+
+                        # Validate: refuse to write malformed entries.
+                        # A line like "seat=|gw|" or "=port|gw|ts" would
+                        # poison load_history's parser — skip it instead.
+                        if not entry['seat'] or not port or not gateway_full or not timestamp:
+                            continue
+
+                        # Canonical format: SEAT|PORT|GATEWAY|TS (no '=' anywhere)
+                        line = f"{entry['seat']}|{port}|{gateway_full}|{timestamp}\n"
                         f.write(line)
 
             print(f"\n✓ Added {len([e for e in seat_entries if e['seat'] not in existing_seats])} new seat entries to {SEAT_HISTORY_FILE}")
@@ -432,7 +440,18 @@ def write_history_files(seat_entries, portforward_entries, confirm=True):
                 for entry in portforward_entries:
                     if entry['rack'] not in existing_racks:
                         timestamp = int(time.time())
-                        line = f"{entry['rack']}={entry.get('headend', '172.17.4.4')}|{entry['user']}|{timestamp}\n"
+                        rack = entry['rack']
+                        headend = entry.get('headend', '172.17.4.4')
+                        user = entry['user']
+
+                        # Validate: every field must be non-empty.
+                        # A line like "172.17.144.5=65415" (no user, no
+                        # timestamp) is worse than missing — drop it.
+                        if not rack or not headend or not user or not timestamp:
+                            continue
+
+                        # Canonical format: RACK|HEAD|USER|TS (no '=' anywhere)
+                        line = f"{rack}|{headend}|{user}|{timestamp}\n"
                         f.write(line)
 
             print(f"\n✓ Added {len([e for e in portforward_entries if e['rack'] not in existing_racks])} new portforward entries to {PORTFORWARD_HISTORY_FILE}")
