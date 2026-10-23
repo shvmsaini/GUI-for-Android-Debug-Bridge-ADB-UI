@@ -96,8 +96,15 @@ class CredentialManager:
             return False
         return False
 
-    def prompt_password(self, parent, gateway, user):
-        """Show password input dialog"""
+    def prompt_password(self, parent, gateway, user, auto_save=False):
+        """Show password input dialog
+
+        Args:
+            parent: Parent widget for the dialog
+            gateway: Gateway hostname
+            user: Username
+            auto_save: If True, automatically save password without asking user
+        """
         from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
 
         password, ok = QInputDialog.getText(
@@ -107,14 +114,17 @@ class CredentialManager:
             QLineEdit.EchoMode.Password
         )
         if ok and password:
-            # Offer to save password
-            reply = QMessageBox.question(
-                parent,
-                "Save Password",
-                "Save password to credential manager?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
+            # Auto-save or offer to save password
+            if auto_save:
                 self.set_password(gateway, user, password)
+            else:
+                reply = QMessageBox.question(
+                    parent,
+                    "Save Password",
+                    "Save password to credential manager?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.set_password(gateway, user, password)
             return password
         return None

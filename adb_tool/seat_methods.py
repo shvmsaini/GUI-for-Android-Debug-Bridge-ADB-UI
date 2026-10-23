@@ -1,14 +1,22 @@
 import os
 import sys
 import subprocess
-from subprocess import TimeoutExpired
+import socket
 import threading
 import time
 import shlex
 import shutil
 import re
 import tempfile
+import uuid
+import fnmatch
 from datetime import datetime
+from subprocess import TimeoutExpired
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None  # _install_adb_key_on_seat logs a friendly error if it's called
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
 from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -24,6 +32,517 @@ from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
 import bundled_scripts
+
+
+# ---------------------------------------------------------------------------
+# SSH helpers for the "Install ADB keys on seat" flow.
+#
+# Single paramiko transport to the gateway, then a `ssh -t mtc@<seat>
+# 'sudo -i'` chain driven by an interactive shell (same approach as
+# pac-seat-connector). The mtc password is fed twice — once for the SSH
+# login, once for the sudo password — so the user only ever types one
+# password (besides the gateway password).
+# ---------------------------------------------------------------------------
+
+_ADB_KEYS_FILE = "/data/misc/adb/adb_keys"
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
+
+
+def _clean(text):
+    return _ANSI_RE.sub("", text or "")
+
+
+class _SeatSshError(Exception):
+    """User-facing error from the install-adbkey SSH flow."""
+
+
+class _SeatAuthError(_SeatSshError):
+    """Raised when SSH or sudo authentication fails. Triggers re-prompt."""
+
+
+def _lookup_ssh_config(host):
+    """Return (user, hostname, port, proxy_command) from ``~/.ssh/config``.
+
+    Only the keys we actually need are parsed: ``User``, ``HostName``,
+    ``Port``, ``ProxyCommand``. Patterns in the ``Host`` directive are
+    matched with ``fnmatch`` (so ``*.vrack`` works). Returns
+    ``(None, None, None, None)`` if no config applies or the file is missing.
+    """
+    path = os.path.expanduser("~/.ssh/config")
+    if not os.path.isfile(path):
+        return (None, None, None, None)
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception:
+        return (None, None, None, None)
+
+    user = host_name = port = proxy_cmd = None
+    matched = False
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, val = parts
+        key = key.lower()
+        if key == "host":
+            patterns = val.split()
+            matched = any(fnmatch.fnmatch(host, p) for p in patterns)
+            continue
+        if not matched:
+            continue
+        if key == "user":
+            user = val
+        elif key == "hostname":
+            host_name = val
+        elif key == "port":
+            try:
+                port = int(val)
+            except ValueError:
+                pass
+        elif key == "proxycommand":
+            proxy_cmd = val
+    return (user, host_name, port, proxy_cmd)
+
+
+def _parse_ssh_host(ssh_host):
+    """Return (user, host, port) from `user@host[:port]`."""
+    user = ""
+    host = ssh_host
+    port = 22
+    if "@" in host:
+        user, host = host.rsplit("@", 1)
+    if ":" in host and host.count(":") == 1:
+        host, p = host.split(":")
+        try:
+            port = int(p)
+        except ValueError:
+            pass
+    if not user:
+        user = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    return user, host, port
+
+
+class _ProxySocket:
+    """Adapter that makes a ``ProxyCommand`` subprocess look like a socket.
+
+    paramiko's ``Transport`` only needs ``recv``, ``send``, ``close``, and a
+    few socket-ish attributes. We wire those to the proxy's stdin/stdout
+    pipes so the SSH protocol runs through the same tunnel ``ssh`` would
+    have used.
+    """
+
+    def __init__(self, proc):
+        self._proc = proc
+        self._in = proc.stdout
+        self._out = proc.stdin
+        self.settimeout = lambda *_a, **_k: None
+        self.gettimeout = lambda *_a, **_k: None
+        self.setblocking = lambda *_a, **_k: None
+        self.family = socket.AF_INET
+        self.type = socket.SOCK_STREAM
+        self.proto = 0
+
+    def recv(self, n):
+        data = self._in.read(n)
+        if not data:
+            return b""
+        return data
+
+    def send(self, data):
+        self._out.write(data)
+        self._out.flush()
+        return len(data)
+
+    def sendall(self, data):
+        self._out.write(data)
+        self._out.flush()
+
+    def close(self):
+        try:
+            self._in.close()
+        except Exception:
+            pass
+        try:
+            self._out.close()
+        except Exception:
+            pass
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+
+    def fileno(self):
+        return self._in.fileno()
+
+
+class _SeatJumpHost:
+    """One SSH connection to the jump host (e.g. user@gateway).
+
+    Honours ``~/.ssh/config`` for ``ProxyCommand`` (and ``User``/``Port``
+    overrides) so hosts that only reach the network through an HTTPS tunnel
+    (e.g. ``ProxyCommand openssl s_client ...`` for ``*.vrack``) work the
+    same way they do from the ``ssh`` CLI.
+    """
+
+    def __init__(self, ssh_host, password, log):
+        if paramiko is None:
+            raise _SeatSshError(
+                "paramiko is not installed. Run `pip install paramiko` to "
+                "enable the 'Install ADB keys on seat' flow."
+            )
+        user, host, port = _parse_ssh_host(ssh_host)
+
+        # Merge in ~/.ssh/config for this host (User/Port/ProxyCommand).
+        cfg_user, cfg_host, cfg_port, proxy_cmd = _lookup_ssh_config(host)
+        if cfg_user and not user:
+            user = cfg_user
+        if cfg_host:
+            host = cfg_host
+        if cfg_port and port == 22:
+            port = cfg_port
+
+        log(f"SSH: connecting to {user}@{host}:{port}"
+            + (" via ProxyCommand" if proxy_cmd else "") + "...")
+
+        sock = None
+        proxy_proc = None
+        try:
+            if proxy_cmd:
+                cmd = proxy_cmd
+                cmd = cmd.replace("%h", host)
+                cmd = cmd.replace("%p", str(port))
+                cmd = cmd.replace("%r", user or "")
+                proxy_proc = subprocess.Popen(
+                    shlex.split(cmd),
+                    stdout=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                sock = _ProxySocket(proxy_proc)
+            else:
+                try:
+                    sock = socket.create_connection((host, port), timeout=10)
+                except OSError as e:
+                    raise _SeatSshError(
+                        f"Cannot reach {host}:{port} ({e}). "
+                        "Are you on the VPN/network?"
+                    )
+
+            self.t = paramiko.Transport(sock)
+            self.t.banner_timeout = 15
+            self.t.start_client(timeout=15)
+            self.t.auth_timeout = 20
+            try:
+                self._auth(user, password, log)
+            except Exception:
+                try:
+                    self.t.close()
+                except Exception:
+                    pass
+                raise
+            self.t.set_keepalive(20)
+            self._proxy_proc = proxy_proc
+            log(f"SSH: connected to {user}@{host}")
+        except _SeatSshError:
+            if proxy_proc:
+                try:
+                    proxy_proc.kill()
+                except Exception:
+                    pass
+            raise
+        except Exception as e:
+            if proxy_proc:
+                try:
+                    proxy_proc.kill()
+                except Exception:
+                    pass
+            raise _SeatSshError(f"SSH connection failed: {e}")
+
+    def _auth(self, user, password, log):
+        if not password:
+            raise _SeatSshError("SSH password is required.")
+        # Try password first, then keyboard-interactive (some jump hosts
+        # only accept the latter even when they advertise password).
+        try:
+            self.t.auth_password(user, password)
+            return
+        except paramiko.BadAuthenticationType as e:
+            if "keyboard-interactive" in e.allowed_types:
+                try:
+                    self.t.auth_interactive(
+                        user,
+                        lambda _t, _i, prompts: [password] * len(prompts),
+                    )
+                    return
+                except paramiko.AuthenticationException:
+                    pass
+        except paramiko.AuthenticationException:
+            try:
+                self.t.auth_interactive(
+                    user,
+                    lambda _t, _i, prompts: [password] * len(prompts),
+                )
+                return
+            except Exception:
+                pass
+        raise _SeatSshError(
+            "SSH authentication failed. Check user@host and password."
+        )
+
+    @property
+    def active(self):
+        return self.t.is_active()
+
+    def shell(self):
+        ch = self.t.open_session(timeout=15)
+        ch.get_pty(width=200, height=50)
+        ch.invoke_shell()
+        return _SeatShell(ch)
+
+    def close(self):
+        t = getattr(self, "t", None)
+        if t is not None:
+            try:
+                t.close()
+            except Exception:
+                pass
+        proxy = getattr(self, "_proxy_proc", None)
+        if proxy:
+            try:
+                proxy.kill()
+            except Exception:
+                pass
+
+
+class _SeatShell:
+    """Interactive shell driven by unique end-markers."""
+
+    def __init__(self, chan):
+        self.chan = chan
+        self.buf = ""
+
+    def _pull(self):
+        if self.chan.recv_ready():
+            self.buf += self.chan.recv(65536).decode("utf-8", "replace")
+            return True
+        return False
+
+    def drain(self, quiet=1.0, maxwait=10.0):
+        end = time.time() + maxwait
+        last = time.time()
+        while time.time() < end:
+            if self._pull():
+                last = time.time()
+            elif time.time() - last >= quiet:
+                break
+            else:
+                time.sleep(0.05)
+        return _clean(self.buf)
+
+    def wait_for(self, regex, timeout):
+        pat = re.compile(regex)
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._pull():
+                m = pat.search(self.buf)
+                if m:
+                    return m
+            else:
+                time.sleep(0.05)
+        return None
+
+    def run(self, command, timeout=15):
+        """Run one command. Returns (output, exit_code). Raises on timeout."""
+        tag = uuid.uuid4().hex[:8]
+        self.buf = ""
+        self.chan.send(f'{command}\necho __ADB_GUI_{tag}_"$?"__\n')
+        m = self.wait_for(rf"__ADB_GUI_{tag}_(\d+)__", timeout)
+        if not m:
+            tail = _clean(self.buf)[-200:].strip()
+            raise _SeatSshError(
+                f"Timed out waiting for: {command.split()[0]!r} "
+                f"(output tail: {tail})"
+            )
+        out = _clean(self.buf[: m.start()])
+        return out, int(m.group(1))
+
+    def send_line(self, line):
+        self.chan.send(line)
+
+    def close(self):
+        try:
+            self.chan.close()
+        except Exception:
+            pass
+
+
+def _clean_adb_key_line(raw_lines):
+    """Return the first non-comment, non-empty, whitespace-collapsed line."""
+    for raw in raw_lines.splitlines():
+        raw = raw.strip()
+        if raw and not raw.startswith("#"):
+            return " ".join(raw.split())
+    return ""
+
+
+def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
+    """From the jump host, run `ssh -t mtc@<seat> 'sudo -i'` and return the
+    resulting root shell.
+
+    The mtc password is fed twice:
+      1. SSH to mtc@<seat> (login)
+      2. sudo prompt (when sudo reads its password from the remote tty)
+
+    Raises ``_SeatSshError`` if any step fails.
+    """
+    sh = None
+    try:
+        sh = jump.shell()
+        sh.drain(quiet=1.0, maxwait=8)
+
+        # Build the SSH-to-seat command. -t forces a tty allocation so sudo
+        # reads its password from the remote tty (which is the only place our
+        # shell can write to).
+        #
+        # Use `sudo -i` to land in root's login shell so the append-key
+        # # command runs as root without further prompts.
+        ssh_seat_cmd = (
+            f"ssh -o StrictHostKeyChecking=accept-new "
+            f"-o UserKnownHostsFile=/dev/null "
+            f"-tt mtc@{seat} 'sudo -i'"
+        )
+        log(f"SEAT: {ssh_seat_cmd}")
+        sh.buf = ""
+        sh.send_line(ssh_seat_cmd + "\n")
+
+        # First password prompt: SSH login for mtc@<seat>.
+        if not sh.wait_for(r"(?i)password[^\n]*:", 15):
+            tail = _clean(sh.buf)[-200:].strip()
+            raise _SeatSshError(
+                f"Did not get an SSH password prompt from mtc@{seat}. "
+                f"Last output: {tail}"
+            )
+        log(f"SEAT: sending mtc password for SSH login ({len(mtc_password)} chars)")
+        time.sleep(0.2)
+        sh.buf = ""
+        sh.send_line(mtc_password + "\n")
+
+        # Wait for either a second password prompt (sudo on the seat) OR
+        # an auth failure ("Permission denied") from the inner ssh.
+        end_at = time.time() + 12
+        outcome = None  # 'sudo' | 'auth_fail'
+        while time.time() < end_at and outcome is None:
+            sh._pull()
+            low = sh.buf.lower()
+            if "permission denied" in low:
+                outcome = 'auth_fail'
+            elif re.search(r"(?i)password[^\n]*:", sh.buf):
+                outcome = 'sudo'
+            else:
+                time.sleep(0.1)
+
+        if outcome == 'auth_fail':
+            raise _SeatAuthError(
+                f"mtc@{seat} rejected the SSH password."
+            )
+
+        if outcome is None:
+            # No second prompt and no auth failure — either NOPASSWD sudo
+            # or the shell never came back. Let sudo-password branch decide.
+            log("SEAT: no second password prompt — assuming NOPASSWD sudo", "DEBUG")
+        else:
+            log("SEAT: sending mtc password for sudo")
+            time.sleep(0.2)
+            sh.buf = ""
+            sh.send_line(mtc_password + "\n")
+            if sh.wait_for(
+                r"(?i)try again|incorrect password|authentication fail|"
+                r"not in the sudoers|may not run sudo",
+                3,
+            ):
+                raise _SeatAuthError(
+                    "sudo rejected the password on this seat. The seat's sudo "
+                    "password must match the mtc password."
+                )
+
+        time.sleep(0.5)
+
+        # Verify we are actually root on the seat.
+        out, _ = sh.run("id -u", timeout=10)
+        if not re.search(r"^\s*0\s*$", out, re.M):
+            raise _SeatSshError(
+                f"sudo -i did not land in root (id -u output: {out.strip()!r}). "
+                "Check the mtc password."
+            )
+
+        # Sanity check: confirm /data/misc/adb exists — if not, we may have
+        # landed on the jump host, not the seat.
+        _, on_seat = sh.run("test -d /data/misc/adb", timeout=10)
+        if on_seat != 0:
+            raise _SeatSshError(
+                f"This does not look like a seat shell (no /data/misc/adb), "
+                f"so nothing was written. Is `{seat}` correct?"
+            )
+        log("SEAT: root on seat")
+        return sh
+    except Exception:
+        if sh:
+            try:
+                sh.close()
+            except Exception:
+                pass
+        raise
+
+
+def _push_adb_key(sh, adb_keys, log):
+    """Append the user's adb public key to /data/misc/adb/adb_keys.
+
+    Dedups by the leading token of the key (the base64 blob) so re-running
+    is idempotent. Preserves any other entries already on the device.
+    """
+    line = _clean_adb_key_line(adb_keys)
+    if not line:
+        raise _SeatSshError("adb key is empty")
+    token = line.split()[0]
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", token) or not re.fullmatch(
+        r"[A-Za-z0-9+/=@._:\- ]+", line
+    ):
+        raise _SeatSshError(
+            "adb key contains unexpected characters — paste the contents of "
+            "~/.android/adbkey.pub."
+        )
+
+    f = _ADB_KEYS_FILE
+
+    # Dedup check: `grep -qF` exits 0 if found. The token check is loose —
+    # different hosts' keys share the same key type but differ in the base64
+    # blob. Comparing the full line is the only reliable dedup.
+    _, code = sh.run(f"grep -qF '{line}' {f} 2>/dev/null", timeout=15)
+    if code == 0:
+        log("KEYS: key already on seat — skipping", "INFO")
+        return
+    log("KEYS: key not on seat, appending...", "INFO")
+
+    # Make sure the file ends with a newline so the new key isn't glued to
+    # the previous one.
+    sh.run(
+        f'[ -s {f} ] && [ "$(tail -c1 {f} | wc -l)" -eq 0 ] && echo >> {f}',
+        timeout=15,
+    )
+    _, code = sh.run(f"echo '{line}' >> {f}", timeout=15)
+    if code != 0:
+        raise _SeatSshError(f"Could not write the key to {f}")
+    sh.run(f"chmod 644 {f}", timeout=15)
+
+    # Verify by reading it back.
+    _, code = sh.run(f"grep -qF '{line}' {f}", timeout=15)
+    if code != 0:
+        raise _SeatSshError(f"Could not verify the key in {f}")
+    log("KEYS: key written and verified", "INFO")
 
 
 class SeatMixin:
@@ -580,8 +1099,8 @@ class SeatMixin:
         else:
             # Connect — fire `seat.sh auto-connect` internally without any
             # prompt dialog. Password must already be in Keychain for this
-            # gateway; if not, log a clear error and bail rather than
-            # blocking the GUI thread with a popup.
+            # gateway; if not, prompt and save it so subsequent connections
+            # to the same gateway don't ask again.
             gateway_norm = entry['gateway'].strip()
             if '@' not in gateway_norm:
                 gateway_norm = f'user@{gateway_norm}'
@@ -590,16 +1109,17 @@ class SeatMixin:
             gateway_host = parts[1] if len(parts) == 2 else gateway_norm
             password = self.credential_manager.get_password(gateway_host, user)
             if not password:
-                self.log(
-                    f"No password stored for {user}@{gateway_host} — "
-                    f"set it in Settings → Security first",
-                    "ERROR",
+                # Prompt and automatically save since all gateway passwords are the same
+                password = self.credential_manager.prompt_password(
+                    self, gateway_host, user,
+                    auto_save=True  # Auto-save since all gateways share password
                 )
-                self.update_status(f"No password for {gateway_host}")
-                return
+                if not password:
+                    self.log("Password required to connect", "ERROR")
+                    return
             self.connect_seat(
                 entry['seat'], entry['gateway'],
-                device_password=password, mtc_password=password, root_password=password,
+                device_password=password, mtc_password=password,
             )
 
     def _on_portforward_clicked(self, entry):
@@ -653,7 +1173,7 @@ class SeatMixin:
             self.log(f"Error checking port forward status: {e}", "ERROR")
 
     def connect_seat(self, seat, gateway, install_adb_key=False, adb_key=None,
-                  device_password=None, mtc_password=None, root_password=None):
+                  device_password=None, mtc_password=None):
         """Connect to a seat"""
         self.log(f"Connecting to seat {seat} via {gateway}...")
         self.update_status(f"Connecting to {seat}...")
@@ -662,7 +1182,6 @@ class SeatMixin:
         self._pending_adb_key = adb_key if install_adb_key else None
         self._pending_device_password = device_password
         self._pending_mtc_password = mtc_password
-        self._pending_root_password = root_password
 
         # Normalize gateway to ensure user@ prefix (fixes plain hostname inputs)
         gateway = gateway.strip()
@@ -676,8 +1195,9 @@ class SeatMixin:
         gateway_host = parts[1] if len(parts) == 2 else gateway
 
         # Get password from Keychain only (no plain text storage)
+        # Only prompt if no password is stored and we weren't passed one already
         password = self.credential_manager.get_password(gateway_host, user)
-        if not password:
+        if not password and not any([device_password, mtc_password]):
             password = self.credential_manager.prompt_password(self, gateway_host, user)
             if not password:
                 self.log("Password required to connect", "ERROR")
@@ -810,32 +1330,32 @@ class SeatMixin:
                 succeeded = (returncode == 0)
                 if succeeded:
                     self.seat_port_manager.mark_seat_connected(seat, gateway)
-                    # Install ADB key if requested
-                    adb_key = getattr(self, '_pending_adb_key', None)
-                    device_password = getattr(self, '_pending_device_password', None)
-                    mtc_password = getattr(self, '_pending_mtc_password', None)
-                    root_password = getattr(self, '_pending_root_password', None)
-                    if adb_key and device_password and root_password:
-                        # Wait for the seat port forward (5555) to become available
-                        # so adb devices shows the device IP
-                        time.sleep(2)
-                        threading.Thread(target=self._install_adb_key_on_seat,
-                                       args=(seat, gateway, adb_key, device_password,
-                                             mtc_password, root_password),
-                                       daemon=True).start()
-                        self.log("ADB key installation thread started", "INFO")
-                    else:
-                        self.log("Not installing ADB key (missing credentials or flag)", "INFO")
-
-                    # History is owned by seat.sh — it calls savePort inside
-                    # auto-connect and persists the mapping to ~/.cache/adb-seat-ports.
-                    # We just read it back via get_top_entries on refresh.
-                    # Pull the actual adb port from stdout for the seat-panel label.
+                    # Pull the actual adb port from stdout for the seat-panel
+                    # label and for the install-adbkey reconnect step below.
                     _port_match = re.search(
                         r"(?:Assigned new port|Reusing port)\s+(\d+)",
                         stdout or '',
                     )
                     actual_port = _port_match.group(1) if _port_match else '5555'
+                    self._pending_seat_port = actual_port
+
+                    # Install ADB key if requested. Only needs gateway + mtc
+                    # passwords (mtc is reused for SSH login and sudo on the seat).
+                    adb_key = getattr(self, '_pending_adb_key', None)
+                    device_password = getattr(self, '_pending_device_password', None)
+                    mtc_password = getattr(self, '_pending_mtc_password', None)
+                    if adb_key and device_password and mtc_password:
+                        # Wait for the seat port forward (5555) to become available
+                        # so adb devices shows the device IP
+                        time.sleep(2)
+                        threading.Thread(target=self._install_adb_key_on_seat,
+                                       args=(seat, gateway, adb_key,
+                                             device_password, mtc_password),
+                                       daemon=True).start()
+                        self.log("ADB key installation thread started", "INFO")
+                    else:
+                        self.log("Not installing ADB key (missing credentials or flag)", "INFO")
+
                     if _port_match:
                         self.log(f"Seat connected on port {actual_port}", "INFO")
                     else:
@@ -900,7 +1420,7 @@ class SeatMixin:
                                             install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                             adb_key=getattr(self, '_pending_adb_key', None),
                                             device_password=getattr(self, '_pending_device_password', None),
-                                            root_password=getattr(self, '_pending_root_password', None))
+                                            mtc_password=getattr(self, '_pending_mtc_password', None))
                     QTimer.singleShot(0, show_error)
             except TimeoutExpired as te:
                 # Command timed out - show specific message and disconnect
@@ -934,7 +1454,7 @@ class SeatMixin:
                                         install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                         adb_key=getattr(self, '_pending_adb_key', None),
                                         device_password=getattr(self, '_pending_device_password', None),
-                                        root_password=getattr(self, '_pending_root_password', None))
+                                        mtc_password=getattr(self, '_pending_mtc_password', None))
                 QTimer.singleShot(0, show_timeout_error)
             except Exception as e:
                 self.log(f"Error connecting to seat: {str(e)}", "ERROR")
@@ -965,10 +1485,148 @@ class SeatMixin:
                                         install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                         adb_key=getattr(self, '_pending_adb_key', None),
                                         device_password=getattr(self, '_pending_device_password', None),
-                                        root_password=getattr(self, '_pending_root_password', None))
+                                        mtc_password=getattr(self, '_pending_mtc_password', None))
                 QTimer.singleShot(0, show_error)
 
         threading.Thread(target=do_connect, daemon=True).start()
+
+    def _install_adb_key_on_seat(self, seat, gateway, adb_key,
+                                 gateway_password, mtc_password):
+        """Install the user's ADB public key on the seat.
+
+        Flow (per the user's preference — single mtc password covers both
+        SSH login and sudo on the seat):
+
+          1. Open a paramiko SSH connection to the gateway (using the gateway
+             password). Honours ``~/.ssh/config`` for ``ProxyCommand``
+             (``*.vrack`` HTTPS tunnels).
+          2. Open an interactive PTY shell on the gateway, then run
+             ``ssh -t mtc@<seat> 'sudo -i'``.
+          3. Feed the mtc password for SSH login, then again for the sudo
+             prompt on the seat.
+          4. Verify we're root on the seat (``id -u`` = 0 and
+             ``/data/misc/adb`` exists).
+          5. Dedup-check, then append ``adb_key`` to
+             ``/data/misc/adb/adb_keys`` and verify by reading it back.
+
+        Replaces the old ``seat.sh setup-adbkey`` bash approach, which couldn't
+        reliably ferry the key into a `sudo -S su -c '...'` block (stdin was
+        consumed by sudo) and surfaced openssl cert warnings from the user's
+        ``~/.ssh/config`` ProxyCommand as connection errors.
+        """
+        if paramiko is None:
+            self.log(
+                "paramiko is not installed. Run `pip install paramiko` to "
+                "enable 'Install ADB keys on seat'.",
+                "ERROR",
+            )
+            return
+
+        if not mtc_password:
+            self.log("No mtc password available — cannot install ADB key.", "ERROR")
+            return
+
+        self.log(f"Installing ADB key on seat {seat} via {gateway}...", "INFO")
+
+        # The seat's adb port is parsed in connect_seat and stored on self so
+        # the install worker can find the right device to reconnect at the end.
+        seat_port = getattr(self, '_pending_seat_port', None) or '5555'
+        seat_dev = f"localhost:{seat_port}"
+
+        def do_install():
+            jump = None
+            sh = None
+            try:
+                jump = _SeatJumpHost(gateway, gateway_password, log=self.log)
+                sh = _seat_root_shell_via_mtc(jump, seat, mtc_password, log=self.log)
+                _push_adb_key(sh, adb_key, log=self.log)
+                self.log(f"ADB key installed on seat {seat}", "INFO")
+                # After appending the key, force adb to re-handshake with the
+                # seat so the device flips back to `device` (was likely showing
+                # yellow 🟡 until it re-authorizes with the freshly-appended key).
+                # adbd reads /data/misc/adb/adb_keys at startup, so a running
+                # adbd won't notice the new key until we disconnect + reconnect.
+                QTimer.singleShot(
+                    0,
+                    lambda: self._reconnect_seat_device_after_install(seat_dev),
+                )
+            except _SeatAuthError as e:
+                # Wrong mtc password (cached or freshly typed). Re-prompt on
+                # the GUI thread, update the cache, and retry once.
+                self.log(f"Failed to install ADB key: {e}", "ERROR")
+                self.log("Cached mtc password may be wrong — prompting again.", "INFO")
+                QTimer.singleShot(
+                    0,
+                    lambda: self._retry_install_adb_key_with_new_mtc_password(
+                        seat, gateway, adb_key, gateway_password, seat_dev
+                    ),
+                )
+            except _SeatSshError as e:
+                self.log(f"Failed to install ADB key: {e}", "ERROR")
+            except Exception as e:
+                self.log(f"Error installing ADB key: {type(e).__name__}: {e}",
+                         "ERROR")
+            finally:
+                if sh:
+                    try:
+                        sh.send_line("exit\n")
+                        time.sleep(0.2)
+                        sh.send_line("exit\n")
+                    except Exception:
+                        pass
+                    try:
+                        sh.close()
+                    except Exception:
+                        pass
+                if jump:
+                    try:
+                        jump.close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=do_install, daemon=True).start()
+
+    def _reconnect_seat_device_after_install(self, seat_dev):
+        """Force adb to re-handshake the seat device so the freshly-appended
+        ADB key takes effect. Schedules refresh_devices() once complete.
+        Must be called on the GUI thread.
+        """
+        self.log(f"Reconnecting {seat_dev} to pick up new ADB key...", "INFO")
+
+        def do_reconnect():
+            try:
+                self.adb.run_command(f"disconnect {seat_dev}")
+                time.sleep(0.3)
+                self.adb.run_command(f"connect {seat_dev}")
+            except Exception as e:
+                self.log(f"Reconnect {seat_dev} failed: {e}", "WARNING")
+            QTimer.singleShot(500, self.refresh_devices)
+
+        threading.Thread(target=do_reconnect, daemon=True).start()
+
+    def _retry_install_adb_key_with_new_mtc_password(self, seat, gateway, adb_key,
+                                                     gateway_password, seat_dev):
+        """GUI-thread handler: re-prompt for the mtc password (the cached one
+        was wrong), update the cache, then re-spawn the install worker.
+        """
+        mtc_key = "mtc@adb-gui-ui"
+        new_mtc, ok = QInputDialog.getText(
+            self, "Wrong MTC Password",
+            f"The cached mtc password was rejected by {seat}.\n\n"
+            "Enter the correct mtc password:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not new_mtc:
+            self.log("MTC password prompt cancelled — install aborted.", "ERROR")
+            return
+        # Update the cache so future installs use the new password without
+        # prompting. (The user said mtc is the same everywhere, so a fresh
+        # install on any other seat will pick this up automatically.)
+        self.credential_manager.set_password(mtc_key, "mtc", new_mtc)
+        self.log("Cached mtc password updated. Retrying install...", "INFO")
+        self._install_adb_key_on_seat(
+            seat, gateway, adb_key, gateway_password, new_mtc,
+        )
 
     def disconnect_seat(self, seat):
         """Disconnect from a seat"""
@@ -1021,9 +1679,12 @@ class SeatMixin:
 
         # Get password from Keychain only (no plain text storage)
         # Keychain is keyed by the hostname and user, constructed as user@hostname
+        # Since all gateway passwords are the same, prompt if not cached
         password = self.credential_manager.get_password(gateway_host, user)
         if not password:
-            password = self.credential_manager.prompt_password(self, gateway_host, user)
+            password = self.credential_manager.prompt_password(
+                self, gateway_host, user, auto_save=True
+            )
             if not password:
                 self.log("Password required to connect", "ERROR")
                 return
@@ -1251,45 +1912,55 @@ class SeatMixin:
             install_adb_key = adb_key_cb.isChecked()
             adb_key = adb_key_edit.text().strip() if install_adb_key else None
 
-            # Ask for the gateway SSH password (for SSH to user@<gateway>)
-            gateway_password, ok = QInputDialog.getText(
-                dialog, "Gateway Password",
-                f"Enter SSH password for {gateway}:",
-                QLineEdit.EchoMode.Password
-            )
-            if not ok or not gateway_password:
-                return
+            # Resolve gateway user/host so we can look up a cached password.
+            gw_parts = gateway.split('@') if '@' in gateway else ('user', gateway)
+            gw_user = gw_parts[0]
+            gw_host = gw_parts[1] if len(gw_parts) > 1 else gw_parts[0]
+
+            # Gateway SSH password — only ask if not already cached. We save
+            # it after first prompt so subsequent connects to the same (or any
+            # other) gateway don't ask again; all gateways share the same
+            # password per the user's preference.
+            gateway_password = self.credential_manager.get_password(gw_host, gw_user)
+            if not gateway_password:
+                gateway_password, ok = QInputDialog.getText(
+                    dialog, "Gateway Password",
+                    f"Enter SSH password for {gateway}:",
+                    QLineEdit.EchoMode.Password
+                )
+                if not ok or not gateway_password:
+                    return
+                self.credential_manager.set_password(gw_host, gw_user, gateway_password)
 
             mtc_password = None
-            root_password = None
             if install_adb_key:
-                # Ask for the mtc user's SSH password on the seat
-                # (only used when bct is NOT available on the gateway).
-                mtc_password, ok = QInputDialog.getText(
-                    dialog, "MTC Password",
-                    f"Enter SSH password for mtc@{seat_name}:",
-                    QLineEdit.EchoMode.Password
-                )
-                if not ok or not mtc_password:
-                    return
+                # Single mtc password covers both the SSH login to the seat
+                # and the sudo prompt on the seat (the user's flow: ssh to
+                # gateway, then `ssh -t mtc@<seat> 'sudo -i'` using the same
+                # password twice). The mtc password is the same across ALL
+                # seats and gateways, so we cache it under one canonical key
+                # and only re-prompt if the install fails with auth error.
+                mtc_key = "mtc@adb-gui-ui"
+                mtc_password = self.credential_manager.get_password(mtc_key, "mtc")
+                if not mtc_password:
+                    mtc_password, ok = QInputDialog.getText(
+                        dialog, "MTC Password",
+                        "Enter mtc password "
+                        "(used for SSH login and sudo on the seat):",
+                        QLineEdit.EchoMode.Password
+                    )
+                    if not ok or not mtc_password:
+                        return
+                    # Save so future installs don't ask again — the user
+                    # said the mtc password is the same everywhere.
+                    self.credential_manager.set_password(mtc_key, "mtc", mtc_password)
 
-                # Ask for the sudo su - password on the seat
-                root_password, ok = QInputDialog.getText(
-                    dialog, "Sudo Password",
-                    "Enter sudo su - password for the seat (mtc user):",
-                    QLineEdit.EchoMode.Password
-                )
-                if not ok or not root_password:
-                    return
-
-            # Use the existing connect_seat method (pass adb_key as extra arg).
-            # Note: connect_seat's "device_password" parameter is the gateway
-            # SSH password (used by sshpass for the gateway auth). The mtc
-            # SSH password is the seat's mtc-user login password.
+            # Use the existing connect_seat method. device_password is the
+            # gateway SSH password; mtc_password covers both the seat's SSH
+            # login and the sudo prompt on the seat.
             self.connect_seat(seat_name, gateway, install_adb_key=install_adb_key,
                             adb_key=adb_key, device_password=gateway_password,
-                            mtc_password=mtc_password,
-                            root_password=root_password)
+                            mtc_password=mtc_password)
             dialog.accept()
 
         connect_btn.clicked.connect(on_connect)
@@ -1356,6 +2027,23 @@ class SeatMixin:
 
             # Gateway format: user@rack
             gateway = f"{user}@{rack}"
+
+            # Auto-set the password in credential manager for this gateway
+            # Since gateway passwords are the same, we prompt if not already cached
+            rack_host = rack.split('@')[-1]  # Get just the hostname part
+            password = self.credential_manager.get_password(rack_host, user)
+            if not password:
+                # Prompt and auto-save
+                password, ok = QInputDialog.getText(
+                    dialog,
+                    "Password Required",
+                    f"Enter password for {user}@{rack}:",
+                    QLineEdit.EchoMode.Password
+                )
+                if not ok or not password:
+                    return
+                # Set in credential manager
+                self.credential_manager.set_password(rack_host, user, password)
 
             # Use the existing connect_portforward method
             self.connect_portforward(gateway, partition, user)
