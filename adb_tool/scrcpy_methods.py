@@ -364,6 +364,7 @@ class ScrcpyMixin:
                     screenshot_path=self.settings.get('screenshot_path', ''),
                     seat_info=seat_context,
                     on_fallback_native=lambda did: self.scrcpy_device(device_id=did),
+                    log_callback=self.log,
                 )
                 win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
                 win.show()

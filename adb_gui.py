@@ -92,6 +92,10 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         if DEBUG_MODE:
             title = f"🔧 DEBUG MODE: {title}"
         self.setWindowTitle(title)
+        # Enable DEBUG-level logs in the GUI log panel when running in
+        # DEBUG_MODE. By default DEBUG is suppressed to keep the panel
+        # focused on success/error signal (see logging_methods.log()).
+        self._debug_logging = DEBUG_MODE
         self.setGeometry(100, 100, 1800, 1000)
         self.setMinimumSize(1450, 800)
 

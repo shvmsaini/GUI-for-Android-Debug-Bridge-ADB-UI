@@ -34,7 +34,12 @@ class LoggingMixin:
     """Mixin class providing logging and logcat functionality."""
 
     def log(self, message, level="INFO"):
-        """Add message to output"""
+        """Add message to output. DEBUG-level messages are suppressed
+        unless ``self._debug_logging`` is True — set it from a flag/setting
+        to see the verbose flow without re-introducing log spam by default.
+        """
+        if level == "DEBUG" and not getattr(self, "_debug_logging", False):
+            return
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.output_text.append(f"[{timestamp}] [{level}] {message}")
         # Auto-scroll to bottom

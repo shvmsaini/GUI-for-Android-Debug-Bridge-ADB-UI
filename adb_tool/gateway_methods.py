@@ -150,7 +150,7 @@ class GatewayMixin:
             sock = None
             proxy_cmd = self._lookup_ssh_proxy_command(host)
             if proxy_cmd:
-                self.log(f"Gateway Manager: using ProxyCommand for {host}: {proxy_cmd[:80]}…", "INFO")
+                self.log(f"Gateway Manager: using ProxyCommand for {host}", "DEBUG")
                 sock = paramiko.ProxyCommand(proxy_cmd)
 
             client.connect(
@@ -263,7 +263,7 @@ class GatewayMixin:
         seat_sh = self.seat_port_manager.get_devices_from_seat_sh() or []
         current_adb_devices = self.adb.get_devices(silent=True) or []
         current_device = getattr(self, 'current_device', None)
-        self.log(f"Gateway: picking gateway; current_device={current_device}, adb devices={current_adb_devices}", "INFO")
+        self.log(f"Gateway: picking gateway; current_device={current_device}", "DEBUG")
         def find_default():
             best_idx = 0
             # Candidate list: gateways by seat name
@@ -283,17 +283,17 @@ class GatewayMixin:
                 for seat, device in seat_to_device.items():
                     if device == current_device and seat in seat_to_gateway:
                         reason = f"matched current_device={current_device} to seat {seat} → gateway {seat_to_gateway[seat][1]}"
-                        self.log(f"Gateway: selected index={seat_to_gateway[seat][0]} because {reason}", "INFO")
+                        self.log(f"Gateway: selected index={seat_to_gateway[seat][0]} because {reason}", "DEBUG")
                         return seat_to_gateway[seat][0]
             # Rule 2: if any seat's device is currently online, pick first such gateway.
             for seat, device in seat_to_device.items():
                 if device and device in current_adb_devices and seat in seat_to_gateway:
-                    self.log(f"Gateway: selected first online idx={seat_to_gateway[seat][0]} (seat {seat} device {device})", "INFO")
+                    self.log(f"Gateway: selected first online idx={seat_to_gateway[seat][0]} (seat {seat} device {device})", "DEBUG")
                     return seat_to_gateway[seat][0]
             # Rule 3: pick first gateway.
             return 0
         default_index = find_default()
-        self.log(f"Gateway: gateway picker will default to index={default_index} label={labels[default_index] if default_index < len(labels) else 'N/A'}", "INFO")
+        self.log(f"Gateway: gateway picker will default to index={default_index} label={labels[default_index] if default_index < len(labels) else 'N/A'}", "DEBUG")
         label, ok = QInputDialog.getItem(
             self,
             "Select Gateway",
@@ -321,12 +321,12 @@ class GatewayMixin:
 
         def do_connect():
             import time
-            self.log(f"Gateway Manager: starting SSH handshake to {user}@{host}…", "INFO")
+            self.log(f"Gateway Manager: starting SSH handshake to {user}@{host}…", "DEBUG")
             try:
                 t0 = time.time()
                 client, sftp_or_err = self._ssh_connect(host, user, password)
                 took = int((time.time() - t0) * 1000)
-                self.log(f"Gateway Manager: _ssh_connect returned after {took}ms", "INFO")
+                self.log(f"Gateway Manager: _ssh_connect returned after {took}ms", "DEBUG")
             except Exception as e:
                 # Defensive: _ssh_connect already swallows its own exceptions, but
                 # belt-and-braces so a crash here can never silently swallow the
@@ -369,11 +369,11 @@ class GatewayMixin:
             # Hand the connection over to the explorer on the GUI thread.
             # Keep args on self so the closure can't be GC'd before the timer fires.
             self._pending_gateway_explorer_args = (host, user, client, sftp_or_err)
-            self.log(f"Gateway Manager: posting _show_gateway_explorer to GUI thread", "INFO")
+            self.log(f"Gateway Manager: posting _show_gateway_explorer to GUI thread", "DEBUG")
             # Use a bound method, not a lambda. QTimer.singleShot from a
             # background thread is more reliable with a method reference.
             QTimer.singleShot(0, self._open_gateway_explorer_from_pending)
-            self.log(f"Gateway Manager: posted", "INFO")
+            self.log(f"Gateway Manager: posted", "DEBUG")
 
         threading.Thread(target=do_connect, daemon=True).start()
 
@@ -850,7 +850,7 @@ class GatewayMixin:
                 failed = 0
                 for rp, is_dir in targets:
                     try:
-                        self._sftp_remove(sftp, rp, is_dir)
+                        _sftp_remove(sftp, rp, is_dir)
                         ok += 1
                     except Exception as e:
                         failed += 1
@@ -919,7 +919,7 @@ class GatewayMixin:
                 remote_path = '/' + remote_path
             self.log(f"Gateway: copying {raw_name} to seat device…", "INFO")
             self.update_status("Copy to Seat…")
-            self.log(f"Gateway: current_device={getattr(self, 'current_device', None)}", "INFO")
+            self.log(f"Gateway: current_device={getattr(self, 'current_device', None)}", "DEBUG")
             def do_copy():
                 with tempfile.TemporaryDirectory() as tmpdir:
                     ok, err = _sftp_download_to_seat(remote_path, tmpdir)
@@ -1134,14 +1134,11 @@ class GatewayMixin:
         explorer.finished.connect(on_close)
 
         try:
-            self.log(f"Gateway Manager: before refresh_listing for {user}@{host}", "INFO")
             refresh_listing()
-            self.log(f"Gateway Manager: before explorer.show() for {user}@{host}", "INFO")
             explorer.show()
             self.log(f"Gateway Manager: explorer window opened for {user}@{host}", "INFO")
         except Exception as e:
             self.log(f"Gateway Manager: failed to open explorer window: {e}", "ERROR")
-            self.log("Gateway Manager: traceback follows", "ERROR")
             import traceback
             for line in traceback.format_exc().splitlines():
                 self.log(f"  {line}", "ERROR")

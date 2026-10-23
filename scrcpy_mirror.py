@@ -576,7 +576,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def __init__(self, device_id, adb_path=None, bitrate=3_000_000,
                  max_size=1024, max_fps=60, screenshot_path=None, parent=None,
-                 seat_info=None, on_fallback_native=None):
+                 seat_info=None, on_fallback_native=None, log_callback=None):
         super().__init__(parent)
         self.device_id = device_id
         self.adb_path = adb_path
@@ -591,6 +591,13 @@ class ScrcpyMirrorWindow(QMainWindow):
         self._watchdog_timer = None   # QTimer that checks for stalled connections
         self._first_frame_received = False  # Latch set by _on_frame so the watchdog knows when to stop
         self.seat_info = seat_info
+        # Optional callback for routing internal logs to the GUI log panel.
+        # Signature: log_callback(message: str, level: str) -> None
+        # Levels: "DEBUG" (suppressed unless self._scrcpy_verbose=True),
+        # "INFO", "WARNING", "ERROR". When log_callback is None we fall
+        # back to print() — INFO/WARNING/ERROR still print so terminal
+        # debugging keeps working, DEBUG is silent by default.
+        self._log_callback = log_callback
         # Auto-retry state.  When the SDK times out (no frames for 30/60s
         # because the device screen is static or the seat tunnel stalled),
         # the listener thread emits auto_retry instead of error_retry; the
@@ -669,9 +676,11 @@ class ScrcpyMirrorWindow(QMainWindow):
         # gives them an out if it stalls.
         self._is_seat = self.device_id.startswith('localhost:')
         if self._is_seat and self.bitrate > 2_000_000:
-            print(f"🔧 [scrcpy] WARNING: bitrate={self.bitrate} over seat "
-                  f"connection {self.device_id} — likely too high; consider "
-                  f"Low/Medium preset if stream stalls")
+            self._log(
+                "WARNING",
+                f"bitrate={self.bitrate} over seat connection {self.device_id} "
+                f"— likely too high; consider Low/Medium preset if stream stalls",
+            )
 
         # ── video display ───────────────────────────────────────────
         self.video = VideoDisplayWidget()
@@ -822,6 +831,31 @@ class ScrcpyMirrorWindow(QMainWindow):
                 proc.deleteLater()
             except Exception:
                 pass
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Logging
+    # ──────────────────────────────────────────────────────────────────
+
+    def _log(self, level, msg):
+        """Route internal scrcpy logs through the GUI log panel.
+
+        Levels: "DEBUG" | "INFO" | "WARNING" | "ERROR".
+        DEBUG is suppressed unless ``self._scrcpy_verbose`` is True.
+        When no ``log_callback`` was supplied we fall back to ``print`` —
+        INFO/WARNING/ERROR still print (so terminal debugging keeps
+        working), DEBUG is silent.
+        """
+        if level == "DEBUG" and not getattr(self, "_scrcpy_verbose", False):
+            return
+        if self._log_callback is not None:
+            try:
+                self._log_callback(f"[scrcpy] {msg}", level)
+                return
+            except Exception:
+                pass
+        # Fallback: keep important levels visible in the terminal.
+        if level in ("INFO", "WARNING", "ERROR"):
+            print(f"🔧 [scrcpy] [{level}] {msg}")
 
     # ──────────────────────────────────────────────────────────────────
     #  UI construction
@@ -1233,7 +1267,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def _start_client(self):
         """Create and start the ScrcpyClient, then listen for frames."""
-        print(f"\n🔧 [scrcpy] _start_client() called for {self.device_id}")
+        self._log("DEBUG", f"_start_client() called for {self.device_id}")
         ok, msg = _check_deps()
         if not ok:
             QMessageBox.warning(self, "Dependencies Missing", msg)
@@ -1259,9 +1293,12 @@ class ScrcpyMirrorWindow(QMainWindow):
             try:
                 from py_scrcpy_sdk import ScrcpyClient, ScrcpyConfig  # pyrefly: ignore[missing-import]
 
-                print(f"🔧 [scrcpy] Starting client for {self.device_id} "
-                      f"(bitrate={self.bitrate}, max_size={self.max_size}, "
-                      f"max_fps={self.max_fps}, adb_path={self.adb_path})")
+                self._log(
+                    "DEBUG",
+                    f"Starting client for {self.device_id} "
+                    f"(bitrate={self.bitrate}, max_size={self.max_size}, "
+                    f"max_fps={self.max_fps}, adb_path={self.adb_path})",
+                )
 
                 # Build config — always pass adb_path so py_scrcpy_sdk uses
                 # the same adb binary the app already validated.
@@ -1290,33 +1327,38 @@ class ScrcpyMirrorWindow(QMainWindow):
                 last_exc: Exception | None = None
                 for attempt in range(3):
                     if self._closing:
-                        print("🔧 [scrcpy] Closing during start retries — aborting")
+                        self._log("DEBUG", "Closing during start retries — aborting")
                         return
                     try:
-                        print(f"🔧 [scrcpy] start() attempt {attempt + 1}/3")
+                        self._log("DEBUG", f"start() attempt {attempt + 1}/3")
                         self._client.start()
-                        print("🔧 [scrcpy] start() succeeded")
+                        self._log("INFO", f"start() succeeded for {self.device_id}")
                         break
                     except Exception as e:
                         last_exc = e
                         msg = str(e)
-                        print(f"🔧 [scrcpy] start() attempt {attempt + 1} failed: "
-                              f"{type(e).__name__}: {msg}")
+                        self._log(
+                            "DEBUG",
+                            f"start() attempt {attempt + 1} failed: {type(e).__name__}: {msg}",
+                        )
                         # If the device is genuinely gone, don't waste time
                         # retrying — fail fast with a clear message.
                         if "device" in msg and "not found" in msg:
-                            print("🔧 [scrcpy] Device not found — stopping retries")
+                            self._log("DEBUG", "Device not found — stopping retries")
                             break
                         import time as _t
                         _t.sleep(0.5)
                 else:
                     if last_exc is not None:
-                        print(f"🔧 [scrcpy] All start attempts failed: {last_exc}")
+                        self._log(
+                            "ERROR",
+                            f"All start attempts failed for {self.device_id}: {last_exc}",
+                        )
                         raise last_exc
                     raise RuntimeError("Failed to start scrcpy client")
 
                 name = self._client.device_name or self.device_id
-                print(f"🔧 [scrcpy] Connected to {name}")
+                self._log("INFO", f"Connected to {name}")
                 self.signal.init_done.emit(name)
 
                 # Start the frame-arrival watchdog.  QTimer.singleShot
@@ -1351,37 +1393,35 @@ class ScrcpyMirrorWindow(QMainWindow):
                     # Local USB device: shorter timeout, should be fast
                     frame_timeout = 30.0
 
-                print(f"🔧 [scrcpy] listen() starting — frame_timeout={frame_timeout}s")
+                self._log("DEBUG", f"listen() starting — frame_timeout={frame_timeout}s")
                 self._client.listen(on_frame, timeout=frame_timeout)
-                print("🔧 [scrcpy] listen() returned normally (stream ended cleanly)")
+                self._log("INFO", f"listen() returned normally (stream ended cleanly) for {self.device_id}")
 
             except Exception as e:
                 # If the user closed the window or restarted the client,
                 # the listen() loop will fail with a socket error — that's
                 # expected, not a real failure.
                 if self._closing:
-                    print(f"🔧 [scrcpy] Exception after closing (expected): "
-                          f"{type(e).__name__}: {e}")
+                    self._log("DEBUG", f"Exception after closing (expected): {type(e).__name__}: {e}")
                     return
                 msg = str(e)
                 exc_type = type(e).__name__
 
-                # ── Terminal diagnostics ────────────────────────────────
-                # Always log the full traceback so we can see exactly what
-                # py_scrcpy_sdk raised when the stream died.
-                print(f"\n{'='*60}")
-                print(f"🔧 [scrcpy] STREAM EXCEPTION for {self.device_id}")
-                print(f"🔧 [scrcpy]   Type:    {exc_type}")
-                print(f"🔧 [scrcpy]   Message: {msg}")
-                print(f"🔧 [scrcpy]   Traceback:")
+                # Always log the full traceback as ERROR so it's visible
+                # in the GUI log panel (with our log callback) or in the
+                # terminal (without). DEBUG-only lines are suppressed by
+                # the default _scrcpy_verbose=False setting.
+                self._log(
+                    "ERROR",
+                    f"STREAM EXCEPTION for {self.device_id}: {exc_type}: {msg}",
+                )
                 tb_lines = traceback.format_exc().splitlines()
                 for _ln in tb_lines:
-                    print(f"🔧 [scrcpy]     {_ln}")
-                print(f"{'='*60}\n")
+                    self._log("DEBUG", _ln)
 
                 # Socket closed during shutdown / Apply-restart — not an error.
                 if "Bad file descriptor" in msg or "control socket" in msg:
-                    print("🔧 [scrcpy] Socket closed during shutdown — ignoring")
+                    self._log("DEBUG", "Socket closed during shutdown — ignoring")
                     return
 
                 # Frame timeout — the SDK's per-frame wait expired
@@ -1393,9 +1433,12 @@ class ScrcpyMirrorWindow(QMainWindow):
                 # the socket is genuinely dead the decode thread will
                 # set reader_error, which we pick up on the next tick.
                 if exc_type == "ScrcpyTimeoutError" or "timeout" in msg.lower():
-                    print(f"🔧 [scrcpy] Frame timeout (no new frame in "
-                          f"{'60' if self.device_id.startswith('localhost:') else '30'}s) "
-                          f"— restarting listener (screen may be static)")
+                    self._log(
+                        "DEBUG",
+                        f"Frame timeout (no new frame in "
+                        f"{'60' if self.device_id.startswith('localhost:') else '30'}s) "
+                        f"— restarting listener (screen may be static)",
+                    )
                     self.signal.auto_retry.emit("timeout")
                     return
 
@@ -1445,8 +1488,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                 # Reset auto-retry budget on successful first frame so
                 # the user isn't punished for an early stall.
                 if self._retry_count > 0:
-                    print(f"🔧 [scrcpy] Stream recovered — resetting retry "
-                          f"counter (was {self._retry_count})")
+                    self._log("INFO", f"Stream recovered — resetting retry counter (was {self._retry_count})")
                 self._retry_count = 0
         except RuntimeError:
             # Widget was deleted between signal emission and delivery.
@@ -1503,7 +1545,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             # The only thing we care about: is there a real SDK error?
             reader_error = getattr(client, 'reader_error', None)
             if reader_error is not None:
-                print(f"🔧 [scrcpy] WATCHDOG: client.reader_error detected: {reader_error}")
+                self._log("ERROR", f"WATCHDOG: client.reader_error detected: {reader_error}")
                 self._stop_frame_watchdog()
                 # The client is broken — the exception handler in _thread
                 # will pick this up and auto-restart. But if for some reason
@@ -1532,16 +1574,13 @@ class ScrcpyMirrorWindow(QMainWindow):
         the user a Retry / Close choice — useful when the failure is
         likely transient (e.g. device showing a static screen).
         """
-        print(f"\n{'─'*60}")
-        print(f"🔧 [scrcpy] _on_error called")
-        print(f"🔧 [scrcpy]   auto_close_ms: {auto_close_ms}")
-        print(f"🔧 [scrcpy]   message:")
-        for _ln in error_msg.splitlines():
-            print(f"🔧 [scrcpy]     {_ln}")
-        print(f"{'─'*60}\n")
+        self._log(
+            "ERROR",
+            f"_on_error (auto_close_ms={auto_close_ms}): {error_msg.splitlines()[0] if error_msg else ''}",
+        )
         try:
             if self._closing:
-                print("🔧 [scrcpy] _on_error: already closing — ignoring")
+                self._log("DEBUG", "_on_error: already closing — ignoring")
                 return
             # Guard against re-entrant calls: while the Retry dialog is
             # open (modal), the old listener thread may exit with an
@@ -1585,19 +1624,20 @@ class ScrcpyMirrorWindow(QMainWindow):
         No upper limit — restarts indefinitely if needed.
         """
         if self._closing:
-            print(f"🔧 [scrcpy] _on_auto_retry: window is closing — ignoring ({reason})")
+            self._log("DEBUG", f"_on_auto_retry: window is closing — ignoring ({reason})")
             return
 
         # Backoff: 0 s, 1 s, 2 s, 5 s, 5 s, …
         delay = (0, 1, 2, 5, 5)[min(self._retry_count, 4)]
         self._retry_count += 1
 
-        # Log to console so we can see what's happening, but don't show
-        # any UI element to the user (no status bar text, no dialogs).
-        if delay > 0:
-            print(f"🔧 [scrcpy] _on_auto_retry ({reason}): restart in {delay}s (attempt {self._retry_count})")
-        else:
-            print(f"🔧 [scrcpy] _on_auto_retry ({reason}): restart immediately (attempt {self._retry_count})")
+        # Log so we can see what's happening, but don't show any UI element
+        # to the user (no status bar text, no dialogs).
+        when = "immediately" if delay == 0 else f"in {delay}s"
+        self._log(
+            "DEBUG",
+            f"_on_auto_retry ({reason}): restart {when} (attempt {self._retry_count})",
+        )
 
         def _restart():
             if self._closing:
@@ -1671,12 +1711,10 @@ class ScrcpyMirrorWindow(QMainWindow):
             pass
 
     def _on_disconnect(self, error_msg):
-        print(f"\n{'─'*60}")
-        print(f"🔧 [scrcpy] _on_disconnect called: {error_msg}")
-        print(f"{'─'*60}\n")
+        self._log("ERROR", f"_on_disconnect: {error_msg.splitlines()[0] if error_msg else ''}")
         try:
             if self._closing:
-                print("🔧 [scrcpy] _on_disconnect: already closing — ignoring")
+                self._log("DEBUG", "_on_disconnect: already closing — ignoring")
                 return
             # Show disconnection message on the video display
             self.video.set_disconnected()
