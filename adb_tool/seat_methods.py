@@ -654,7 +654,7 @@ def _push_adb_key(sh, adb_keys, log):
     if code == 0:
         log("KEYS: key already on seat — running post-install setup", "INFO")
         _run_post_install_setup(sh, log)
-        return
+        return False  # Key was already present, not freshly installed
     log("KEYS: key not on seat, appending...", "INFO")
 
     # Make sure the file ends with a newline so the new key isn't glued to
@@ -675,6 +675,7 @@ def _push_adb_key(sh, adb_keys, log):
     log("KEYS: key written and verified", "INFO")
 
     _run_post_install_setup(sh, log)
+    return True  # Key was freshly installed
 
 
 def _run_post_install_setup(sh, log):
@@ -1761,8 +1762,9 @@ class SeatMixin:
             try:
                 jump = _SeatJumpHost(gateway, gateway_password, log=self.log)
                 sh = _seat_root_shell_via_mtc(jump, seat, mtc_password, log=self.log)
-                _push_adb_key(sh, adb_key, log=self.log)
-                self.log(f"ADB key installed on seat {seat}", "INFO")
+                key_was_installed = _push_adb_key(sh, adb_key, log=self.log)
+                if key_was_installed:
+                    self.log(f"ADB key installed on seat {seat}", "INFO")
                 # Restart adbd on the seat so it re-reads /data/misc/adb/adb_keys
                 # at startup and accepts the host's public key. Without this,
                 # the running adbd doesn't notice the freshly-appended key and
@@ -2085,20 +2087,74 @@ class SeatMixin:
         """Instance-method wrapper so callers can do ``self._read_arp_table()``."""
         return _read_arp_table()
 
+    def _ssh_run_arp_on_gateway(self, gateway_user, gateway_host, password):
+        """SSH into the gateway and run `arp -a` to discover connected seats.
+
+        Returns dict {name: ip} like _read_arp_table() but from the gateway's
+        network, not the local machine.
+        """
+        import paramiko
+        arp_entries = {}
+
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(gateway_host, username=gateway_user, password=password,
+                         timeout=8, banner_timeout=8, auth_timeout=8)
+
+            stdin, stdout, stderr = client.exec_command('arp -a', timeout=8)
+            # Read with timeout to prevent hanging forever
+            import select
+            chunks = []
+            start = time.time()
+            while True:
+                if time.time() - start > 5:
+                    break  # 5 second total timeout
+                ready, _, _ = select.select([stdout.channel], [], [], 0.5)
+                if ready:
+                    chunk = stdout.read(4096).decode('utf-8', 'replace')
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            out = ''.join(chunks)
+            err = stderr.read().decode('utf-8', 'replace')
+
+            if err:
+                self.log(f"Gateway arp -a error: {err}", "DEBUG")
+
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                name = line.split(None, 1)[0] if line else ""
+                ip = None
+                if '(' in line and ')' in line:
+                    inside = line.split('(', 1)[1].split(')', 1)[0].strip()
+                    if _is_dotted_quad(inside):
+                        ip = inside
+                if ip and name:
+                    arp_entries[name] = ip
+
+            client.close()
+        except Exception as e:
+            self.log(f"SSH arp discovery failed: {e}", "DEBUG")
+
+        return arp_entries
+
     def _show_add_seat_dialog(self):
         """Show dialog to connect to a new seat. Gateway field comes first;
-        after selecting/typing one, seat IP auto-populates from `arp -a` and
-        the clipboard.
+        after selecting/typing one, seat IP auto-populates from remote
+        gateway's `arp -a` (via SSH) and the clipboard.
         """
-        arp_map = self._read_arp_table()  # { "seat010B": "172.17.136.2", ... }
+        arp_map = None  # Loaded on-demand to avoid blocking dialog open
 
-        def populate_seat_options(gateway_text):
-            """Build a list of seat IP suggestions for the current gateway.
+        def populate_seat_options_gw(gateway_text):
+            """Build a list of seat IP suggestions for the specific gateway.
 
             Sources (in priority order):
               1. Clipboard — if it contains an IP-looking string.
-              2. `arp -a` rows — all dotted-decimal IPs we saw.
-              3. Anything already known from connected_seats / history.
+              2. Local `arp -a` rows
+              3. Seat IPs from history that were connected via THIS gateway
             """
             seen = []
             seen_set = set()
@@ -2108,7 +2164,17 @@ class SeatMixin:
                     seen.append(s)
                     seen_set.add(s)
 
-            # 1. Clipboard (the user often has the seat IP copied from elsewhere)
+            # Parse gateway to get host for matching
+            gateway_user = "user"
+            gateway_host = None
+            if gateway_text and '@' in gateway_text:
+                parts = gateway_text.split('@', 1)
+                gateway_user = parts[0]
+                gateway_host = parts[1]
+            elif gateway_text:
+                gateway_host = gateway_text
+
+            # 1. Clipboard
             try:
                 cb = QApplication.clipboard().text().strip()
                 if _is_dotted_quad(cb):
@@ -2116,19 +2182,27 @@ class SeatMixin:
             except Exception:
                 pass
 
-            # 2. arp entries — anything that looks like a 172.x or 10.x seat
-            for _name, ip in arp_map.items():
-                if ip:
-                    add(ip)
-
-            # 3. Already-known seat IPs from connected_seats and history
+            # 2. Local arp entries (these are seats on the local network)
             try:
+                local_arp = self._read_arp_table()
+                for _name, ip in local_arp.items():
+                    if ip:
+                        add(ip)
+            except Exception:
+                pass
+
+            # 3. Seat IPs from history that were connected via THIS gateway
+            try:
+                # Check connected_seats (current connections) - match by gateway
                 for s, gw in (self.seat_port_manager.connected_seats or {}).items():
-                    if _is_dotted_quad(s):
+                    if _is_dotted_quad(s) and gw and gateway_host and gateway_host in gw:
                         add(s)
+
+                # Check history entries - match by gateway
                 for entry in (self.seat_port_manager.get_top_entries('seat', 1000) or []):
                     s = entry.get('seat', '')
-                    if _is_dotted_quad(s):
+                    gw = entry.get('gateway', '')
+                    if _is_dotted_quad(s) and gw and gateway_host and gateway_host in gw:
                         add(s)
             except Exception:
                 pass
@@ -2160,52 +2234,120 @@ class SeatMixin:
                     gw_seen.add(gw)
         except Exception:
             pass
-        # Also pull hostnames out of `arp -a` so the user can pick a seat's
-        # gateway by its reverse-DNS hostname.
-        for name in arp_map.keys():
-            if name and '.' in name and not name.replace('.', '').isdigit() and name not in gw_seen:
-                # Skip pure-IP labels, accept hostnames (e.g. is1.example.com).
-                candidate = f"user@{name}"
-                if candidate not in gw_seen:
-                    gw_options.append(candidate)
-                    gw_seen.add(candidate)
         gateway_combo.addItems(sorted(set(gw_options)))
         gateway_combo.lineEdit().setPlaceholderText("e.g., user@ate009.example.com")
         layout.addWidget(gateway_combo)
 
-        # Seat IP — auto-populated once gateway is filled.
-        layout.addWidget(QLabel("Seat IP (auto-populated):"))
+        # Seat IP — with search button to fetch from gateway.
+        seat_label = QLabel("Seat IP (click 🔍 to fetch from gateway):")
+        layout.addWidget(seat_label)
+        seat_row = QHBoxLayout()
         seat_combo = QComboBox()
         seat_combo.setEditable(True)
         seat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        seat_combo.setPlaceholderText("Pick or type a seat IP — list refreshes when gateway changes")
-        seat_combo.addItems(populate_seat_options(""))
-        if seat_combo.count():
-            seat_combo.setCurrentIndex(0)
-        layout.addWidget(seat_combo)
+        seat_combo.setPlaceholderText("Select gateway, then click 🔍 to fetch seats")
+        seat_row.addWidget(seat_combo, 1)
+        search_btn = QPushButton("🔍")
+        search_btn.setFixedWidth(40)
+        search_btn.setToolTip("Fetch seats from gateway via SSH (cached per session)")
+        seat_row.addWidget(search_btn)
+        layout.addLayout(seat_row)
 
         hint = QLabel(
-            "ⓘ Pick or type a gateway first; the seat IP list auto-populates from "
-            "`arp -a` and the clipboard. The IP (not the name) is what gets passed "
-            "to `seat.sh auto-connect`."
+            "ⓘ Click 🔍 to SSH into the gateway and fetch seats via `arp -a`. "
+            "Results are cached for this session per gateway."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
         layout.addWidget(hint)
 
-        def on_gateway_changed(text):
-            suggestions = populate_seat_options(text)
-            current = seat_combo.currentText().strip()
+        # Password input field removed - no longer needed
+        def show_password_prompt(show):
+            pass  # No-op for compatibility
+
+        def update_seat_combo(suggestions):
+            """Update seat combo box on GUI thread."""
+            current_text = seat_combo.currentText().strip()
+            # Don't overwrite if user is typing in seat field
+            if current_text == "⏳ Loading seats from gateway...":
+                current_text = ""
             seat_combo.blockSignals(True)
             seat_combo.clear()
-            seat_combo.addItems(suggestions)
+            if suggestions:
+                seat_combo.addItems(suggestions)
             # Preserve whatever the user already typed if it's not in the new list
-            if current and current not in suggestions:
-                seat_combo.addItem(current)
-            seat_combo.setCurrentText(current or (suggestions[0] if suggestions else ""))
+            if current_text and current_text not in suggestions:
+                seat_combo.addItem(current_text)
+            seat_combo.setCurrentText(current_text or (suggestions[0] if suggestions else ""))
             seat_combo.blockSignals(False)
 
-        gateway_combo.editTextChanged.connect(on_gateway_changed)
+        # Session cache: gateway_host -> list of seat IPs
+        seat_cache = {}
+
+        def on_gateway_changed(text):
+            """When gateway changes, restore cached seats if available."""
+            gateway_user = "user"
+            gateway_host = None
+            if text and '@' in text:
+                parts = text.split('@', 1)
+                gateway_user = parts[0]
+                gateway_host = parts[1]
+            elif text:
+                gateway_host = text
+
+            # If we have cached seats for this gateway, restore them
+            if gateway_host and gateway_host in seat_cache:
+                update_seat_combo(seat_cache[gateway_host])
+            else:
+                # No cache - clear seats
+                seat_combo.blockSignals(True)
+                seat_combo.clear()
+                seat_combo.blockSignals(False)
+
+        gateway_combo.currentTextChanged.connect(on_gateway_changed)
+
+        def on_search_clicked():
+            """Search button clicked - fetch seats from gateway via SSH."""
+            gateway_text = gateway_combo.currentText().strip()
+            if not gateway_text:
+                QMessageBox.warning(dialog, "No Gateway", "Please enter a gateway first.")
+                return
+
+            gateway_user = "user"
+            gateway_host = None
+            if '@' in gateway_text:
+                parts = gateway_text.split('@', 1)
+                gateway_user = parts[0]
+                gateway_host = parts[1]
+            else:
+                gateway_host = gateway_text
+
+            # Check session cache
+            if gateway_host in seat_cache:
+                update_seat_combo(seat_cache[gateway_host])
+                return
+
+            # Show "Loading..." and disable button
+            seat_combo.blockSignals(True)
+            seat_combo.clear()
+            seat_combo.addItem("⏳ Loading seats...")
+            seat_combo.blockSignals(False)
+            search_btn.setEnabled(False)
+
+            # Run scan synchronously (no SSH, just local lookup)
+            try:
+                suggestions = populate_seat_options_gw(gateway_text)
+                seat_cache[gateway_host] = suggestions
+                update_seat_combo(suggestions)
+            except Exception as e:
+                self.log(f"Scan failed: {e}", "DEBUG")
+                update_seat_combo([])
+            finally:
+                search_btn.setEnabled(True)
+
+        search_btn.clicked.connect(on_search_clicked)
+
+        # Password functionality removed - no longer needed
         layout.addStretch()
 
         # Install ADB keys section
