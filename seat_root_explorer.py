@@ -1,0 +1,706 @@
+# -*- coding: utf-8 -*-
+"""Seat Root File Explorer — SSH-based root file access.
+
+Uses the same SSH chain as 'Install ADB keys': gateway → ssh -t mtc@seat 'sudo -i' → root shell.
+Allows browsing system directories like /data, /system, /var with proper permissions.
+"""
+
+import os
+import sys
+import shlex
+import time
+import threading
+import base64
+import tarfile
+import io
+
+# Ensure we can import adb_tool modules
+sys.path.insert(0, os.path.dirname(__file__))
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (
+    QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
+    QLineEdit, QFileDialog, QMessageBox, QTableWidgetItem, QInputDialog,
+    QTextEdit
+)
+from PyQt6.QtGui import QFont
+
+from adb_tool.seat_methods import (
+    _SeatJumpHost, _SeatAuthError, _SeatShell, _SeatSshError,
+    _seat_root_shell_via_mtc
+)
+from adb_tool.credentials import CredentialManager
+from adb_tool.ui_widgets import DeviceFileTableWidget, _UICaller
+
+try:
+    from adb_tool.gateway_methods import _format_size
+except ImportError:
+    def _format_size(size_bytes):
+        if size_bytes < 0:
+            return "?"
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024.0:
+                if unit == 'B':
+                    return f"{int(size_bytes)} {unit}"
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} PB"
+
+
+def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway_password,
+                          seat_hostname, mtc_password, colors):
+    """Open a root-level SSH file explorer for a seat.
+
+    seat_hostname: the actual seat device name (e.g., 'seat01')
+    gateway_host, gateway_user, gateway_password: gateway SSH credentials
+    mtc_password: mtc account password on the seat (for SSH and sudo)
+    """
+    # Create signal emitters on the MAIN thread so they marshal calls
+    # back to the GUI thread. Emitting from the background thread will
+    # run the connected slot on the main thread (where Qt widgets /
+    # NSWindow can be safely created).
+    from adb_tool.ui_widgets import _SignalEmitter
+    show_signal = _SignalEmitter()
+    error_signal = _SignalEmitter()
+    explorer_holder = {}  # shared dict to pass the explorer ref
+
+    def _on_show(payload):
+        _show_window(payload['shell'], payload['jump'])
+
+    def _on_error(msg):
+        QMessageBox.warning(
+            parent, "Connection Failed",
+            f"Could not connect to {seat_hostname}:\n\n{msg}\n\n"
+            f"Tip: If this is a ProxyCommand (vrack) host, make sure you're on the VPN."
+        )
+        parent.update_status("Connection failed")
+
+    show_signal.call.connect(_on_show)
+    error_signal.call.connect(_on_error)
+
+    # Connect in background, show window after successful root access
+    def do_connect():
+        try:
+            parent.log(f"Seat Root: connecting to {seat_hostname} via {gateway_user}@{gateway_host}", "DEBUG")
+            jump = None
+            shell = None
+            try:
+                jump = _SeatJumpHost(f"{gateway_user}@{gateway_host}", gateway_password, parent.log)
+                parent.log("Seat Root: gateway hop done, opening mtc/root shell", "DEBUG")
+                shell = _seat_root_shell_via_mtc(jump, seat_hostname, mtc_password, parent.log)
+                parent.log(f"Seat Root: root shell active: {shell}", "INFO")
+                parent.update_status(f"Connected to {seat_hostname} (root)")
+                # Save mtc password globally (one for all seats/gateways)
+                try:
+                    saved_creds = CredentialManager()
+                    saved_creds.set_password("mtc_global", "mtc", mtc_password)
+                except Exception:
+                    pass
+                # Emit signal so _show_window runs on the GUI thread.
+                show_signal.call.emit({'shell': shell, 'jump': jump})
+                return
+            except _SeatAuthError:
+                raise Exception("mtc password was rejected.")
+            except Exception as e:
+                parent.log(f"Seat Root: connection failed: {e}", "ERROR")
+                error_signal.call.emit(str(e))
+                if jump:
+                    try:
+                        jump.close()
+                    except Exception:
+                        pass
+                if shell:
+                    try:
+                        shell.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            parent.log(f"Seat Root: unhandled error: {e}", "ERROR")
+            error_signal.call.emit(f"Unhandled: {e}")
+
+    explorer = None
+    def _show_window(shell, jump):
+        nonlocal explorer
+        try:
+            parent.log("Seat Root: opening file explorer window", "INFO")
+            explorer = QDialog(parent)
+            explorer.setWindowTitle(f"🛡️ Seat Root Explorer — {seat_hostname} (via {gateway_host})")
+            explorer.setMinimumSize(950, 650)
+            explorer.setModal(False)
+            explorer.setStyleSheet(f"""
+                QDialog {{
+                    background-color: {colors['bg']};
+                    color: {colors['fg']};
+                }}
+                QLabel {{
+                    color: {colors['fg']};
+                }}
+                QLineEdit {{
+                    background-color: {colors['card_bg']};
+                    color: {colors['fg']};
+                    border: 1px solid {colors['border']};
+                    padding: 4px;
+                }}
+                QPushButton {{
+                    background-color: {colors['card_bg']};
+                    color: {colors['fg']};
+                    border: 1px solid {colors['border']};
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                }}
+                QPushButton:hover {{
+                    background-color: {colors['accent']};
+                    color: white;
+                }}
+                QTableWidget {{
+                    background-color: {colors['bg']};
+                    color: {colors['fg']};
+                    gridline-color: {colors['border']};
+                    border: 1px solid {colors['border']};
+                }}
+                QTableWidget::item:selected {{
+                    background-color: {colors['accent']};
+                    color: white;
+                }}
+            """)
+        except Exception as e:
+            parent.log(f"Seat Root: failed to create dialog: {e}", "ERROR")
+            return
+
+        # Hold reference to prevent GC
+        if not hasattr(parent, '_seat_root_windows'):
+            parent._seat_root_windows = []
+        parent._seat_root_windows.append(explorer)
+
+        layout = QVBoxLayout(explorer)
+        layout.setSpacing(8)
+
+        # Path + controls
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Path:"))
+        path_entry = QLineEdit("/")
+        top_row.addWidget(path_entry, 1)
+        up_btn = QPushButton("⬆️ Up")
+        top_row.addWidget(up_btn)
+        refresh_btn = QPushButton("🔄 Refresh")
+        top_row.addWidget(refresh_btn)
+        layout.addLayout(top_row)
+
+        status = QLabel("🔐 ROOT ACCESS — modifications affect system directories")
+        status.setStyleSheet(f"color: brown; font-weight: bold;")
+        layout.addWidget(status)
+
+        listbox = DeviceFileTableWidget()
+        listbox.set_device_context(f"seat_root:{seat_hostname}", "/")
+        layout.addWidget(listbox, 1)
+
+        # Buttons row
+        btn_row = QHBoxLayout()
+        upload_btn = QPushButton("⬆️ Upload as root")
+        download_btn = QPushButton("⬇️ Download")
+        edit_btn = QPushButton("📝 Edit")
+        delete_btn = QPushButton("🗑️ Delete")
+        mkdir_btn = QPushButton("📁 New Folder")
+        rename_btn = QPushButton("📝 Rename")
+        close_btn = QPushButton("Close")
+        btn_row.addWidget(upload_btn)
+        btn_row.addWidget(download_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(delete_btn)
+        btn_row.addWidget(mkdir_btn)
+        btn_row.addWidget(rename_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        ui = _UICaller(parent)
+
+        def current_path():
+            p = path_entry.text().strip() or "/"
+            return p.rstrip('/') if p not in ('/', '.') else '/'
+
+        def join_remote(base, name):
+            base = base.rstrip('/') if base != '/' else ''
+            if base:
+                return f"{base}/{name}"
+            return f"/{name}"
+
+        def selected():
+            selected = []
+            for idx in listbox.selectionModel().selectedRows():
+                row = idx.row()
+                name_item = listbox.item(row, 0)
+                if not name_item:
+                    continue
+                display = name_item.text()
+                raw = name_item.data(Qt.ItemDataRole.UserRole) or display
+                is_dir = display.startswith("📁 ")
+                selected.append((row, display, raw, is_dir))
+            return selected
+
+        # File list via ls -la parsing
+        def refresh_listing():
+            p = current_path()
+            listbox.setRowCount(0)
+            listbox.setRowCount(1)
+            listbox.setItem(0, 0, QTableWidgetItem("Loading…"))
+            def do_ls():
+                try:
+                    cmd = f"cd {shlex.quote(p)} 2>/dev/null; LC_ALL=C ls -la"
+                    out, code = shell.run(cmd, timeout=20)
+                    if code != 0:
+                        raise Exception("ls failed")
+                    lines = (out or "").splitlines()
+                    rows = []
+                    for line in lines:
+                        if not line.strip():
+                            continue
+                        parts = line.split()
+                        if len(parts) < 6:
+                            continue
+                        size_col = parts[4]
+                        name = ' '.join(parts[8:])
+                        if name in ('.', '..'):
+                            continue
+                        is_dir = parts[0][0] == 'd'
+                        if is_dir:
+                            display = "📁 " + name
+                            size_str = "—"
+                        else:
+                            display = name
+                            try:
+                                size_str = _format_size(int(size_col))
+                            except ValueError:
+                                size_str = size_col
+                        rows.append((display, size_str, is_dir, name))
+                    rows.sort(key=lambda r: (not r[2], r[3].lower()))
+                except Exception as e:
+                    def apply_err():
+                        listbox.setRowCount(1)
+                        listbox.setItem(0, 0, QTableWidgetItem(f"[Error] {str(e)}"))
+                    ui.call.emit(apply_err)
+                    return
+                def apply():
+                    listbox.setRowCount(len(rows))
+                    for i, (display, size, is_dir, raw) in enumerate(rows):
+                        name_item = QTableWidgetItem(display)
+                        size_item = QTableWidgetItem(size)
+                        name_item.setData(Qt.ItemDataRole.UserRole, raw)
+                        size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                        listbox.setItem(i, 0, name_item)
+                        listbox.setItem(i, 1, size_item)
+                ui.call.emit(apply)
+            threading.Thread(target=do_ls, daemon=True).start()
+
+        def go_up():
+            p = current_path()
+            if p == "/":
+                return
+            parent = os.path.dirname(p.rstrip("/"))
+            parent = "/" if not parent else parent
+            path_entry.setText(parent)
+            refresh_listing()
+
+        def on_double_click(row, col):
+            name_item = listbox.item(row, 0)
+            if not name_item:
+                return
+            display = name_item.text()
+            raw = name_item.data(Qt.ItemDataRole.UserRole) or display
+            if display.startswith("[Error]"):
+                return
+            target = join_remote(current_path(), raw)
+            if display.startswith("📁 "):
+                path_entry.setText(target)
+                refresh_listing()
+                return
+            # Check if it's a directory
+            def check():
+                cmd = f"test -d {shlex.quote(target)} && echo DIR || echo FILE"
+                parent.log(f"Seat Root: checking type of {target}", "DEBUG")
+                try:
+                    out, code = shell.run(cmd, timeout=10)
+                    parent.log(f"Seat Root: got type {out}", "DEBUG")
+                    if out.strip() == "DIR":
+                        ui.call.emit(lambda: path_entry.setText(target))
+                        ui.call.emit(refresh_listing)
+                except Exception:
+                    pass
+            threading.Thread(target=check, daemon=True).start()
+
+        def upload():
+            files, _ = QFileDialog.getOpenFileNames(parent, "Select files")
+            if not files:
+                return
+            dest = current_path()
+            parent.log(f"Uploading {len(files)} files as root to {dest}", "INFO")
+            parent.update_status("Uploading as root…")
+            def do_upload():
+                ok = 0
+                for f in files:
+                    try:
+                        with open(f, 'rb') as rf:
+                            content = rf.read()
+                        b64 = base64.b64encode(content).decode('ascii')
+                        target_file = join_remote(dest, os.path.basename(f))
+                        cmd = f"umask 022; echo {shlex.quote(b64)} | base64 -d > {shlex.quote(target_file)}"
+                        shell.run(cmd, timeout=60)
+                        ok += 1
+                    except Exception as e:
+                        parent.log(f"Upload failed for {f}: {e}", "ERROR")
+                parent.update_status("Upload complete")
+                if ok:
+                    ui.call.emit(refresh_listing)
+            threading.Thread(target=do_upload, daemon=True).start()
+
+        def download():
+            sel = selected()
+            if not sel:
+                QMessageBox.information(explorer, "Download", "Select files to download first.")
+                return
+            dest_dir = QFileDialog.getExistingDirectory(explorer, "Download to…")
+            if not dest_dir:
+                return
+            parent.update_status("Downloading as root…")
+
+            def _extract_base64(out):
+                """Extract valid base64 data from shell output.
+
+                shell.run() returns the raw output which includes the
+                command echo and shell prompt mixed with the actual
+                base64 data. We filter to only lines that look like
+                base64 (A-Z, a-z, 0-9, +, /, =).
+                """
+                b64_chars = set(
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+                )
+                lines = []
+                for line in out.splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if all(c in b64_chars for c in stripped):
+                        lines.append(stripped)
+                return "".join(lines)
+
+            def do_download():
+                ok = 0
+                failed = 0
+                failed_items = []
+                for _row, display, raw, is_dir in sel:
+                    try:
+                        remote_path = join_remote(current_path(), raw)
+                        local_path = os.path.join(dest_dir, raw)
+                        if is_dir:
+                            parent.log(f"Downloading directory {remote_path}…", "INFO")
+                            out, code = shell.run(
+                                f"tar cf - -C {shlex.quote(os.path.dirname(remote_path) or '/')} "
+                                f"{shlex.quote(os.path.basename(remote_path))} 2>/dev/null | base64",
+                                timeout=120,
+                            )
+                            if code != 0:
+                                raise Exception(f"tar failed (exit {code})")
+                            b64_str = _extract_base64(out)
+                            if not b64_str:
+                                raise Exception("no base64 data in output")
+                            raw_bytes = base64.b64decode(b64_str)
+                            with tarfile.open(fileobj=io.BytesIO(raw_bytes)) as tf:
+                                tf.extractall(dest_dir)
+                        else:
+                            parent.log(f"Downloading {remote_path}…", "INFO")
+                            out, code = shell.run(
+                                f"base64 {shlex.quote(remote_path)}", timeout=60
+                            )
+                            if code != 0:
+                                raise Exception(f"base64 failed (exit {code})")
+                            b64_str = _extract_base64(out)
+                            if not b64_str:
+                                raise Exception("no base64 data in output")
+                            raw_bytes = base64.b64decode(b64_str)
+                            with open(local_path, 'wb') as wf:
+                                wf.write(raw_bytes)
+                        ok += 1
+                    except Exception as e:
+                        parent.log(f"Download failed for {raw}: {e}", "ERROR")
+                        failed += 1
+                        failed_items.append(f"{raw}: {e}")
+
+                ui.call.emit(lambda: parent.update_status(
+                    f"Downloaded {ok} item(s)" + (f", {failed} failed" if failed else "")
+                ))
+                if ok:
+                    parent.log(
+                        f"Downloaded {ok} item(s) to {dest_dir}" + (f", {failed} failed" if failed else ""),
+                        "INFO" if not failed else "WARNING",
+                    )
+                if failed:
+                    parent.log(f"{failed} download(s) failed", "ERROR")
+                if ok or failed:
+                    msg = f"Downloaded: {ok}\nFailed: {failed}\n\nDestination:\n{dest_dir}"
+                    if failed_items:
+                        msg += "\n\nFailures:\n" + "\n".join(failed_items[:5])
+                        if len(failed_items) > 5:
+                            msg += f"\n…and {len(failed_items) - 5} more"
+                    ui.call.emit(lambda: QMessageBox.information(explorer, "Download complete", msg))
+                if ok:
+                    ui.call.emit(refresh_listing)
+            threading.Thread(target=do_download, daemon=True).start()
+
+        def delete():
+            sel = selected()
+            if not sel:
+                QMessageBox.information(explorer, "Delete", "Select items to delete first.")
+                return
+            names = [r[2] for r in sel]
+            reply = QMessageBox.question(
+                explorer, "Confirm Delete",
+                f"Delete {len(names)} item(s) as root?\n" + "\n".join(names[:10])
+                + ("…" if len(names) > 10 else ""),
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            parent.update_status("Deleting as root…")
+            def do_delete():
+                ok = 0
+                for _row, _display, raw, _is_dir in sel:
+                    try:
+                        target = join_remote(current_path(), raw)
+                        shell.run(f"rm -rf {shlex.quote(target)}", timeout=30)
+                        ok += 1
+                    except Exception as e:
+                        parent.log(f"Delete failed for {raw}: {e}", "ERROR")
+                parent.update_status(f"Deleted {ok} item(s)")
+                ui.call.emit(refresh_listing)
+            threading.Thread(target=do_delete, daemon=True).start()
+
+        def mkdir():
+            name, ok = QInputDialog.getText(explorer, "New Folder", "Folder name:")
+            if not ok or not name:
+                return
+            def do_mkdir():
+                try:
+                    target = join_remote(current_path(), name)
+                    shell.run(f"mkdir -p {shlex.quote(target)}", timeout=10)
+                    ui.call.emit(refresh_listing)
+                except Exception as e:
+                    parent.log(f"Mkdir failed: {e}", "ERROR")
+            threading.Thread(target=do_mkdir, daemon=True).start()
+
+        def rename():
+            sel = selected()
+            if len(sel) != 1:
+                QMessageBox.information(explorer, "Rename", "Select exactly one item.")
+                return
+            raw = sel[0][2]
+            new_name, ok = QInputDialog.getText(explorer, "Rename", "New name:", text=raw)
+            if not ok or not new_name or new_name == raw:
+                return
+            def do_rename():
+                try:
+                    src = join_remote(current_path(), raw)
+                    dst = join_remote(current_path(), new_name)
+                    shell.run(f"mv {shlex.quote(src)} {shlex.quote(dst)}", timeout=10)
+                    ui.call.emit(refresh_listing)
+                except Exception as e:
+                    parent.log(f"Rename failed: {e}", "ERROR")
+            threading.Thread(target=do_rename, daemon=True).start()
+
+        def edit_file():
+            sel = selected()
+            if len(sel) != 1:
+                QMessageBox.information(explorer, "Edit", "Select exactly one file to edit.")
+                return
+            raw = sel[0][2]
+            if sel[0][3]:  # is_dir
+                QMessageBox.information(explorer, "Edit", "Cannot edit a directory.")
+                return
+            remote_path = join_remote(current_path(), raw)
+
+            def _do_load():
+                try:
+                    # base64-encode on the remote to safely transfer
+                    out, code = shell.run(f"base64 {shlex.quote(remote_path)}", timeout=30)
+                    if code != 0:
+                        ui.call.emit(lambda: QMessageBox.warning(explorer, "Edit", f"Failed to read file (exit {code})"))
+                        return
+                    # Extract only valid base64 lines
+                    b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+                    b64_str = "".join(
+                        l.strip() for l in out.splitlines()
+                        if l.strip() and all(c in b64_chars for c in l.strip())
+                    )
+                    if not b64_str:
+                        ui.call.emit(lambda: QMessageBox.warning(explorer, "Edit", "No data in file."))
+                        return
+                    content = base64.b64decode(b64_str).decode("utf-8", "replace")
+                    ui.call.emit(lambda: _show_editor(content))
+                except Exception as e:
+                    err = str(e)
+                    ui.call.emit(lambda: QMessageBox.warning(explorer, "Edit", f"Failed to read: {err}"))
+
+            def _show_editor(content):
+                editor = QDialog(explorer)
+                editor.setWindowTitle(f"📝 Edit — {raw}")
+                editor.setMinimumSize(700, 500)
+                elayout = QVBoxLayout(editor)
+                etext = QTextEdit()
+                etext.setPlainText(content)
+                etext.setFont(QFont("Monaco", 11) if sys.platform == 'darwin' else QFont("Courier", 10))
+                elayout.addWidget(etext)
+                ebtn_row = QHBoxLayout()
+                ebtn_row.addStretch()
+                esave_btn = QPushButton("💾 Save")
+                eclose_btn = QPushButton("Close")
+                ebtn_row.addWidget(esave_btn)
+                ebtn_row.addWidget(eclose_btn)
+                elayout.addLayout(ebtn_row)
+
+                def _do_save():
+                    new_content = etext.toPlainText()
+                    def _save_thread():
+                        try:
+                            b64 = base64.b64encode(new_content.encode("utf-8")).decode("ascii")
+                            cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(remote_path)}"
+                            shell.run(cmd, timeout=30)
+                            ui.call.emit(lambda: parent.log(f"Seat Root: saved {remote_path}", "INFO"))
+                            ui.call.emit(editor.accept)
+                        except Exception as e:
+                            err = str(e)
+                            ui.call.emit(lambda: QMessageBox.warning(editor, "Save Failed", err))
+
+                    threading.Thread(target=_save_thread, daemon=True).start()
+
+                esave_btn.clicked.connect(_do_save)
+                eclose_btn.clicked.connect(editor.reject)
+                editor.show()
+
+            threading.Thread(target=_do_load, daemon=True).start()
+
+        upload_btn.clicked.connect(upload)
+        download_btn.clicked.connect(download)
+        edit_btn.clicked.connect(edit_file)
+        delete_btn.clicked.connect(delete)
+        mkdir_btn.clicked.connect(mkdir)
+        rename_btn.clicked.connect(rename)
+        refresh_btn.clicked.connect(refresh_listing)
+        up_btn.clicked.connect(go_up)
+        listbox.cellDoubleClicked.connect(on_double_click)
+        close_btn.clicked.connect(explorer.accept)
+
+        # Clean up
+        def on_close():
+            try:
+                shell.close()
+            except Exception:
+                pass
+            try:
+                jump.close()
+            except Exception:
+                pass
+            if hasattr(parent, '_seat_root_windows') and explorer in parent._seat_root_windows:
+                parent._seat_root_windows.remove(explorer)
+        explorer.finished.connect(on_close)
+
+        try:
+            refresh_listing()
+            explorer.show()
+            explorer.raise_()
+            explorer.activateWindow()
+            parent.log(f"Seat Root: window shown for {seat_hostname}", "INFO")
+        except Exception as e:
+            parent.log(f"Seat Root: show failed: {e}", "ERROR")
+            try:
+                shell.close()
+                jump.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=do_connect, daemon=True).start()
+
+
+def prompt_and_open_seat_root(parent):
+    """Open a root explorer for the currently-selected seat (no picker)."""
+    # seat_port_manager is created by ScrcpyMixin's
+    # _preload_mirror_native_libs (called via QTimer at startup). If the
+    # user clicked too early, retry once instead of erroring out.
+    if not hasattr(parent, 'seat_port_manager'):
+        QTimer.singleShot(500, lambda: prompt_and_open_seat_root(parent))
+        return
+
+    from adb_tool.constants import ADB_SEAT_PORTS_FILE  # noqa: F401
+
+    # Determine the "currently selected" seat. We look at:
+    #   1. The current ADB device (if its transport-id matches a seat)
+    #   2. seat.sh devices (live)
+    #   3. connected_seats (most recently connected)
+    #   4. History file fallback
+    seat = None
+    gateway = None
+
+    # (3) connected_seats — single most recent is the natural "current"
+    connected = getattr(parent.seat_port_manager, 'connected_seats', {}) or {}
+    if connected:
+        # Use the last connected seat (insertion order is preserved in Python 3.7+)
+        seat = next(reversed(list(connected.keys())))
+        gateway = connected[seat]
+
+    # (2) seat.sh devices — prefer live state when available
+    if not seat:
+        try:
+            devices = parent.seat_port_manager.get_devices_from_seat_sh() or []
+            for d in devices:
+                if d.get('seat') and d.get('gateway'):
+                    seat = d['seat']
+                    gateway = d['gateway']
+                    break
+        except Exception:
+            pass
+
+    # (4) History fallback
+    if not seat:
+        try:
+            history = parent.seat_port_manager.load_history('seat') or []
+            if history:
+                h = history[-1]
+                if h.get('seat') and h.get('gateway'):
+                    seat = h['seat']
+                    gateway = h['gateway']
+        except Exception:
+            pass
+
+    if not seat or not gateway:
+        QMessageBox.information(parent, "No Seats Connected",
+                                "Use 'Connect to new seat' first to attach a seat.")
+        return
+
+    # Parse gateway
+    gateway_host = gateway
+    gateway_user = "user"
+    if '@' in gateway:
+        gateway_user, gateway_host = gateway.split('@', 1)
+
+    # Credentials from Keychain
+    creds = CredentialManager()
+    gw_pw = creds.get_password(gateway_host, gateway_user)
+    if not gw_pw:
+        gw_pw = creds.prompt_password(parent, gateway_host, gateway_user)
+        if not gw_pw:
+            return
+
+    # mtc password is global (same across all seats)
+    mtc_pw = creds.get_password("mtc_global", "mtc")
+    if not mtc_pw:
+        mtc_pw, ok2 = QInputDialog.getText(parent, "mtc Password",
+                                            f"Enter the mtc password (used for all seats):",
+                                            QLineEdit.EchoMode.Password)
+        mtc_pw = mtc_pw if ok2 else None
+        if not mtc_pw:
+            return
+
+    parent.update_status(f"Connecting to {seat} as root…")
+    open_seat_root_window(parent, seat, gateway_host, gateway_user, gw_pw, seat, mtc_pw, parent.colors)

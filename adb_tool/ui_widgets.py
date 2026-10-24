@@ -67,22 +67,97 @@ class DeviceFileTableWidget(QTableWidget):
         self.device_id = None
         self.current_path = "/sdcard"
 
+        # Drag-hover overlay (shown when local files are being dragged over the table)
+        self._drag_overlay = None
+
     def set_device_context(self, device_id, path):
         self.device_id = device_id
         self.current_path = path
 
+    def _drag_has_local_files(self, mime):
+        """Return True if the mime data is a local-file drop (not a device-file drag)."""
+        if not mime or not mime.hasUrls():
+            return False
+        for url in mime.urls():
+            if isinstance(url, QUrl) and url.isLocalFile():
+                return True
+        return False
+
+    def _show_drop_overlay(self):
+        if self._drag_overlay is not None:
+            return
+        try:
+            overlay = QLabel(self)
+            overlay.setText("⬆️\nDrop to Upload")
+            overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            overlay.setStyleSheet(
+                "QLabel {"
+                " background-color: rgba(40, 80, 160, 200);"
+                " color: white;"
+                " font-size: 24px;"
+                " font-weight: bold;"
+                " border: 4px dashed rgba(255, 255, 255, 220);"
+                " border-radius: 16px;"
+                " padding: 40px;"
+                "}"
+            )
+            overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            overlay.resize(self.size())
+            overlay.move(0, 0)
+            overlay.raise_()
+            overlay.show()
+            self._drag_overlay = overlay
+        except Exception:
+            self._drag_overlay = None
+
+    def _hide_drop_overlay(self):
+        if self._drag_overlay is None:
+            return
+        try:
+            self._drag_overlay.hide()
+            self._drag_overlay.deleteLater()
+        except Exception:
+            pass
+        finally:
+            self._drag_overlay = None
+
     def dragEnterEvent(self, event):
-        # Accept both file drops from local filesystem and drags from other tables
-        if event.mimeData().hasUrls() or event.mimeData().hasFormat("application/x-device-file"):
+        mime = event.mimeData()
+        # Accept local file drops (uploads)
+        if mime and self._drag_has_local_files(mime):
+            event.acceptProposedAction()
+            self._show_drop_overlay()
+            return
+        # Also accept cross-table device file drags (existing behavior)
+        if mime and mime.hasFormat("application/x-device-file"):
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls() or event.mimeData().hasFormat("application/x-device-file"):
+        mime = event.mimeData()
+        if mime and self._drag_has_local_files(mime):
+            event.acceptProposedAction()
+            return
+        if mime and mime.hasFormat("application/x-device-file"):
             event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):
+        try:
+            self._hide_drop_overlay()
+        except Exception:
+            pass
+        super().dragLeaveEvent(event)
+
+    def resizeEvent(self, event):
+        try:
+            if self._drag_overlay is not None:
+                self._drag_overlay.resize(self.size())
+        except Exception:
+            pass
+        super().resizeEvent(event)
 
     def dropEvent(self, event):
         if event.mimeData().hasUrls():

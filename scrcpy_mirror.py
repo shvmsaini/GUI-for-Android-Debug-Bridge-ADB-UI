@@ -839,12 +839,14 @@ class ScrcpyMirrorWindow(QMainWindow):
     def _log(self, level, msg):
         """Route internal scrcpy logs through the GUI log panel.
 
-        Levels: "DEBUG" | "INFO" | "WARNING" | "ERROR".
-        DEBUG is suppressed unless ``self._scrcpy_verbose`` is True.
-        When no ``log_callback`` was supplied we fall back to ``print`` —
-        INFO/WARNING/ERROR still print (so terminal debugging keeps
-        working), DEBUG is silent.
+        Heavy C++ calls are behind a blanket guard to prevent crashes if
+        the QMainWindow Qt object has been deleted while background threads
+        are still running.
         """
+        # Blanket guard: if the C++/Qt objects have been destroyed, do not touch them.
+        if self._closing:
+            # Avoid any C++ method calls (QObject.isValid()/isVisible() are not safe here).
+            return
         if level == "DEBUG" and not getattr(self, "_scrcpy_verbose", False):
             return
         if self._log_callback is not None:

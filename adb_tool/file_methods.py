@@ -163,10 +163,12 @@ class FileMixin:
         delete_btn = QPushButton("🗑️ Delete")
         mkdir_btn = QPushButton("📁 New Folder…")
         rename_btn = QPushButton("📝 Rename")
+        install_apk_btn = QPushButton("📱 Install APK")
         close_btn = QPushButton("Close")
 
         btn_row.addWidget(upload_btn)
         btn_row.addWidget(download_btn)
+        btn_row.addWidget(install_apk_btn)
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(mkdir_btn)
         btn_row.addWidget(rename_btn)
@@ -606,6 +608,73 @@ class FileMixin:
 
             threading.Thread(target=do_rename, daemon=True).start()
 
+        def install_apk_clicked():
+            """Install APK file(s) directly on the device via `adb install` (no pull, no push)."""
+            items = selected_rows()
+            if not items:
+                QMessageBox.warning(self, "No Selection", "Select one or more .apk files to install.")
+                return
+
+            # Filter to APK files only
+            apk_paths = []
+            for row, display, raw_name, is_dir in items:
+                if is_dir:
+                    continue
+                if display.startswith("[Error]") or display == "Loading…":
+                    continue
+                if not raw_name.lower().endswith('.apk'):
+                    continue
+                apk_paths.append(join_remote(current_path(), raw_name))
+
+            if not apk_paths:
+                QMessageBox.warning(self, "No APK Files", "Selected files must have a .apk extension.")
+                return
+
+            if not self.current_device:
+                QMessageBox.warning(self, "No Device", "Please select a device first")
+                return
+
+            # Use `adb shell pm install` so the device reads the path itself.
+            # This avoids any host-side pull/push and surfaces the system install prompt.
+            base_name = os.path.basename(apk_paths[0]) if apk_paths else 'APK'
+            self.log(f"Installing {len(apk_paths)} APK(s) via pm install…")
+            self.update_status(f"Installing {base_name}…")
+
+            def do_install():
+                successes = []
+                errors = []
+                for idx, apk_path in enumerate(apk_paths, 1):
+                    try:
+                        # Use adb shell pm install so the device handles the file itself.
+                        # Quotes inside the shell command are needed for paths with spaces.
+                        shell_path = shlex.quote(apk_path)
+                        cmd = f"{self.get_device_flag()} shell pm install -r -t {shell_path}"
+                        res = self.adb.run_command(cmd, timeout=120)
+                        stdout = (res.get('stdout') or '').strip()
+                        stderr = (res.get('stderr') or '').strip()
+                        if res['success'] and 'Success' in stdout:
+                            self.log(f"✅ [{idx}/{len(apk_paths)}] {os.path.basename(apk_path)} installed successfully")
+                            successes.append(os.path.basename(apk_path))
+                        else:
+                            err_msg = stderr or stdout or 'Unknown error'
+                            self.log(f"❌ [{idx}/{len(apk_paths)}] {os.path.basename(apk_path)} failed: {err_msg[:200]}", "ERROR")
+                            errors.append(f"{os.path.basename(apk_path)}: {err_msg}")
+                    except Exception as e:
+                        self.log(f"❌ [{idx}/{len(apk_paths)}] Error installing {os.path.basename(apk_path)}: {e}", "ERROR")
+                        errors.append(f"{os.path.basename(apk_path)}: {e}")
+
+                def final_done():
+                    if successes and not errors:
+                        QMessageBox.information(self, "Install Complete", f"Successfully installed {len(successes)} APK(s).")
+                    elif errors and successes:
+                        QMessageBox.warning(self, "Partial Install", f"Installed {len(successes)} APK(s), but failed on {len(errors)}:\n\n" + "• " + "\n• ".join(errors))
+                    elif errors:
+                        QMessageBox.critical(self, "Install Failed", "All installations failed:\n\n" + "• " + "\n• ".join(errors))
+                    self.update_status("Installation complete")
+                ui.call.emit(final_done)
+
+            threading.Thread(target=do_install, daemon=True).start()
+
         # Wire events
         close_btn.clicked.connect(explorer.accept)
         refresh_btn.clicked.connect(refresh_listing)
@@ -613,6 +682,7 @@ class FileMixin:
         listbox.cellDoubleClicked.connect(on_double_click)
         upload_btn.clicked.connect(upload_clicked)
         download_btn.clicked.connect(download_clicked)
+        install_apk_btn.clicked.connect(install_apk_clicked)
         delete_btn.clicked.connect(delete_clicked)
         mkdir_btn.clicked.connect(mkdir_clicked)
         rename_btn.clicked.connect(rename_clicked)

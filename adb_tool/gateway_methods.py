@@ -654,9 +654,36 @@ class GatewayMixin:
             self.log(f"Gateway: uploading {len(local_paths)} item(s) to {dest_dir}…")
             self.update_status("Uploading…")
 
+            # Pre-compute total size for progress dialog
+            total_bytes = [0]
+            def compute_total():
+                total = 0
+                for lp in local_paths:
+                    total += _local_size(lp)
+                total_bytes[0] = total
+            threading.Thread(target=compute_total, daemon=True).start()
+
+            # Create progress dialog (no Cancel button, user opted for real % bar)
+            progress = QProgressDialog(f"Uploading…", None, 0, 100, explorer)
+            progress.setWindowTitle("Uploading")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(500)
+            progress.setValue(0)
+            progress.setCancelButton(None)  # No cancel button
+
             def do_upload():
                 ok = 0
                 failed = 0
+                bytes_done = [0]
+
+                def _upload_with_progress(local_path, remote_path, is_dir, cb=None):
+                    """Upload a file or directory with optional progress callback."""
+                    if is_dir:
+                        # Recursive upload of a folder
+                        self._sftp_upload_dir(sftp, local_path, remote_path, cb)
+                    else:
+                        sftp.put(local_path, remote_path, callback=cb)
+
                 for lp in local_paths:
                     if not os.path.exists(lp):
                         failed += 1
@@ -664,18 +691,25 @@ class GatewayMixin:
                     remote_target = join_remote(dest_dir, os.path.basename(lp.rstrip(os.sep)))
                     if not remote_target.startswith('/'):
                         remote_target = '/' + remote_target
+                    is_dir = os.path.isdir(lp)
+                    file_total = _local_size(lp)
+
+                    def file_cb(transferred, _total=file_total, _bytes=bytes_done, _name=os.path.basename(lp)):
+                        _bytes[0] += transferred
+                        pct = (100 * _bytes[0] // total_bytes[0]) if total_bytes[0] else 0
+                        ui.call.emit(lambda p=pct, n=_name: progress.setValue(p) or progress.setLabelText(f"Uploading {n}…"))
                     try:
-                        if os.path.isdir(lp):
-                            # Recursive upload of a folder
-                            self._sftp_upload_dir(sftp, lp, remote_target)
-                        else:
-                            sftp.put(lp, remote_target)
+                        _upload_with_progress(lp, remote_target, is_dir, file_cb)
                         ok += 1
                     except Exception as e:
                         failed += 1
                         self.log(f"Gateway upload failed for {lp}: {e}", "ERROR")
 
                 def done():
+                    try:
+                        progress.close()
+                    except Exception:
+                        pass
                     self.update_status("Upload complete")
                     if ok > 0:
                         refresh_listing()
@@ -688,7 +722,7 @@ class GatewayMixin:
 
             threading.Thread(target=do_upload, daemon=True).start()
 
-        def _sftp_upload_dir(sftp, local_dir, remote_dir):
+        def _sftp_upload_dir(sftp, local_dir, remote_dir, callback=None):
             """Recursively upload a local directory via SFTP."""
             # Ensure remote dir exists
             try:
@@ -699,9 +733,13 @@ class GatewayMixin:
                 local_path = os.path.join(local_dir, entry)
                 remote_path = remote_dir.rstrip('/') + '/' + entry
                 if os.path.isdir(local_path):
-                    _sftp_upload_dir(sftp, local_path, remote_path)
+                    _sftp_upload_dir(sftp, local_path, remote_path, callback)
                 else:
-                    sftp.put(local_path, remote_path)
+                    file_total = os.path.getsize(local_path)
+                    def file_cb(transferred, _total=file_total, _callback=callback):
+                        if _callback:
+                            _callback(transferred, _total)
+                    sftp.put(local_path, remote_path, callback=file_cb)
 
         def upload_clicked():
             files, _ = QFileDialog.getOpenFileNames(explorer, "Select file(s) to upload")
@@ -806,6 +844,22 @@ class GatewayMixin:
             except Exception:
                 return 0
 
+        def _local_size(path):
+            """Return total size of a local path. Sum of all files for dirs."""
+            try:
+                if os.path.isfile(path):
+                    return os.path.getsize(path)
+                total = 0
+                for root, _dirs, files in os.walk(path):
+                    for f in files:
+                        try:
+                            total += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+                return total
+            except Exception:
+                return 0
+
         def _sftp_download_dir(sftp, remote_dir, local_dir):
             """Recursively download a remote directory via SFTP."""
             os.makedirs(local_dir, exist_ok=True)
@@ -878,12 +932,24 @@ class GatewayMixin:
             else:
                 sftp.remove(path)
 
-        def _sftp_download_to_seat(remote_path, local_temp_dir):
-            """Download the identified file from the gateway and send it to the connected seat device."""
+        def _sftp_download_to_seat(remote_path, local_temp_dir, progress_callback=None):
+            """Download the identified file from the gateway and send it to the connected seat device.
+
+            Args:
+                remote_path: Path on gateway to download
+                local_temp_dir: Temporary directory to store the file
+                progress_callback: Optional func(transferred, total_bytes) for SFTP phase.
+                                   Will also be called with (total, total) to signal adb push phase.
+            """
             # First pull via SFTP to a local temp dir
             ensure_dir(local_temp_dir)
             local_file = os.path.join(local_temp_dir, os.path.basename(remote_path))
-            sftp.get(remote_path, local_file)
+            # Get file size for progress reporting
+            file_size = _sftp_size(sftp, remote_path, is_dir=False)
+            sftp.get(remote_path, local_file, callback=progress_callback)
+            # Signal transition to adb push phase
+            if progress_callback:
+                progress_callback(file_size, file_size)
             # Then push to seat using ADB (use currently selected device)
             try:
                 device_id = getattr(self, 'current_device', None)
@@ -894,7 +960,7 @@ class GatewayMixin:
                 if not device_id:
                     return False, "No connected device"
                 cmd = f"-s {device_id} push {shlex.quote(local_file)} {shlex.quote('/sdcard/')}"
-                result = self.adb.run_command(cmd)
+                result = self.adb.run_command(cmd, timeout=300)
                 return result['success'], result['stderr']
             finally:
                 try:
@@ -920,10 +986,35 @@ class GatewayMixin:
             self.log(f"Gateway: copying {raw_name} to seat device…", "INFO")
             self.update_status("Copy to Seat…")
             self.log(f"Gateway: current_device={getattr(self, 'current_device', None)}", "DEBUG")
+
+            # Get file size for progress dialog
+            file_size = _sftp_size(sftp, remote_path, is_dir=False)
+            phase = ["sftp"]  # Track which phase we're in: 'sftp' or 'push'
+
+            progress = QProgressDialog(f"Downloading from gateway…", None, 0, 100, explorer)
+            progress.setWindowTitle("Copy to Seat")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(500)
+            progress.setValue(0)
+            progress.setCancelButton(None)
+
+            def progress_cb(transferred, total):
+                # When transferred == total, we're transitioning to the 'push' phase
+                if transferred == total:
+                    phase[0] = "push"
+                    ui.call.emit(lambda: progress.setLabelText("Pushing to seat device…"))
+                else:
+                    pct = (100 * transferred // total) if total else 0
+                    ui.call.emit(lambda p=pct: progress.setValue(p))
+
             def do_copy():
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    ok, err = _sftp_download_to_seat(remote_path, tmpdir)
+                    ok, err = _sftp_download_to_seat(remote_path, tmpdir, progress_cb)
                     def done():
+                        try:
+                            progress.close()
+                        except Exception:
+                            pass
                         self.update_status("Copy complete" if ok else "Copy failed")
                         if ok:
                             self.log("Gateway: Copy-to-Seat succeeded", "INFO")

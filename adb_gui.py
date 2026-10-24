@@ -445,6 +445,9 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         )
         gateway_btn.clicked.connect(self.open_gateway_explorer)
         gateway_group_layout.addWidget(gateway_btn)
+
+        # Seat Root Explorer - browse system directories on seat over SSH
+        self._setup_seat_root_button(gateway_group_layout, self.colors)
         ops_layout.addWidget(gateway_group)
 
         # File operations
@@ -2899,6 +2902,49 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         
         # Show dialog
         dialog.exec()
+
+    def _setup_seat_root_button(self, layout, colors):
+        """Add Seat Root Explorer button to gateway group."""
+        seat_root_btn = QPushButton("🛡️ Seat Root Explorer")
+        seat_root_btn.setToolTip(
+            "Browse system directories on the seat as root (requires gateway + mtc access).\n"
+            "Use 'Connect to new seat' first. All mtc passwords are saved after first use."
+        )
+        seat_root_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {colors['card_bg']};
+                color: {colors['fg']};
+                border: 1px solid {colors['border']};
+                padding: 8px 12px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {colors['accent']};
+                color: white;
+            }}
+        """)
+        seat_root_btn.clicked.connect(self._open_seat_root_explorer)
+        layout.addWidget(seat_root_btn)
+
+    def _open_seat_root_explorer(self):
+        """Open the seat root explorer dialog."""
+        try:
+            from seat_root_explorer import prompt_and_open_seat_root
+            prompt_and_open_seat_root(self)
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "Not Available",
+                "Seat Root Explorer requires the seat_root_explorer.py module.\n"
+                "Please ensure it is in the application directory."
+            )
+        except Exception as e:
+            self.log(f"Seat Root Explorer failed: {e}", "ERROR")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to open Seat Root Explorer:\n{e}"
+            )
 
 
 def _write_crash_report(exc_type, exc_value, exc_tb, source="main"):

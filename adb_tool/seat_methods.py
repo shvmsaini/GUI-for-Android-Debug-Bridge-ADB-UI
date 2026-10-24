@@ -15,8 +15,10 @@ from subprocess import TimeoutExpired
 
 try:
     import paramiko
+    from paramiko.proxy import ProxyCommand
 except ImportError:
     paramiko = None  # _install_adb_key_on_seat logs a friendly error if it's called
+    ProxyCommand = None
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
 from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -139,17 +141,28 @@ class _ProxySocket:
         self._proc = proc
         self._in = proc.stdout
         self._out = proc.stdin
-        self.settimeout = lambda *_a, **_k: None
-        self.gettimeout = lambda *_a, **_k: None
-        self.setblocking = lambda *_a, **_k: None
+        self._timeout = None  # None = blocking, otherwise float seconds
+        self.settimeout = self._set_timeout
+        self.gettimeout = lambda: self._timeout
+        self.setblocking = lambda block: self._set_timeout(None if block else 0.0)
         self.family = socket.AF_INET
         self.type = socket.SOCK_STREAM
         self.proto = 0
 
+    def _set_timeout(self, t):
+        self._timeout = t
+
     def recv(self, n):
+        # Non-blocking path with explicit timeout, so the socket doesn't
+        # hang forever if the ProxyCommand tunnel dies mid-handshake.
+        if self._timeout is not None:
+            import select as _sel
+            ready, _, _ = _sel.select([self._in], [], [], self._timeout)
+            if not ready:
+                raise socket.timeout(f"ProxyCommand recv timed out after {self._timeout}s")
         data = self._in.read(n)
         if not data:
-            return b""
+            raise EOFError("ProxyCommand tunnel closed (EOF)")
         return data
 
     def send(self, data):
@@ -182,22 +195,24 @@ class _ProxySocket:
 class _SeatJumpHost:
     """One SSH connection to the jump host (e.g. user@gateway).
 
-    Honours ``~/.ssh/config`` for ``ProxyCommand`` (and ``User``/``Port``
-    overrides) so hosts that only reach the network through an HTTPS tunnel
-    (e.g. ``ProxyCommand openssl s_client ...`` for ``*.vrack``) work the
-    same way they do from the ``ssh`` CLI.
+    Uses the system ``ssh`` CLI via subprocess + ``SSH_ASKPASS`` so the
+    native ssh handles ProxyCommand / SSL tunnels / jump hosts the same
+    way as your terminal. ``paramiko`` cannot talk through ``openssl
+    s_client`` (it stalls waiting for the SSL handshake to complete),
+    so we drive ssh directly and surface its PTY as a ``_SeatShell``.
+
+    Honours ``~/.ssh/config`` for ``User`` / ``Port`` (we don't need to
+    parse ProxyCommand here — ssh itself reads it).
     """
 
     def __init__(self, ssh_host, password, log):
-        if paramiko is None:
-            raise _SeatSshError(
-                "paramiko is not installed. Run `pip install paramiko` to "
-                "enable the 'Install ADB keys on seat' flow."
-            )
+        if not password:
+            raise _SeatSshError("SSH password is required.")
+
         user, host, port = _parse_ssh_host(ssh_host)
 
-        # Merge in ~/.ssh/config for this host (User/Port/ProxyCommand).
-        cfg_user, cfg_host, cfg_port, proxy_cmd = _lookup_ssh_config(host)
+        # Merge in ~/.ssh/config for User/Port (skip ProxyCommand — ssh uses it natively).
+        cfg_user, cfg_host, cfg_port, _proxy = _lookup_ssh_config(host)
         if cfg_user and not user:
             user = cfg_user
         if cfg_host:
@@ -205,117 +220,211 @@ class _SeatJumpHost:
         if cfg_port and port == 22:
             port = cfg_port
 
-        log(f"SSH: connecting to {user}@{host}:{port}"
-            + (" via ProxyCommand" if proxy_cmd else "") + "...")
+        log(f"SSH: connecting to {user}@{host}:{port} (via system ssh)...")
 
-        sock = None
-        proxy_proc = None
+        # Create a temp file holding the password, plus a tiny askpass script
+        # so ssh can read the password non-interactively. We use SSH_ASKPASS
+        # (not sshpass) to avoid the "sshpass kills backgrounded tunnels"
+        # bug — the askpass program is invoked per-prompt and exits cleanly.
+        askpass_file = None
+        pw_file = None
+        proc = None
         try:
-            if proxy_cmd:
-                cmd = proxy_cmd
-                cmd = cmd.replace("%h", host)
-                cmd = cmd.replace("%p", str(port))
-                cmd = cmd.replace("%r", user or "")
-                proxy_proc = subprocess.Popen(
-                    shlex.split(cmd),
-                    stdout=subprocess.PIPE,
-                    stdin=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                sock = _ProxySocket(proxy_proc)
-            else:
-                try:
-                    sock = socket.create_connection((host, port), timeout=10)
-                except OSError as e:
-                    raise _SeatSshError(
-                        f"Cannot reach {host}:{port} ({e}). "
-                        "Are you on the VPN/network?"
-                    )
+            pw_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_gui_pw_"
+            )
+            pw_file.write(password)
+            pw_file.close()
+            os.chmod(pw_file.name, 0o600)
 
-            self.t = paramiko.Transport(sock)
-            self.t.banner_timeout = 15
-            self.t.start_client(timeout=15)
-            self.t.auth_timeout = 20
-            try:
-                self._auth(user, password, log)
-            except Exception:
-                try:
-                    self.t.close()
-                except Exception:
-                    pass
-                raise
-            self.t.set_keepalive(20)
-            self._proxy_proc = proxy_proc
-            log(f"SSH: connected to {user}@{host}")
+            askpass_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_gui_askpass_", suffix=".sh"
+            )
+            askpass_file.write(
+                "#!/bin/sh\n"
+                f"cat '{pw_file.name}'\n"
+            )
+            askpass_file.close()
+            os.chmod(askpass_file.name, 0o700)
+
+            # Build the ssh command. -tt forces a tty so sudo later can
+            # read passwords from the remote tty. -o BatchMode=yes would
+            # break interactive prompts, so we leave it off and rely on
+            # SSH_ASKPASS / DISPLAY=None for non-interactive password.
+            ssh_cmd = [
+                "ssh",
+                "-tt",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", f"ConnectTimeout=15",
+                "-p", str(port),
+                f"{user}@{host}",
+            ]
+
+            env = os.environ.copy()
+            env["SSH_ASKPASS"] = askpass_file.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = ":0"  # required for SSH_ASKPASS to fire on macOS
+            # Strip any sshpass-related vars that might confuse ssh.
+            env.pop("SSHPASS", None)
+
+            log(f"SSH: launching: {' '.join(ssh_cmd)}")
+            proc = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                bufsize=0,
+            )
+
+            # Quick connectivity check: wait briefly for the banner /
+            # password prompt to appear on stderr or stdout. If the
+            # connection fails fast (DNS, ProxyCommand rejected), we
+            # can fail here instead of waiting forever.
+            import select as _sel
+            ready, _, _ = _sel.select(
+                [proc.stdout, proc.stderr], [], [], 15
+            )
+            if proc.poll() is not None:
+                err = (proc.stderr.read() or b"").decode("utf-8", "replace")
+                raise _SeatSshError(
+                    f"ssh exited with code {proc.returncode} before banner: {err.strip()[:300]}"
+                )
+            if not ready:
+                # Still alive after 15s, assume connection in progress
+                log("SSH: ssh is still connecting (no banner in 15s)...", "DEBUG")
+
+            # Build a fake "Transport" interface so the rest of the code
+            # (which uses .open_session + .get_pty + .invoke_shell)
+            # can keep working unchanged.
+            self._proc = proc
+            self._askpass_file = askpass_file.name
+            self._pw_file = pw_file.name
+
+            log(f"SSH: connected to {user}@{host} (subprocess pid={proc.pid})")
         except _SeatSshError:
-            if proxy_proc:
-                try:
-                    proxy_proc.kill()
-                except Exception:
-                    pass
+            self._cleanup_proc(proc, askpass_file, pw_file)
             raise
         except Exception as e:
-            if proxy_proc:
-                try:
-                    proxy_proc.kill()
-                except Exception:
-                    pass
+            self._cleanup_proc(proc, askpass_file, pw_file)
             raise _SeatSshError(f"SSH connection failed: {e}")
 
-    def _auth(self, user, password, log):
-        if not password:
-            raise _SeatSshError("SSH password is required.")
-        # Try password first, then keyboard-interactive (some jump hosts
-        # only accept the latter even when they advertise password).
-        try:
-            self.t.auth_password(user, password)
-            return
-        except paramiko.BadAuthenticationType as e:
-            if "keyboard-interactive" in e.allowed_types:
-                try:
-                    self.t.auth_interactive(
-                        user,
-                        lambda _t, _i, prompts: [password] * len(prompts),
-                    )
-                    return
-                except paramiko.AuthenticationException:
-                    pass
-        except paramiko.AuthenticationException:
+    def _cleanup_proc(self, proc, askpass_file, pw_file):
+        """Kill the ssh subprocess and remove temp files."""
+        if proc is not None:
             try:
-                self.t.auth_interactive(
-                    user,
-                    lambda _t, _i, prompts: [password] * len(prompts),
-                )
-                return
+                proc.kill()
             except Exception:
                 pass
-        raise _SeatSshError(
-            "SSH authentication failed. Check user@host and password."
-        )
+        for f in (askpass_file, pw_file):
+            if f:
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
 
     @property
     def active(self):
-        return self.t.is_active()
+        proc = getattr(self, "_proc", None)
+        return proc is not None and proc.poll() is None
 
     def shell(self):
-        ch = self.t.open_session(timeout=15)
-        ch.get_pty(width=200, height=50)
-        ch.invoke_shell()
-        return _SeatShell(ch)
+        """Return a ``_SeatShell`` backed by the ssh subprocess pipes.
+
+        The process was started with ``-tt``, so its stdin/stdout are
+        a tty on the remote side — exactly what ``_SeatShell.run``
+        expects (it writes ``cmd\\n`` and reads back responses).
+        """
+        proc = getattr(self, "_proc", None)
+        if proc is None:
+            raise _SeatSshError("SSH connection is not open")
+        if proc.poll() is not None:
+            err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+            raise _SeatSshError(
+                f"SSH subprocess exited with code {proc.returncode}: {err[:300]}"
+            )
+        # Wrap the subprocess's stdin/stdout/stderr in a channel-like
+        # object so ``_SeatShell`` works unchanged.
+        return _SeatShell(_ProcChannel(proc))
 
     def close(self):
-        t = getattr(self, "t", None)
-        if t is not None:
+        proc = getattr(self, "_proc", None)
+        if proc is not None:
             try:
-                t.close()
+                proc.kill()
             except Exception:
                 pass
-        proxy = getattr(self, "_proxy_proc", None)
-        if proxy:
+        for attr in ("_askpass_file", "_pw_file"):
+            f = getattr(self, attr, None)
+            if f:
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+
+class _ProcChannel:
+    """Adapter that lets ``_SeatShell`` drive a subprocess as if it were
+    a paramiko Channel. Exposes the methods ``_SeatShell`` actually
+    uses: ``recv_ready``, ``recv``, ``send``, ``close``.
+    """
+
+    def __init__(self, proc):
+        self._proc = proc
+        self._stdout = proc.stdout
+
+    def recv_ready(self):
+        import select as _sel
+        r, _, _ = _sel.select([self._stdout], [], [], 0)
+        return bool(r)
+
+    def recv(self, n):
+        # Non-blocking-ish: paramiko's Channel.recv returns whatever is
+        # buffered (up to n bytes), empty bytes only if the channel is
+        # closed. subprocess.Popen.stdout.read(n) blocks, so we wrap
+        # it with a poll-check: if the process exited, return empty.
+        if self._proc.poll() is not None:
+            return b""
+        # Use select with a reasonable timeout. The shell uses recv_ready
+        # as a polling check, so a 0.1s timeout on recv keeps things
+        # responsive. For longer reads we accumulate.
+        import select as _sel
+        r, _, _ = _sel.select([self._stdout], [], [], 0.1)
+        if not r:
+            return b""
+        # read1 only exists on BufferedIOBase, not raw FileIO. The
+        # Popen stdout pipe is BufferedReader in practice, but be
+        # defensive: fall back to read() if read1 isn't available.
+        reader = getattr(self._stdout, "read1", None)
+        if reader is not None:
             try:
-                proxy.kill()
-            except Exception:
-                pass
+                data = reader(n)
+            except (ValueError, OSError):
+                data = b""
+        else:
+            try:
+                data = self._stdout.read(n)
+            except (ValueError, OSError):
+                data = b""
+        return data or b""
+
+    def send(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8", "replace")
+        try:
+            self._proc.stdin.write(data)
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return 0
+        return len(data)
+
+    def close(self):
+        try:
+            self._proc.stdin.close()
+        except Exception:
+            pass
 
 
 class _SeatShell:
@@ -326,8 +435,15 @@ class _SeatShell:
         self.buf = ""
 
     def _pull(self):
-        if self.chan.recv_ready():
-            self.buf += self.chan.recv(65536).decode("utf-8", "replace")
+        # Always try to drain any buffered data. recv() is non-blocking
+        # (it uses a 0.1s select timeout internally and returns b""
+        # if nothing is ready), so this won't hang even if no data is
+        # available. We don't rely solely on recv_ready() because the
+        # subprocess pipe can have data buffered from earlier that
+        # recv_ready() doesn't surface.
+        data = self.chan.recv(65536)
+        if data:
+            self.buf += data.decode("utf-8", "replace")
             return True
         return False
 
