@@ -2,7 +2,6 @@ import os
 import sys
 import subprocess
 import threading
-import time
 import shlex
 from datetime import datetime
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
@@ -128,29 +127,6 @@ class FileMixin:
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # Root mode toggle
-        root_row = QHBoxLayout()
-        root_cb = QCheckBox("🔒 Root Mode")
-        root_cb.setChecked(False)
-        root_cb.setToolTip("Require root privileges to list/modify protected directories like /var, /data, /etc")
-        root_cb.setStyleSheet("QCheckBox { font-size: 11pt; } QCheckBox::indicator { width: 20px; height: 20px; }")
-        root_row.addWidget(root_cb)
-        root_row.addStretch()
-        revert_btn = QPushButton("👤 Revert to user")
-        revert_btn.setVisible(False)
-        root_row.addWidget(revert_btn)
-        layout.addLayout(root_row)
-
-        # Toggle root mode and button visibility
-        root_cb.stateChanged.connect(lambda state: (
-            revert_btn.setVisible(state == Qt.CheckState.Checked.value),
-            root_flag.__setitem__(0, state == Qt.CheckState.Checked.value)
-        ))
-        revert_btn.clicked.connect(lambda: (
-            root_cb.setChecked(False),
-            root_flag.__setitem__(0, False)
-        ))
-
         # File list (use DeviceFileTableWidget to support drag-and-drop file uploads)
         listbox = DeviceFileTableWidget()
         listbox.set_device_context(device_id, "/sdcard")
@@ -204,9 +180,7 @@ class FileMixin:
                 selected.append((row, display, raw, is_dir))
             return selected
 
-        # Root mode state
-        root_flag = [False]  # mutable list so inner scopes can update it
-
+        # File listing
         def refresh_listing():
             p = current_path()
             listbox.setRowCount(0)
@@ -227,21 +201,8 @@ class FileMixin:
                         'else echo "$f"; fi; '
                         "done"
                     )
-                    if root_flag[0]:
-                        basic_cmd = f'{self.get_device_flag()} shell sh -c {sh_quote(script)} sh {p}'
-                        self.adb.run_command(f"{self.get_device_flag()} root")
-                        time.sleep(1)
-                        res = self.adb.run_command(basic_cmd)
-                        if res and not res.get("success"):
-                            stderr = (res.get("stderr", "") + res.get("stdout", "")).lower()
-                            if "permission denied" in stderr or "denied" in stderr:
-                                su_check = self.adb.run_command(f"{self.get_device_flag()} shell which su")
-                                if su_check and su_check.get("success") and su_check.get("stdout"):
-                                    full_cmd = f'{self.get_device_flag()} shell su -c {sh_quote(basic_cmd)}'
-                                    res = self.adb.run_command(full_cmd)
-                    else:
-                        cmd = f'{self.get_device_flag()} shell sh -c {sh_quote(script)} sh {p}'
-                        res = self.adb.run_command(cmd)
+                    cmd = f'{self.get_device_flag()} shell sh -c {sh_quote(script)} sh {p}'
+                    res = self.adb.run_command(cmd)
 
                     def apply():
                         listbox.setRowCount(0)
@@ -527,7 +488,7 @@ class FileMixin:
                 failed = 0
                 for t in targets:
                     # rm -rf handles both files and dirs
-                    cmd = f"{self.get_device_flag()} shell {'su -c ' if root_flag[0] else ''}rm -rf {sh_quote(t)}"
+                    cmd = f"{self.get_device_flag()} shell rm -rf {sh_quote(t)}"
                     res = self.adb.run_command(cmd)
                     if res["success"]:
                         ok += 1
@@ -552,8 +513,7 @@ class FileMixin:
             self.update_status("Creating folder…")
 
             def do_mkdir():
-                # Respect root mode if enabled
-                cmd = f"{self.get_device_flag()} shell {'su -c ' if root_flag[0] else ''}mkdir -p {sh_quote(dest)}"
+                cmd = f"{self.get_device_flag()} shell mkdir -p {sh_quote(dest)}"
                 res = self.adb.run_command(cmd)
                 if res["success"]:
                     ui.call.emit(refresh_listing)
@@ -594,7 +554,7 @@ class FileMixin:
             self.update_status("Renaming…")
 
             def do_rename():
-                cmd = f"{self.get_device_flag()} shell {'su -c ' if root_flag[0] else ''}mv -f {sh_quote(old_path)} {sh_quote(new_path)}"
+                cmd = f"{self.get_device_flag()} shell mv -f {sh_quote(old_path)} {sh_quote(new_path)}"
                 res = self.adb.run_command(cmd)
                 if res["success"]:
                     ui.call.emit(refresh_listing)
