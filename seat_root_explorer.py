@@ -191,10 +191,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         top_row.addWidget(refresh_btn)
         layout.addLayout(top_row)
 
-        status = QLabel("🔐 ROOT ACCESS — modifications affect system directories")
-        status.setStyleSheet(f"color: brown; font-weight: bold;")
-        layout.addWidget(status)
-
         listbox = DeviceFileTableWidget()
         listbox.set_device_context(f"seat_root:{seat_hostname}", "/")
         layout.addWidget(listbox, 1)
@@ -779,7 +775,7 @@ def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
     # Parse the entered string or selected label format: "seat → gateway"
     seat = None
     gateway = None
-    parts = text.split('→') if '→' in text else None
+    parts = text.split('←') if '←' in text else None
     if parts and len(parts) == 2:
         seat = parts[0].strip()
         gateway = parts[1].strip()
