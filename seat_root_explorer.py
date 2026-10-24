@@ -26,7 +26,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QLineEdit, QFileDialog, QMessageBox, QTableWidgetItem, QInputDialog,
-    QTextEdit
+    QTextEdit, QComboBox, QDialogButtonBox, QCompleter, QSizePolicy
 )
 from PyQt6.QtGui import QFont
 
@@ -607,11 +607,17 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         explorer.finished.connect(on_close)
 
         try:
-            refresh_listing()
+            # Show the window IMMEDIATELY before starting the SSH file listing.
+            # The listing can take several seconds (SSH round-trip to gateway →
+            # seat, running ls, transferring output). We don't want to block
+            # the GUI thread during that time — the user should see the
+            # explorer right away with a "Loading…" placeholder.
             explorer.show()
             explorer.raise_()
             explorer.activateWindow()
             parent.log(f"Seat Root: window shown for {seat_hostname}", "INFO")
+            # Now kick off the file listing in the background.
+            refresh_listing()
         except Exception as e:
             parent.log(f"Seat Root: show failed: {e}", "ERROR")
             try:
@@ -623,8 +629,194 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
     threading.Thread(target=do_connect, daemon=True).start()
 
 
+def _gather_seat_and_gateway_options(parent):
+    """Build (default_seat, default_gateway, seat_options, gateway_options)
+    for the picker dialog.
+
+    Seat options: live seats (connected_seats + seat.sh devices) merged with
+    history, deduplicated. Sorted so live entries come first.
+    Gateway options: all distinct gateways seen in seat.sh + history, each
+    rendered as ``user@host``.
+    """
+    spm = parent.seat_port_manager
+
+    # Live seat names (preserve insertion order so most-recent comes first).
+    live_seats = []
+    seen_seats = set()
+    connected = getattr(spm, 'connected_seats', {}) or {}
+    for seat_name, gw in connected.items():
+        if seat_name and seat_name not in seen_seats:
+            live_seats.append(seat_name)
+            seen_seats.add(seat_name)
+    try:
+        for d in (spm.get_devices_from_seat_sh() or []):
+            s = d.get('seat')
+            if s and s not in seen_seats:
+                live_seats.append(s)
+                seen_seats.add(s)
+    except Exception:
+        pass
+
+    # History seat names (filter to those not already live).
+    history_seats = []
+    try:
+        history = spm.get_top_entries('seat', 1000) or []
+    except Exception:
+        history = []
+    for entry in history:
+        s = entry.get('seat')
+        if s and s not in seen_seats:
+            history_seats.append(s)
+            seen_seats.add(s)
+
+    seat_options = live_seats + history_seats
+
+    # Gateway options: every distinct gateway (user@host) we've seen, live first.
+    live_gateways = []
+    seen_gateways = set()
+    for gw in connected.values():
+        if gw and gw not in seen_gateways:
+            live_gateways.append(gw)
+            seen_gateways.add(gw)
+    try:
+        for d in (spm.get_devices_from_seat_sh() or []):
+            gw = d.get('gateway')
+            if gw and gw not in seen_gateways:
+                live_gateways.append(gw)
+                seen_gateways.add(gw)
+    except Exception:
+        pass
+
+    history_gateways = []
+    for entry in history:
+        gw = entry.get('gateway')
+        if gw and gw not in seen_gateways:
+            history_gateways.append(gw)
+            seen_gateways.add(gw)
+    gateway_options = live_gateways + history_gateways
+
+    # Pick the defaults: most recently connected seat (or last history entry),
+    # and its gateway. If the seat has no matching gateway in the options,
+    # fall back to whatever gateway is associated with it.
+    default_seat = None
+    default_gateway = None
+
+    for seat_name in seat_options:
+        gw = connected.get(seat_name)
+        if gw:
+            default_seat = seat_name
+            default_gateway = gw
+            break
+
+    if not default_seat and history:
+        # Most recent history entry (already sorted desc by timestamp).
+        h = history[0]
+        default_seat = h.get('seat')
+        default_gateway = h.get('gateway')
+
+    # Make sure defaults are present in their option lists so the combobox
+    # can preselect them.
+    if default_seat and default_seat not in seat_options:
+        seat_options.insert(0, default_seat)
+    if default_gateway and default_gateway not in gateway_options:
+        gateway_options.insert(0, default_gateway)
+
+    return default_seat, default_gateway, seat_options, gateway_options
+
+
+def _ask_seat_and_gateway(parent, default_seat, default_gateway,
+                          seat_options, gateway_options):
+    """Show a small dialog with two typeable dropdowns.
+
+    Returns (seat, gateway) on accept, or (None, None) on cancel.
+    """
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Seat Root Explorer")
+    dialog.setMinimumWidth(480)
+    dialog.setModal(True)
+
+    layout = QVBoxLayout(dialog)
+    layout.setSpacing(10)
+    layout.setContentsMargins(12, 12, 12, 12)
+
+    hint = QLabel(
+        "Pick or type a seat and its gateway. Both fields autocomplete from "
+        "previous connections."
+    )
+    hint.setWordWrap(True)
+    hint.setStyleSheet("color: gray; font-size: 9pt;")
+    layout.addWidget(hint)
+
+    # Seat (IP / hostname)
+    layout.addWidget(QLabel("Seat IP / hostname:"))
+    seat_combo = QComboBox()
+    seat_combo.setEditable(True)
+    seat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    seat_combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding,
+                                         QSizePolicy.Policy.Fixed))
+    seat_combo.addItems(seat_options)
+    if default_seat:
+        idx = seat_combo.findText(default_seat)
+        if idx >= 0:
+            seat_combo.setCurrentIndex(idx)
+        else:
+            seat_combo.setEditText(default_seat)
+    seat_completer = QCompleter(seat_options)
+    seat_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    seat_combo.setCompleter(seat_completer)
+    layout.addWidget(seat_combo)
+
+    # Gateway
+    layout.addWidget(QLabel("Gateway (user@host):"))
+    gw_combo = QComboBox()
+    gw_combo.setEditable(True)
+    gw_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    gw_combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding,
+                                       QSizePolicy.Policy.Fixed))
+    gw_combo.addItems(gateway_options)
+    if default_gateway:
+        idx = gw_combo.findText(default_gateway)
+        if idx >= 0:
+            gw_combo.setCurrentIndex(idx)
+        else:
+            gw_combo.setEditText(default_gateway)
+    gw_completer = QCompleter(gateway_options)
+    gw_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    gw_combo.setCompleter(gw_completer)
+    layout.addWidget(gw_combo)
+
+    layout.addStretch()
+
+    button_box = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Connect")
+    button_box.accepted.connect(dialog.accept)
+    button_box.rejected.connect(dialog.reject)
+    layout.addWidget(button_box)
+
+    # Focus the seat field and let Enter submit.
+    seat_combo.setFocus()
+    seat_combo.lineEdit().setPlaceholderText("e.g., 172.17.132.2 or ac-541-1241")
+    gw_combo.lineEdit().setPlaceholderText("e.g., user@gateway.example.com")
+
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None, None
+
+    seat = seat_combo.currentText().strip()
+    gateway = gw_combo.currentText().strip()
+    if not seat or not gateway:
+        return None, None
+    return seat, gateway
+
+
 def prompt_and_open_seat_root(parent):
-    """Open a root explorer for the currently-selected seat (no picker)."""
+    """Open a root explorer. Asks the user to pick/type seat + gateway first.
+
+    The defaults are pre-selected from the currently-connected seat (or the
+    most recently used seat). The user can change either field, or type a
+    brand-new seat IP / gateway — both fields autocomplete from history.
+    """
     # seat_port_manager is created by ScrcpyMixin's
     # _preload_mirror_native_libs (called via QTimer at startup). If the
     # user clicked too early, retry once instead of erroring out.
@@ -632,50 +824,22 @@ def prompt_and_open_seat_root(parent):
         QTimer.singleShot(500, lambda: prompt_and_open_seat_root(parent))
         return
 
-    from adb_tool.constants import ADB_SEAT_PORTS_FILE  # noqa: F401
+    default_seat, default_gateway, seat_options, gateway_options = (
+        _gather_seat_and_gateway_options(parent)
+    )
 
-    # Determine the "currently selected" seat. We look at:
-    #   1. The current ADB device (if its transport-id matches a seat)
-    #   2. seat.sh devices (live)
-    #   3. connected_seats (most recently connected)
-    #   4. History file fallback
-    seat = None
-    gateway = None
+    if not seat_options and not gateway_options:
+        QMessageBox.information(
+            parent, "No Seat History",
+            "No previous seat connections found.\n\n"
+            "Use 'Connect to new seat' first to attach a seat."
+        )
+        return
 
-    # (3) connected_seats — single most recent is the natural "current"
-    connected = getattr(parent.seat_port_manager, 'connected_seats', {}) or {}
-    if connected:
-        # Use the last connected seat (insertion order is preserved in Python 3.7+)
-        seat = next(reversed(list(connected.keys())))
-        gateway = connected[seat]
-
-    # (2) seat.sh devices — prefer live state when available
-    if not seat:
-        try:
-            devices = parent.seat_port_manager.get_devices_from_seat_sh() or []
-            for d in devices:
-                if d.get('seat') and d.get('gateway'):
-                    seat = d['seat']
-                    gateway = d['gateway']
-                    break
-        except Exception:
-            pass
-
-    # (4) History fallback
-    if not seat:
-        try:
-            history = parent.seat_port_manager.load_history('seat') or []
-            if history:
-                h = history[-1]
-                if h.get('seat') and h.get('gateway'):
-                    seat = h['seat']
-                    gateway = h['gateway']
-        except Exception:
-            pass
-
+    seat, gateway = _ask_seat_and_gateway(
+        parent, default_seat, default_gateway, seat_options, gateway_options
+    )
     if not seat or not gateway:
-        QMessageBox.information(parent, "No Seats Connected",
-                                "Use 'Connect to new seat' first to attach a seat.")
         return
 
     # Parse gateway
