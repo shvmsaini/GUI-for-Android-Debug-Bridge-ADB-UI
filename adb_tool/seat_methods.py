@@ -2255,7 +2255,6 @@ class SeatMixin:
 
         hint = QLabel(
             "ⓘ Click 🔍 to SSH into the gateway and fetch seats via `arp -a`. "
-            "Results are cached for this session per gateway."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
@@ -2469,7 +2468,7 @@ class SeatMixin:
         # Rack hostname
         layout.addWidget(QLabel("Rack Hostname:"))
         rack_edit = QLineEdit()
-        rack_edit.setPlaceholderText("e.g., rack01.dv.example.com")
+        rack_edit.setPlaceholderText("e.g., ite22b")
         layout.addWidget(rack_edit)
 
         # Headend
