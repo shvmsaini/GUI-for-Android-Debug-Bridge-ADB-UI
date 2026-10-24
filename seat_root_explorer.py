@@ -629,106 +629,98 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
     threading.Thread(target=do_connect, daemon=True).start()
 
 
-def _gather_seat_and_gateway_options(parent):
-    """Build (default_seat, default_gateway, seat_options, gateway_options)
-    for the picker dialog.
+def _gather_paired_entries(parent):
+    """Return (options, default_label, default_gateway).
 
-    Seat options: live seats (connected_seats + seat.sh devices) merged with
-    history, deduplicated. Sorted so live entries come first.
-    Gateway options: all distinct gateways seen in seat.sh + history, each
-    rendered as ``user@host``.
+    options: paired strings seat → gateway_opt (user@host) for a single combobox.
+    live ones first, then all history, so current connections are on top.
+    default_label and default_gateway point at the current/last-used pair.
     """
     spm = parent.seat_port_manager
 
-    # Live seat names (preserve insertion order so most-recent comes first).
-    live_seats = []
-    seen_seats = set()
+    # Live and history seat/gateway pairs (no dedup yet).
+    pairs = []
+
+    # Preferred: currently connected in our internal state
     connected = getattr(spm, 'connected_seats', {}) or {}
-    for seat_name, gw in connected.items():
-        if seat_name and seat_name not in seen_seats:
-            live_seats.append(seat_name)
-            seen_seats.add(seat_name)
+    for seat, gw in connected.items():
+        if seat and gw:
+            pairs.append({'seat': seat, 'gateway': gw, 'source': 'connected'})
+
+    # Next: live from seat.sh devices
     try:
         for d in (spm.get_devices_from_seat_sh() or []):
             s = d.get('seat')
-            if s and s not in seen_seats:
-                live_seats.append(s)
-                seen_seats.add(s)
+            gw = d.get('gateway')
+            if s and gw:
+                pairs.append({'seat': s, 'gateway': gw, 'source': 'seat.sh'})
     except Exception:
         pass
 
-    # History seat names (filter to those not already live).
-    history_seats = []
+    # Finally: history from file
     try:
         history = spm.get_top_entries('seat', 1000) or []
     except Exception:
         history = []
     for entry in history:
         s = entry.get('seat')
-        if s and s not in seen_seats:
-            history_seats.append(s)
-            seen_seats.add(s)
-
-    seat_options = live_seats + history_seats
-
-    # Gateway options: every distinct gateway (user@host) we've seen, live first.
-    live_gateways = []
-    seen_gateways = set()
-    for gw in connected.values():
-        if gw and gw not in seen_gateways:
-            live_gateways.append(gw)
-            seen_gateways.add(gw)
-    try:
-        for d in (spm.get_devices_from_seat_sh() or []):
-            gw = d.get('gateway')
-            if gw and gw not in seen_gateways:
-                live_gateways.append(gw)
-                seen_gateways.add(gw)
-    except Exception:
-        pass
-
-    history_gateways = []
-    for entry in history:
         gw = entry.get('gateway')
-        if gw and gw not in seen_gateways:
-            history_gateways.append(gw)
-            seen_gateways.add(gw)
-    gateway_options = live_gateways + history_gateways
+        if s and gw:
+            pairs.append({'seat': s, 'gateway': gw, 'source': 'history'})
 
-    # Pick the defaults: most recently connected seat (or last history entry),
-    # and its gateway. If the seat has no matching gateway in the options,
-    # fall back to whatever gateway is associated with it.
-    default_seat = None
+    # Order: connected (reversed so most recent first), seat.sh, history.
+    connected_sorted = [p for p in pairs if p['source'] == 'connected'][::-1]
+    seat_sh_sorted = [p for p in pairs if p['source'] == 'seat.sh']
+    history_sorted = [p for p in pairs if p['source'] == 'history']
+    pairs_sorted = connected_sorted + seat_sh_sorted + history_sorted
+
+    # Build labels and gateway lookup
+    labels = []
+    label_to_gateway = {}
+    for p in pairs_sorted:
+        s = p['seat']
+        gw = p['gateway']
+        label = f"{s} → {gw}"
+        labels.append(label)
+        label_to_gateway[label] = gw
+
+    # Default: current/last-used seat from connected; if none, first history.
+    default_label = None
     default_gateway = None
 
-    for seat_name in seat_options:
-        gw = connected.get(seat_name)
-        if gw:
-            default_seat = seat_name
-            default_gateway = gw
+    # Look for current/last-used from internal state
+    if connected:
+        # Pick the last (most recently) connected seat's label
+        last_seat = next(reversed(list(connected.keys())))
+        last_gw = connected[last_seat]
+        candidate = f"{last_seat} → {last_gw}"
+        if candidate in label_to_gateway:
+            default_label = candidate
+            default_gateway = label_to_gateway[candidate]
+
+    # Fallback to first live entry
+    for label in labels:
+        if label.endswith(')') and not default_label:
+            default_label = label
+            default_gateway = label_to_gateway[label]
             break
 
-    if not default_seat and history:
-        # Most recent history entry (already sorted desc by timestamp).
-        h = history[0]
-        default_seat = h.get('seat')
-        default_gateway = h.get('gateway')
+    # Finally fallback to first history entry
+    if not default_label and history_sorted:
+        default_label = f"{history_sorted[0]['seat']} → {history_sorted[0]['gateway']}"
+        default_gateway = history_sorted[0]['gateway']
 
-    # Make sure defaults are present in their option lists so the combobox
-    # can preselect them.
-    if default_seat and default_seat not in seat_options:
-        seat_options.insert(0, default_seat)
-    if default_gateway and default_gateway not in gateway_options:
-        gateway_options.insert(0, default_gateway)
+    # If nothing exists, return NO defaults
+    if not labels:
+        return [], None, None
 
-    return default_seat, default_gateway, seat_options, gateway_options
+    return labels, default_label, default_gateway
 
 
-def _ask_seat_and_gateway(parent, default_seat, default_gateway,
-                          seat_options, gateway_options):
-    """Show a small dialog with two typeable dropdowns.
+def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
+    """Single combobox with editable/text field: user can select or type.
 
-    Returns (seat, gateway) on accept, or (None, None) on cancel.
+    Returns (seat, gateway) or (None, None) on cancel.
     """
     dialog = QDialog(parent)
     dialog.setWindowTitle("Seat Root Explorer")
@@ -740,51 +732,30 @@ def _ask_seat_and_gateway(parent, default_seat, default_gateway,
     layout.setContentsMargins(12, 12, 12, 12)
 
     hint = QLabel(
-        "Pick or type a seat and its gateway. Both fields autocomplete from "
-        "previous connections."
+        "Select or type a seat and its gateway. Format: 172.17.132.2 → user@gateway"
     )
     hint.setWordWrap(True)
     hint.setStyleSheet("color: gray; font-size: 9pt;")
     layout.addWidget(hint)
 
-    # Seat (IP / hostname)
-    layout.addWidget(QLabel("Seat IP / hostname:"))
-    seat_combo = QComboBox()
-    seat_combo.setEditable(True)
-    seat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-    seat_combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding,
-                                         QSizePolicy.Policy.Fixed))
-    seat_combo.addItems(seat_options)
-    if default_seat:
-        idx = seat_combo.findText(default_seat)
-        if idx >= 0:
-            seat_combo.setCurrentIndex(idx)
-        else:
-            seat_combo.setEditText(default_seat)
-    seat_completer = QCompleter(seat_options)
-    seat_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-    seat_combo.setCompleter(seat_completer)
-    layout.addWidget(seat_combo)
+    combo = QComboBox()
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding,
+                                     QSizePolicy.Policy.Fixed))
+    combo.addItems(labels)
 
-    # Gateway
-    layout.addWidget(QLabel("Gateway (user@host):"))
-    gw_combo = QComboBox()
-    gw_combo.setEditable(True)
-    gw_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-    gw_combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding,
-                                       QSizePolicy.Policy.Fixed))
-    gw_combo.addItems(gateway_options)
-    if default_gateway:
-        idx = gw_combo.findText(default_gateway)
-        if idx >= 0:
-            gw_combo.setCurrentIndex(idx)
-        else:
-            gw_combo.setEditText(default_gateway)
-    gw_completer = QCompleter(gateway_options)
-    gw_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-    gw_combo.setCompleter(gw_completer)
-    layout.addWidget(gw_combo)
+    if default_label and default_label in labels:
+        idx = labels.index(default_label)
+        combo.setCurrentIndex(idx)
+    elif default_label:
+        combo.setEditText(default_label)
 
+    completer = QCompleter(labels)
+    completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    combo.setCompleter(completer)
+
+    layout.addWidget(combo)
     layout.addStretch()
 
     button_box = QDialogButtonBox(
@@ -795,18 +766,32 @@ def _ask_seat_and_gateway(parent, default_seat, default_gateway,
     button_box.rejected.connect(dialog.reject)
     layout.addWidget(button_box)
 
-    # Focus the seat field and let Enter submit.
-    seat_combo.setFocus()
-    seat_combo.lineEdit().setPlaceholderText("e.g., 172.17.132.2 or ac-541-1241")
-    gw_combo.lineEdit().setPlaceholderText("e.g., user@gateway.example.com")
+    combo.setFocus()
+    combo.lineEdit().setPlaceholderText("e.g., 172.17.132.2 → user@gateway")
 
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None, None
 
-    seat = seat_combo.currentText().strip()
-    gateway = gw_combo.currentText().strip()
+    text = combo.currentText().strip()
+    if not text:
+        return None, None
+
+    # Parse the entered string or selected label format: "seat → gateway"
+    seat = None
+    gateway = None
+    parts = text.split('→') if '→' in text else None
+    if parts and len(parts) == 2:
+        seat = parts[0].strip()
+        gateway = parts[1].strip()
+    else:
+        # probable manual entry without arrow; scan labels to see if any matches
+        # at least toss an error
+        QMessageBox.warning(parent, "Input Error", "Please enter: seat → gateway")
+        return None, None
+
     if not seat or not gateway:
         return None, None
+
     return seat, gateway
 
 
@@ -824,11 +809,9 @@ def prompt_and_open_seat_root(parent):
         QTimer.singleShot(500, lambda: prompt_and_open_seat_root(parent))
         return
 
-    default_seat, default_gateway, seat_options, gateway_options = (
-        _gather_seat_and_gateway_options(parent)
-    )
+    labels, default_label, default_gateway = _gather_paired_entries(parent)
 
-    if not seat_options and not gateway_options:
+    if not labels:
         QMessageBox.information(
             parent, "No Seat History",
             "No previous seat connections found.\n\n"
@@ -837,7 +820,7 @@ def prompt_and_open_seat_root(parent):
         return
 
     seat, gateway = _ask_seat_and_gateway(
-        parent, default_seat, default_gateway, seat_options, gateway_options
+        parent, labels, default_label, default_gateway
     )
     if not seat or not gateway:
         return

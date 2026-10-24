@@ -2910,19 +2910,8 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
             "Browse system directories on the seat as root (requires gateway + mtc access).\n"
             "Use 'Connect to new seat' first. All mtc passwords are saved after first use."
         )
-        seat_root_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {colors['card_bg']};
-                color: {colors['fg']};
-                border: 1px solid {colors['border']};
-                padding: 8px 12px;
-                border-radius: 4px;
-            }}
-            QPushButton:hover {{
-                background-color: {colors['accent']};
-                color: white;
-            }}
-        """)
+        # No custom stylesheet — inherit the global QPushButton theme so
+        # this button matches every other button in the app.
         seat_root_btn.clicked.connect(self._open_seat_root_explorer)
         layout.addWidget(seat_root_btn)
 

@@ -184,15 +184,10 @@ class GatewayMixin:
             return None, f"Connection failed: {e}"
 
     def _connected_gateways(self):
-        """Return list of (label, host, user) for currently connected seats.
+        """Return list of (label, host, user) for ALL gateways (history + connected).
 
         label is "seat → host (user)" — what the user sees in the picker.
-
-        Source of truth is `seat.sh devices` (the same source the seat list
-        uses for highlighting), with `connected_seats` as a hint for seats
-        that may not have a `seat` column in the devices output. This means
-        seats connected *outside* the GUI (or that briefly disappeared from
-        `seat.sh devices` during a refresh tick) still show up here.
+        Live connections first (connected_seats + seat.sh devices), then history.
         """
         out = []
         seen = set()
@@ -240,18 +235,62 @@ class GatewayMixin:
             label = f"{seat} → {host} ({user})"
             out.append((label, host, user))
 
-        return sorted(out, key=lambda g: (0 if g[1] in (self.adb.get_devices(silent=True) or []) else 1), reverse=True)
+        # Finally: all history entries (even if not currently connected)
+        try:
+            history = self.seat_port_manager.get_top_entries('seat', 1000) or []
+        except Exception:
+            history = []
+        for entry in history:
+            seat = entry.get('seat', '').strip()
+            gateway = entry.get('gateway', '').strip()
+            if not seat or not gateway:
+                continue
+            if '@' in gateway:
+                user, host = gateway.split('@', 1)
+            else:
+                user, host = 'user', gateway
+            if not host:
+                continue
+            key = (seat, host, user)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = f"{seat} → {host} ({user})"
+            out.append((label, host, user))
+
+        # Sort: live (connected_seats) first, then seat.sh, then history.
+        # Within each group, sort alphabetically by seat name.
+        live_conn = []
+        live_sh = []
+        hist = []
+        for g in out:
+            seat = g[0].split('→', 1)[0].strip()
+            # Check if this specific seat+gateway is in connected_seats
+            is_connected = False
+            for s, gw in (self.seat_port_manager.connected_seats or {}).items():
+                if s == seat and gw == f"{g[2]}@{g[1]}":
+                    is_connected = True
+                    break
+            # Check if in seat.sh devices
+            in_seat_sh = False
+            for dev in seat_sh_devices:
+                if dev.get('seat') == seat and dev.get('gateway') == f"{g[2]}@{g[1]}":
+                    in_seat_sh = True
+                    break
+            if is_connected:
+                live_conn.append(g)
+            elif in_seat_sh:
+                live_sh.append(g)
+            else:
+                hist.append(g)
+        live_conn.sort(key=lambda g: g[0])
+        live_sh.sort(key=lambda g: g[0])
+        hist.sort(key=lambda g: g[0])
+        return live_conn + live_sh + hist
 
     def open_gateway_explorer(self):
-        """Open an SSH/SFTP file explorer for a connected seat's gateway."""
+        """Open an SSH/SFTP file explorer for any gateway (connected or history)."""
         gateways = self._connected_gateways()
-        if not gateways:
-            QMessageBox.warning(
-                self, "No Connected Gateways",
-                "Connect to a seat first — the Gateway Manager only works with "
-                "currently-connected seats (so SSH credentials are valid)."
-            )
-            return
 
         # Let the user pick which gateway
         labels = [g[0] for g in gateways]
