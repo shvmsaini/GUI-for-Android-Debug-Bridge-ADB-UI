@@ -646,6 +646,7 @@ class GatewayMixin:
         delete_btn = QPushButton("🗑️ Delete")
         mkdir_btn = QPushButton("📁 New Folder")
         rename_btn = QPushButton("📝 Rename")
+        run_btn = QPushButton("▶️ Run Command")
         close_btn = QPushButton("Close")
 
         btn_row.addWidget(upload_btn)
@@ -653,6 +654,7 @@ class GatewayMixin:
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(mkdir_btn)
         btn_row.addWidget(rename_btn)
+        btn_row.addWidget(run_btn)
         copy_btn = QPushButton("📱 Copy to Seat")
         edit_btn = QPushButton("✏️ Edit")
         btn_row.addWidget(copy_btn)
@@ -1245,6 +1247,64 @@ class GatewayMixin:
             cancel_btn.clicked.connect(edit_dlg.close)
             edit_dlg.exec()
 
+        def run_command_clicked():
+            """Run a shell command on the gateway and display output."""
+            cmd, ok = QInputDialog.getMultiLineText(
+                explorer,
+                "Run Command",
+                f"Run on {user}@{host} (current dir: {current_path() or default_path}):",
+                "",
+            )
+            if not ok:
+                return
+            cmd = cmd.strip()
+            if not cmd:
+                return
+
+            output_dlg = QDialog(explorer)
+            output_dlg.setWindowTitle(f"▶ {cmd[:60]}{'…' if len(cmd) > 60 else ''}")
+            output_dlg.setMinimumSize(700, 400)
+            o_layout = QVBoxLayout(output_dlg)
+            o_layout.setSpacing(6)
+            status = QLabel("⏳ Running…")
+            o_layout.addWidget(status)
+            output = QTextEdit()
+            output.setReadOnly(True)
+            output.setStyleSheet(f"background:{self.colors['card_bg']};color:{self.colors['fg']}")
+            output.setFont(QFont("Monaco", 11) if sys.platform == 'darwin' else QFont("Courier", 10))
+            o_layout.addWidget(output, 1)
+            o_btn_row = QHBoxLayout()
+            o_btn_row.addStretch()
+            close_o = QPushButton("Close")
+            o_btn_row.addWidget(close_o)
+            o_layout.addLayout(o_btn_row)
+            close_o.clicked.connect(output_dlg.accept)
+            output_dlg.show()
+
+            def do_run():
+                try:
+                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=120)
+                    out = stdout.read().decode('utf-8', 'replace')
+                    err = stderr.read().decode('utf-8', 'replace')
+                    code = stdout.channel.recv_exit_status()
+                    combined = out
+                    if err:
+                        combined = (out + ("\n" if out else "") + err).rstrip()
+                    self.log(f"Gateway: ran '{cmd.splitlines()[0][:60]}', exit={code}", "INFO")
+                    def apply():
+                        status.setText(f"✅ Done (exit {code})" if code == 0 else f"⚠️ Exit {code}")
+                        output.setPlainText(combined or "(no output)")
+                        output.moveCursor(output.textCursor().End)
+                    ui.call.emit(apply)
+                except Exception as e:
+                    err = str(e)
+                    def apply_err():
+                        status.setText("❌ Failed")
+                        output.setPlainText(err)
+                    ui.call.emit(apply_err)
+                    self.log(f"Gateway: run failed: {err}", "ERROR")
+            threading.Thread(target=do_run, daemon=True).start()
+
         def mkdir_clicked():
             folder, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
             if not ok or not folder or not folder.strip():
@@ -1355,6 +1415,7 @@ class GatewayMixin:
         refresh_btn.clicked.connect(refresh_listing)
         terminal_btn.clicked.connect(open_in_terminal)
         edit_btn.clicked.connect(edit_file_clicked)
+        run_btn.clicked.connect(run_command_clicked)
         close_btn.clicked.connect(explorer.close)
         listbox.files_dropped.connect(upload_files)
         path_entry.returnPressed.connect(refresh_listing)

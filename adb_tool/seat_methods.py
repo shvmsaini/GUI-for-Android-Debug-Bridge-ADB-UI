@@ -707,6 +707,66 @@ def _run_post_install_setup(sh, log):
         log("KEYS: post-install setup complete", "INFO")
 
 
+# ---------------------------------------------------------------------------
+# ARP-table helpers for the "Connect to new seat" picker.
+#
+# `arp -a` prints one line per entry like:
+#   seat010B (172.17.136.2) at 00:0d:2e:c7:25:e4 [ether] on enp1s0f0
+#   ubuntu-content-cache-2.ps6.canonical.com (91.189.91.97) at <incomplete> on ...
+#   ? (172.17.0.9) at <incomplete> on enp1s0f0
+#
+# We treat whatever appears before the first whitespace / "(" as the entry's
+# name, and the dotted-decimal IP inside parens as its IP. Entries with no
+# IP (incomplete ARP) are dropped — they're useless for connecting.
+# ---------------------------------------------------------------------------
+
+def _is_dotted_quad(s):
+    """True iff `s` looks like an IPv4 dotted-quad like 172.17.132.2."""
+    if not s:
+        return False
+    parts = s.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
+def _read_arp_table():
+    """Run `arp -a` and return {name: ip} for entries that have a real IP.
+
+    `name` is the bit before the first whitespace or "(" on the line —
+    e.g. "seat010B", "tsh065B", "is1", "pa044538.mascorp.com", or "?"
+    (anonymous / incomplete entries). Entries without a dotted-quad IP
+    are dropped so the picker doesn't show entries we can't actually
+    connect to.
+    """
+    out = {}
+    try:
+        import subprocess as _sp
+        res = _sp.run(['arp', '-a'], capture_output=True, text=True, timeout=8)
+    except Exception:
+        return out
+    if res.returncode != 0:
+        return out
+    for line in (res.stdout or '').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Take the first token as the name (handles "?" too).
+        name = line.split(None, 1)[0] if line else ""
+        # The IP lives inside the first (...) group on the line.
+        ip = None
+        if '(' in line and ')' in line:
+            inside = line.split('(', 1)[1].split(')', 1)[0].strip()
+            if _is_dotted_quad(inside):
+                ip = inside
+        if ip and name:
+            out[name] = ip
+    return out
+
+
 class SeatMixin:
     """Mixin class providing seat and port forward management."""
 
@@ -2021,34 +2081,131 @@ class SeatMixin:
 
         threading.Thread(target=do_disconnect, daemon=True).start()
 
+    def _read_arp_table(self):
+        """Instance-method wrapper so callers can do ``self._read_arp_table()``."""
+        return _read_arp_table()
+
     def _show_add_seat_dialog(self):
-        """Show dialog to connect to a new seat"""
+        """Show dialog to connect to a new seat. Gateway field comes first;
+        after selecting/typing one, seat IP auto-populates from `arp -a` and
+        the clipboard.
+        """
+        arp_map = self._read_arp_table()  # { "seat010B": "172.17.136.2", ... }
+
+        def populate_seat_options(gateway_text):
+            """Build a list of seat IP suggestions for the current gateway.
+
+            Sources (in priority order):
+              1. Clipboard — if it contains an IP-looking string.
+              2. `arp -a` rows — all dotted-decimal IPs we saw.
+              3. Anything already known from connected_seats / history.
+            """
+            seen = []
+            seen_set = set()
+
+            def add(s):
+                if s and s not in seen_set:
+                    seen.append(s)
+                    seen_set.add(s)
+
+            # 1. Clipboard (the user often has the seat IP copied from elsewhere)
+            try:
+                cb = QApplication.clipboard().text().strip()
+                if _is_dotted_quad(cb):
+                    add(cb)
+            except Exception:
+                pass
+
+            # 2. arp entries — anything that looks like a 172.x or 10.x seat
+            for _name, ip in arp_map.items():
+                if ip:
+                    add(ip)
+
+            # 3. Already-known seat IPs from connected_seats and history
+            try:
+                for s, gw in (self.seat_port_manager.connected_seats or {}).items():
+                    if _is_dotted_quad(s):
+                        add(s)
+                for entry in (self.seat_port_manager.get_top_entries('seat', 1000) or []):
+                    s = entry.get('seat', '')
+                    if _is_dotted_quad(s):
+                        add(s)
+            except Exception:
+                pass
+
+            return seen
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Connect to New Seat")
-        dialog.setMinimumWidth(450)
+        dialog.setMinimumWidth(500)
         dialog.setModal(True)
 
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
         layout.setContentsMargins(15, 15, 15, 15)
 
-        # Seat name
-        layout.addWidget(QLabel("Seat Name/IP:"))
-        seat_name_edit = QLineEdit()
-        seat_name_edit.setPlaceholderText("e.g., ac-541-1241")
-        layout.addWidget(seat_name_edit)
-
-        # Gateway (user@hostname format)
+        # Gateway (user@hostname) — first, editable combobox.
         layout.addWidget(QLabel("Gateway (user@hostname):"))
-        gateway_edit = QLineEdit()
-        Gateway = "ac-541-1241" if len(self.seat_search_entry.text().strip()) > 3 else "example"
-        gateway_value = f"user@{Gateway}-gateway"
-        gateway_edit.setPlaceholderText(f"e.g., {gateway_value}")
-        layout.addWidget(gateway_edit)
+        gateway_combo = QComboBox()
+        gateway_combo.setEditable(True)
+        gateway_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
 
-        hint = QLabel("ⓘ Enter seat name and gateway in user@hostname format")
+        gw_options = []
+        gw_seen = set()
+        try:
+            for entry in (self.seat_port_manager.get_top_entries('seat', 1000) or []):
+                gw = entry.get('gateway', '').strip()
+                if gw and '@' in gw and gw not in gw_seen:
+                    gw_options.append(gw)
+                    gw_seen.add(gw)
+        except Exception:
+            pass
+        # Also pull hostnames out of `arp -a` so the user can pick a seat's
+        # gateway by its reverse-DNS hostname.
+        for name in arp_map.keys():
+            if name and '.' in name and not name.replace('.', '').isdigit() and name not in gw_seen:
+                # Skip pure-IP labels, accept hostnames (e.g. is1.example.com).
+                candidate = f"user@{name}"
+                if candidate not in gw_seen:
+                    gw_options.append(candidate)
+                    gw_seen.add(candidate)
+        gateway_combo.addItems(sorted(set(gw_options)))
+        gateway_combo.lineEdit().setPlaceholderText("e.g., user@ate009.example.com")
+        layout.addWidget(gateway_combo)
+
+        # Seat IP — auto-populated once gateway is filled.
+        layout.addWidget(QLabel("Seat IP (auto-populated):"))
+        seat_combo = QComboBox()
+        seat_combo.setEditable(True)
+        seat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        seat_combo.setPlaceholderText("Pick or type a seat IP — list refreshes when gateway changes")
+        seat_combo.addItems(populate_seat_options(""))
+        if seat_combo.count():
+            seat_combo.setCurrentIndex(0)
+        layout.addWidget(seat_combo)
+
+        hint = QLabel(
+            "ⓘ Pick or type a gateway first; the seat IP list auto-populates from "
+            "`arp -a` and the clipboard. The IP (not the name) is what gets passed "
+            "to `seat.sh auto-connect`."
+        )
+        hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
         layout.addWidget(hint)
+
+        def on_gateway_changed(text):
+            suggestions = populate_seat_options(text)
+            current = seat_combo.currentText().strip()
+            seat_combo.blockSignals(True)
+            seat_combo.clear()
+            seat_combo.addItems(suggestions)
+            # Preserve whatever the user already typed if it's not in the new list
+            if current and current not in suggestions:
+                seat_combo.addItem(current)
+            seat_combo.setCurrentText(current or (suggestions[0] if suggestions else ""))
+            seat_combo.blockSignals(False)
+
+        gateway_combo.editTextChanged.connect(on_gateway_changed)
         layout.addStretch()
 
         # Install ADB keys section
@@ -2089,11 +2246,11 @@ class SeatMixin:
         connect_btn.setProperty("accent", "true")
 
         def on_connect():
-            seat_name = seat_name_edit.text().strip()
-            gateway = gateway_edit.text().strip()
+            seat_name = seat_combo.currentText().strip()
+            gateway = gateway_combo.currentText().strip()
 
             if not seat_name or not gateway:
-                QMessageBox.warning(dialog, "Input Required", "Please enter both seat name and gateway")
+                QMessageBox.warning(dialog, "Input Required", "Please enter both seat IP and gateway")
                 return
 
             install_adb_key = adb_key_cb.isChecked()

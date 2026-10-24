@@ -203,6 +203,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         delete_btn = QPushButton("🗑️ Delete")
         mkdir_btn = QPushButton("📁 New Folder")
         rename_btn = QPushButton("📝 Rename")
+        run_btn = QPushButton("▶️ Run Command")
         close_btn = QPushButton("Close")
         btn_row.addWidget(upload_btn)
         btn_row.addWidget(download_btn)
@@ -210,6 +211,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(mkdir_btn)
         btn_row.addWidget(rename_btn)
+        btn_row.addWidget(run_btn)
         btn_row.addStretch()
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
@@ -506,6 +508,60 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     parent.log(f"Rename failed: {e}", "ERROR")
             threading.Thread(target=do_rename, daemon=True).start()
 
+        def run_command():
+            """Run a shell command on the seat as root and display its output."""
+            cmd, ok = QInputDialog.getMultiLineText(
+                explorer,
+                "Run Command",
+                f"Run as root on {seat_hostname}:\n(current dir: {current_path() or '/'})",
+                "",
+            )
+            if not ok:
+                return
+            cmd = cmd.strip()
+            if not cmd:
+                return
+
+            output_dlg = QDialog(explorer)
+            output_dlg.setWindowTitle(f"▶ {cmd[:60]}{'…' if len(cmd) > 60 else ''}")
+            output_dlg.setMinimumSize(700, 400)
+            o_layout = QVBoxLayout(output_dlg)
+            o_layout.setSpacing(6)
+
+            status = QLabel("⏳ Running…")
+            o_layout.addWidget(status)
+
+            output = QTextEdit()
+            output.setReadOnly(True)
+            output.setFont(QFont("Monaco", 11) if sys.platform == 'darwin' else QFont("Courier", 10))
+            o_layout.addWidget(output, 1)
+
+            o_btn_row = QHBoxLayout()
+            o_btn_row.addStretch()
+            close_o = QPushButton("Close")
+            o_btn_row.addWidget(close_o)
+            o_layout.addLayout(o_btn_row)
+            close_o.clicked.connect(output_dlg.accept)
+            output_dlg.show()
+
+            def do_run():
+                try:
+                    out, code = shell.run(cmd, timeout=120)
+                    parent.log(f"Seat Root: ran '{cmd.splitlines()[0][:60]}', exit={code}", "INFO")
+                    def apply():
+                        status.setText(f"✅ Done (exit {code})" if code == 0 else f"⚠️ Exit {code}")
+                        output.setPlainText(out or "(no output)")
+                        output.moveCursor(output.textCursor().End)
+                    ui.call.emit(apply)
+                except Exception as e:
+                    err = str(e)
+                    def apply_err():
+                        status.setText("❌ Failed")
+                        output.setPlainText(err)
+                    ui.call.emit(apply_err)
+                    parent.log(f"Seat Root: run failed: {err}", "ERROR")
+            threading.Thread(target=do_run, daemon=True).start()
+
         def edit_file():
             sel = selected()
             if len(sel) != 1:
@@ -583,6 +639,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         delete_btn.clicked.connect(delete)
         mkdir_btn.clicked.connect(mkdir)
         rename_btn.clicked.connect(rename)
+        run_btn.clicked.connect(run_command)
         refresh_btn.clicked.connect(refresh_listing)
         up_btn.clicked.connect(go_up)
         listbox.cellDoubleClicked.connect(on_double_click)
