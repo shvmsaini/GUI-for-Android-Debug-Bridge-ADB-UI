@@ -438,7 +438,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         gateway_group_layout = QVBoxLayout(gateway_group)
         gateway_group_layout.setContentsMargins(15, 15, 15, 5)
         gateway_group_layout.setSpacing(4)
-        gateway_btn = QPushButton("🗂️ Open Gateway Explorer…")
+        gateway_btn = QPushButton("🗂️ Open Gateway Explorer")
         gateway_btn.setToolTip(
             "Browse files on a connected seat's gateway over SSH/SFTP.\n"
             "Uses saved SSH password from Keychain. Upload and download via SCP."
@@ -2907,8 +2907,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         """Add Seat Root Explorer button to gateway group."""
         seat_root_btn = QPushButton("🛡️ Seat Root Explorer")
         seat_root_btn.setToolTip(
-            "Browse system directories on the seat as root (requires gateway + mtc access).\n"
-            "Use 'Connect to new seat' first. All mtc passwords are saved after first use."
+            "Browse system directories on the seat as root (requires gateway + mtc access)."
         )
         # No custom stylesheet — inherit the global QPushButton theme so
         # this button matches every other button in the app.

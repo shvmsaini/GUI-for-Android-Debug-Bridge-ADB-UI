@@ -680,7 +680,7 @@ def _gather_paired_entries(parent):
     for p in pairs_sorted:
         s = p['seat']
         gw = p['gateway']
-        label = f"{s} → {gw}"
+        label = f"{s} ← {gw}"
         labels.append(label)
         label_to_gateway[label] = gw
 
@@ -693,7 +693,7 @@ def _gather_paired_entries(parent):
         # Pick the last (most recently) connected seat's label
         last_seat = next(reversed(list(connected.keys())))
         last_gw = connected[last_seat]
-        candidate = f"{last_seat} → {last_gw}"
+        candidate = f"{last_seat} ← {last_gw}"
         if candidate in label_to_gateway:
             default_label = candidate
             default_gateway = label_to_gateway[candidate]
@@ -707,7 +707,7 @@ def _gather_paired_entries(parent):
 
     # Finally fallback to first history entry
     if not default_label and history_sorted:
-        default_label = f"{history_sorted[0]['seat']} → {history_sorted[0]['gateway']}"
+        default_label = f"{history_sorted[0]['seat']} ← {history_sorted[0]['gateway']}"
         default_gateway = history_sorted[0]['gateway']
 
     # If nothing exists, return NO defaults
@@ -732,7 +732,7 @@ def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
     layout.setContentsMargins(12, 12, 12, 12)
 
     hint = QLabel(
-        "Select or type a seat and its gateway. Format: 172.17.132.2 → user@gateway"
+        "Select or type a seat and its gateway. Format: 172.17.132.2 ← user@gateway"
     )
     hint.setWordWrap(True)
     hint.setStyleSheet("color: gray; font-size: 9pt;")

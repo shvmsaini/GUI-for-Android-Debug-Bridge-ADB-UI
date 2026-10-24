@@ -46,6 +46,93 @@ def _format_size(size_bytes):
     return f"{size_bytes:.1f} PB"
 
 
+def _gather_all_gateways(seat_port_manager, seat_sh_devices):
+    """Return list of (seat_label, host, user) for ALL gateways (history + connected).
+
+    seat_label is just the seat name (or empty if unknown). Used by the gateway picker.
+    """
+    out = []
+    seen = set()
+
+    # Live from seat.sh devices
+    seat_sh_devices = seat_sh_devices or []
+    for dev in seat_sh_devices:
+        gateway = (dev.get('gateway') or '').strip()
+        if not gateway:
+            continue
+        if '@' in gateway:
+            user, host = gateway.split('@', 1)
+        else:
+            user, host = 'user', gateway
+        if not host:
+            continue
+        key = (host, user)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((dev.get('seat', ''), host, user))
+
+    # Connected seats
+    for seat, gateway in (seat_port_manager.connected_seats or {}).items():
+        gateway = (gateway or "").strip()
+        if not gateway:
+            continue
+        if '@' in gateway:
+            user, host = gateway.split('@', 1)
+        else:
+            user, host = 'user', gateway
+        if not host:
+            continue
+        key = (host, user)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((seat, host, user))
+
+    # History
+    try:
+        history = seat_port_manager.get_top_entries('seat', 1000) or []
+    except Exception:
+        history = []
+    for entry in history:
+        seat = entry.get('seat', '').strip()
+        gateway = entry.get('gateway', '').strip()
+        if not gateway:
+            continue
+        if '@' in gateway:
+            user, host = gateway.split('@', 1)
+        else:
+            user, host = 'user', gateway
+        if not host:
+            continue
+        key = (host, user)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((seat, host, user))
+
+    # Sort: live (connected) first, then seat.sh, then history
+    live_conn = []
+    live_sh = []
+    hist = []
+    conn_set = set(seat_port_manager.connected_seats.values())
+    sh_set = {dev.get('gateway', '') for dev in seat_sh_devices}
+
+    for seat, host, user in out:
+        g = f"{user}@{host}"
+        if g in conn_set:
+            live_conn.append((seat, host, user))
+        elif g in sh_set:
+            live_sh.append((seat, host, user))
+        else:
+            hist.append((seat, host, user))
+
+    live_conn.sort(key=lambda x: x[0])
+    live_sh.sort(key=lambda x: x[0])
+    hist.sort(key=lambda x: x[0])
+    return live_conn + live_sh + hist
+
+
 class GatewayMixin:
     """Mixin class providing SSH/SFTP gateway file management."""
 
@@ -290,62 +377,86 @@ class GatewayMixin:
 
     def open_gateway_explorer(self):
         """Open an SSH/SFTP file explorer for any gateway (connected or history)."""
-        gateways = self._connected_gateways()
+        gateways = _gather_all_gateways(self.seat_port_manager, getattr(self, '_cached_seat_sh_devices', None))
 
-        # Let the user pick which gateway
-        labels = [g[0] for g in gateways]
-        default_index = 0
-        # Prefer:
-        # 1) if current_device (last clicked) is set and has a gateway matching,
-        # 2) then any gateway whose seat's device is currently online,
-        # 3) otherwise, first gateway
-        seat_sh = self.seat_port_manager.get_devices_from_seat_sh() or []
-        current_adb_devices = self.adb.get_devices(silent=True) or []
-        current_device = getattr(self, 'current_device', None)
-        self.log(f"Gateway: picking gateway; current_device={current_device}", "DEBUG")
-        def find_default():
-            best_idx = 0
-            # Candidate list: gateways by seat name
-            seat_to_gateway = {}
-            for idx, (label, host, user) in enumerate(gateways):
-                seat = label.split('→', 1)[0].strip()
-                seat_to_gateway[seat] = (idx, host, user)
-            # Map: seat → current device (from seat.sh)
-            seat_to_device = {}
-            for entry in seat_sh:
-                seat = entry.get('seat', '')
-                device = entry.get('device', '')
-                if seat:
-                    seat_to_device[seat] = device
-            # Rule 1: if current_device matches a seat's device, pick that seat's gateway.
-            if current_device:
-                for seat, device in seat_to_device.items():
-                    if device == current_device and seat in seat_to_gateway:
-                        reason = f"matched current_device={current_device} to seat {seat} → gateway {seat_to_gateway[seat][1]}"
-                        self.log(f"Gateway: selected index={seat_to_gateway[seat][0]} because {reason}", "DEBUG")
-                        return seat_to_gateway[seat][0]
-            # Rule 2: if any seat's device is currently online, pick first such gateway.
-            for seat, device in seat_to_device.items():
-                if device and device in current_adb_devices and seat in seat_to_gateway:
-                    self.log(f"Gateway: selected first online idx={seat_to_gateway[seat][0]} (seat {seat} device {device})", "DEBUG")
-                    return seat_to_gateway[seat][0]
-            # Rule 3: pick first gateway.
-            return 0
-        default_index = find_default()
-        self.log(f"Gateway: gateway picker will default to index={default_index} label={labels[default_index] if default_index < len(labels) else 'N/A'}", "DEBUG")
-        label, ok = QInputDialog.getItem(
-            self,
-            "Select Gateway",
-            "Connected gateway to browse:",
-            labels,
-            default_index,
-            False,
-        )
-        if not ok or not label:
+        if not gateways:
+            QMessageBox.warning(self, "No Gateways", "No gateway history found.")
             return
 
-        idx = labels.index(label)
-        _, host, user = gateways[idx]
+        # Default to current device's seat gateway
+        default_host = None
+        default_user = None
+        current_device = getattr(self, 'current_device', None)
+        if current_device:
+            for entry in (self.seat_port_manager.get_devices_from_seat_sh() or []):
+                if entry.get('device') == current_device:
+                    gw = entry.get('gateway', '')
+                    if '@' in gw:
+                        default_user, default_host = gw.split('@', 1)
+                    else:
+                        default_user, default_host = 'user', gw
+                    break
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Gateway Explorer")
+        dialog.setMinimumWidth(400)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        hint = QLabel("Select or type a gateway (user@host) to browse.")
+        hint.setStyleSheet("color: gray; font-size: 9pt;")
+        layout.addWidget(hint)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
+
+        gateway_options = [f"{u}@{h}" for _, h, u in gateways]
+        combo.addItems(gateway_options)
+
+        if default_host and default_user:
+            candidate = f"{default_user}@{default_host}"
+            idx = combo.findText(candidate)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.setEditText(candidate)
+        elif gateway_options:
+            combo.setCurrentIndex(0)
+
+        completer = QCompleter(gateway_options)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        combo.setCompleter(completer)
+
+        layout.addWidget(combo)
+        layout.addStretch()
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        combo.setFocus()
+        combo.lineEdit().setPlaceholderText("e.g., user@gateway.example.com")
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        text = combo.currentText().strip()
+        if not text:
+            return
+
+        if '@' not in text:
+            QMessageBox.warning(self, "Invalid Format", "Gateway must be user@host")
+            return
+
+        user, host = text.split('@', 1)
 
         # Look up password (already saved per the user's preference)
         password = self.credential_manager.get_password(host, user)
