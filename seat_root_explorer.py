@@ -26,7 +26,8 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QLineEdit, QFileDialog, QMessageBox, QTableWidgetItem, QInputDialog,
-    QTextEdit, QComboBox, QDialogButtonBox, QCompleter, QSizePolicy
+    QTextEdit, QComboBox, QDialogButtonBox, QCompleter, QSizePolicy,
+    QProgressDialog
 )
 from PyQt6.QtGui import QFont
 
@@ -336,24 +337,278 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             if not files:
                 return
             dest = current_path()
-            parent.log(f"Uploading {len(files)} files as root to {dest}", "INFO")
+
+            # Pre-compute total size so the progress dialog can show an
+            # overall % across multiple files (matches the gateway
+            # explorer's upload pattern).
+            def _local_size(path):
+                if os.path.isfile(path):
+                    return os.path.getsize(path)
+                total = 0
+                for root, _dirs, fnames in os.walk(path):
+                    for fn in fnames:
+                        try:
+                            total += os.path.getsize(os.path.join(root, fn))
+                        except OSError:
+                            pass
+                return total
+
+            # Show the dialog immediately on the GUI thread so it appears
+            # before any I/O — the user should see "Uploading…" the moment
+            # they hit the button, even if the file enumeration takes a
+            # second or two.
+            progress = QProgressDialog("Preparing upload…", "Cancel", 0, 100, explorer)
+            progress.setWindowTitle("Uploading")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.setCancelButton(None)  # Cancel is complex with chained SSH; omit for now
+
+            cancel_flag = [False]
+            def _on_cancel():
+                cancel_flag[0] = True
+            # Re-enable cancel button AFTER show (we kept it None to avoid the
+            # initial-flash disable; wire a real handler instead).
+            try:
+                progress.setCancelButtonText("Cancel")
+                cancel_btn = progress.findChild(QPushButton)
+                if cancel_btn is not None:
+                    cancel_btn.clicked.connect(_on_cancel)
+            except Exception:
+                pass
+
+            # Track ETA across chunks
+            start_time = [0.0]
+
+            total_bytes = [0]
+            for f in files:
+                try:
+                    total_bytes[0] += _local_size(f)
+                except OSError:
+                    pass
+
+            parent.log(
+                f"Uploading {len(files)} file(s) as root to {dest} "
+                f"({_format_size(total_bytes[0])} total)",
+                "INFO",
+            )
             parent.update_status("Uploading as root…")
+
+            def _set_progress(pct, label):
+                # Always marshal UI updates onto the GUI thread.
+                ui.call.emit(lambda p=pct, l=label: (
+                    progress.setValue(p),
+                    progress.setLabelText(l),
+                    parent.update_status(l),
+                ))
+
             def do_upload():
                 ok = 0
-                for f in files:
-                    try:
-                        with open(f, 'rb') as rf:
-                            content = rf.read()
-                        b64 = base64.b64encode(content).decode('ascii')
+                failed = 0
+                failed_items = []
+                bytes_done_total = [0]
+                start_time[0] = time.monotonic()
+
+                # 48KB raw → 64KB base64 → ~66KB quoted shell arg. Stays
+                # well under ARG_MAX on every platform while keeping
+                # round-trip overhead low.
+                CHUNK_RAW = 48 * 1024
+
+                # Per-chunk timeout: 15s for a single chunk transfer
+                # (very generous). Total timeout scales with file size
+                # but we don't pre-compute it — the per-chunk timeout
+                # is what matters because each shell.run waits for its
+                # own end-marker.
+                CHUNK_TIMEOUT = 15
+
+                try:
+                    for f in files:
+                        if cancel_flag[0]:
+                            break
                         target_file = join_remote(dest, os.path.basename(f))
-                        cmd = f"umask 022; echo {shlex.quote(b64)} | base64 -d > {shlex.quote(target_file)}"
-                        shell.run(cmd, timeout=60)
-                        ok += 1
-                    except Exception as e:
-                        parent.log(f"Upload failed for {f}: {e}", "ERROR")
-                parent.update_status("Upload complete")
-                if ok:
-                    ui.call.emit(refresh_listing)
+                        file_size = _local_size(f)
+                        if file_size == 0:
+                            # Empty file: still create a 0-byte target.
+                            try:
+                                shell.run(
+                                    f"umask 022; : > {shlex.quote(target_file)}",
+                                    timeout=10,
+                                )
+                                ok += 1
+                                parent.log(
+                                    f"Seat Root: uploaded empty file {os.path.basename(f)}",
+                                    "DEBUG",
+                                )
+                            except Exception as e:
+                                failed += 1
+                                failed_items.append(f"{os.path.basename(f)}: {e}")
+                                parent.log(
+                                    f"Seat Root: upload failed for {f}: {e}",
+                                    "ERROR",
+                                )
+                            continue
+
+                        # Use a temp file in /tmp so partial uploads don't
+                        # leave a half-written file at the target path.
+                        # `mktemp` on the seat avoids any name collision.
+                        tmp = ""
+                        try:
+                            _set_progress(0, f"Preparing {os.path.basename(f)}…")
+                            out, code = shell.run(
+                                "mktemp /tmp/.seat-root-upload.XXXXXX",
+                                timeout=10,
+                            )
+                            if code != 0 or not out.strip():
+                                raise Exception(
+                                    f"could not create temp file on seat (exit {code})"
+                                )
+                            tmp = out.strip().splitlines()[-1].strip()
+
+                            file_bytes_done = 0
+                            last_emit = [time.monotonic()]
+
+                            with open(f, 'rb') as rf:
+                                while True:
+                                    if cancel_flag[0]:
+                                        break
+                                    chunk = rf.read(CHUNK_RAW)
+                                    if not chunk:
+                                        break
+                                    b64_chunk = base64.b64encode(chunk).decode('ascii')
+                                    # `printf '%s'` (not `echo`) avoids a
+                                    # trailing newline that would corrupt
+                                    # binary files mid-stream.
+                                    cmd = (
+                                        f"umask 022; "
+                                        f"printf '%s' {shlex.quote(b64_chunk)} "
+                                        f">> {shlex.quote(tmp)}"
+                                    )
+                                    try:
+                                        shell.run(cmd, timeout=CHUNK_TIMEOUT)
+                                    except Exception as e:
+                                        raise Exception(
+                                            f"chunk at offset {file_bytes_done} "
+                                            f"failed: {e}"
+                                        )
+                                    file_bytes_done += len(chunk)
+                                    bytes_done_total[0] += len(chunk)
+
+                                    # Throttle UI updates to ~5/sec.
+                                    now = time.monotonic()
+                                    if now - last_emit[0] >= 0.2:
+                                        last_emit[0] = now
+                                        pct = (
+                                            100 * bytes_done_total[0] // total_bytes[0]
+                                            if total_bytes[0] else 0
+                                        )
+                                        elapsed = now - start_time[0]
+                                        rate = (
+                                            bytes_done_total[0] / elapsed
+                                            if elapsed > 0 else 0
+                                        )
+                                        eta_s = (
+                                            (total_bytes[0] - bytes_done_total[0]) / rate
+                                            if rate > 0 else 0
+                                        )
+                                        label = (
+                                            f"Uploading {os.path.basename(f)}… "
+                                            f"{_format_size(bytes_done_total[0])}/"
+                                            f"{_format_size(total_bytes[0])}"
+                                            + (f" · ~{int(eta_s)}s left" if eta_s > 1 else "")
+                                        )
+                                        _set_progress(pct, label)
+
+                            if cancel_flag[0]:
+                                # Best-effort cleanup of the partial file.
+                                try:
+                                    shell.run(f"rm -f {shlex.quote(tmp)}", timeout=5)
+                                except Exception:
+                                    pass
+                                break
+
+                            # Decode base64 → target in one shot. The file
+                            # is now complete so this is safe even though
+                            # it's a single command — base64 -d of a
+                            # 66MB file is well under ARG_MAX because the
+                            # *input* is read from the temp file, not the
+                            # command line.
+                            decode_cmd = (
+                                f"base64 -d < {shlex.quote(tmp)} > {shlex.quote(target_file)} "
+                                f"&& rm -f {shlex.quote(tmp)}"
+                            )
+                            # Generous timeout: base64 decode + write of a
+                            # large file locally takes a few seconds.
+                            decode_timeout = max(30, file_size // (256 * 1024))
+                            shell.run(decode_cmd, timeout=decode_timeout)
+                            tmp = ""  # consumed successfully
+
+                            ok += 1
+                            file_elapsed = time.monotonic() - start_time[0]
+                            parent.log(
+                                f"Seat Root: uploaded {os.path.basename(f)} "
+                                f"({_format_size(file_size)}) to {target_file} "
+                                f"in {file_elapsed:.1f}s",
+                                "INFO",
+                            )
+                        except Exception as e:
+                            failed += 1
+                            failed_items.append(f"{os.path.basename(f)}: {e}")
+                            parent.log(
+                                f"Seat Root: upload failed for {f}: {e}",
+                                "ERROR",
+                            )
+                            if tmp:
+                                try:
+                                    shell.run(f"rm -f {shlex.quote(tmp)}", timeout=5)
+                                except Exception:
+                                    pass
+
+                    elapsed = time.monotonic() - start_time[0]
+                    summary = (
+                        f"Uploaded {ok} of {len(files)} file(s) "
+                        f"({_format_size(bytes_done_total[0])} in {elapsed:.1f}s)"
+                        + (f", {failed} failed" if failed else "")
+                    )
+                    parent.update_status(summary)
+                    parent.log(
+                        f"Seat Root: {summary}",
+                        "INFO" if not failed else "WARNING",
+                    )
+
+                    def _finish():
+                        try:
+                            progress.setValue(100)
+                            progress.close()
+                        except Exception:
+                            pass
+                        if failed:
+                            msg = (
+                                f"Uploaded: {ok}\nFailed: {failed}\n\n"
+                                f"Destination:\n{dest}"
+                            )
+                            if failed_items:
+                                msg += "\n\nFailures:\n" + "\n".join(failed_items[:5])
+                                if len(failed_items) > 5:
+                                    msg += f"\n…and {len(failed_items) - 5} more"
+                            QMessageBox.warning(explorer, "Upload finished with errors", msg)
+                        elif ok:
+                            QMessageBox.information(
+                                explorer, "Upload complete",
+                                f"Uploaded {ok} file(s) in {elapsed:.1f}s\n\n"
+                                f"Destination:\n{dest}",
+                            )
+                        if ok:
+                            refresh_listing()
+
+                    ui.call.emit(_finish)
+                except Exception as e:
+                    err = str(e)
+                    parent.log(f"Seat Root: upload thread crashed: {err}", "ERROR")
+                    ui.call.emit(lambda: (
+                        progress.close(),
+                        QMessageBox.critical(explorer, "Upload failed", err),
+                    ))
+
             threading.Thread(target=do_upload, daemon=True).start()
 
         def download():

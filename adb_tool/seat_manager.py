@@ -404,35 +404,50 @@ class SeatPortManager:
         try:
             script_path = self._get_seat_script_path()
             env = self._get_script_env()
+
+            if self.log_callback:
+                self.log_callback(f"Running {script_path} devices", "DEBUG")
+
             result = subprocess.run(
                 [script_path, 'devices'],
                 capture_output=True, text=True, timeout=10, env=env
             )
+
             if result.returncode == 0:
                 lines = result.stdout.strip().split('\n')
-                # Skip header and parse each line
-                # Format: DEVICE               STATUS       GATEWAY              SEAT
-                for line in lines[1:]:  # Skip header line
-                    if line.strip():
-                        # Split by whitespace, but need to handle variable spacing
-                        parts = line.split(None, 3)  # Split on whitespace, max 4 parts
-                        if len(parts) >= 4:
-                            device_entry = {
-                                'device': parts[0],
-                                'status': parts[1],
-                                'gateway': parts[2] if parts[2] != '-' else '',
-                                'seat': parts[3] if len(parts) > 3 and parts[3] != '-' else ''
-                            }
-                            devices.append(device_entry)
-                        elif len(parts) == 3:
-                            # No seat info
-                            device_entry = {
-                                'device': parts[0],
-                                'status': parts[1],
-                                'gateway': parts[2] if parts[2] != '-' else '',
-                                'seat': ''
-                            }
-                            devices.append(device_entry)
+                # Skip any preamble and find the header line
+                header_found = False
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    if not header_found:
+                        # Header starts with DEVICE and contains STATUS
+                        if line.startswith('DEVICE') and 'STATUS' in line:
+                            header_found = True
+                        continue
+
+                    # Parse data lines
+                    # Format: DEVICE               STATUS       GATEWAY              SEAT
+                    # Split by whitespace, but need to handle variable spacing
+                    parts = line.split(None, 3)  # Split on whitespace, max 4 parts
+                    if len(parts) >= 2:
+                        device_entry = {
+                            'device': parts[0],
+                            'status': parts[1],
+                            'gateway': parts[2] if len(parts) > 2 and parts[2] != '-' else '',
+                            'seat': parts[3] if len(parts) > 3 and parts[3] != '-' else ''
+                        }
+                        devices.append(device_entry)
+
+            if self.log_callback:
+                self.log_callback(f"Parsed {len(devices)} device(s) from seat.sh", "DEBUG")
+                for d in devices:
+                    self.log_callback(f"  - {d}", "DEBUG")
+
             return devices
         except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"Error getting devices from seat.sh: {e}", "ERROR")
             return []

@@ -166,6 +166,23 @@ class ADBManager:
 
         # Kill and restart adb server to clear the stale state
         try:
+            # Check if there are other active network connections or mirrors
+            # that we'd be killing.
+            result = subprocess.run([self.adb_path, 'devices'],
+                                    capture_output=True, text=True, timeout=5)
+            devices_output = result.stdout or ""
+            # Count how many devices are 'device' or 'offline'
+            active_devices = [l for l in devices_output.splitlines()[1:] if l.strip()]
+
+            if len(active_devices) > 1:
+                print(f"🔧 [adb] Multiple devices detected ({len(active_devices)}). "
+                      f"Skipping kill-server to avoid dropping other connections.")
+                # We can't fix the 'more than one device' bug for 'adb reverse'
+                # by killing the server if other devices are active without
+                # disrupting them. In this case, we'll just have to fail
+                # or hope for the best.
+                return False
+
             subprocess.run([self.adb_path, 'kill-server'],
                            capture_output=True, timeout=5)
             import time as _t
@@ -329,35 +346,33 @@ class ADBManager:
                     if mfr_result['success'] and mfr_result['stdout'].strip():
                         device['manufacturer'] = mfr_result['stdout'].strip()
 
-            # For local emulators (e.g., emulator-5554), try to get the AVD name.
-            # This gives a friendly name like "Pixel_9_Pro" instead of the generic
-            # product name. Only works for local emulators, not seat/adb-connect ones.
-            for device in devices:
-                device_id = device['id']
-                if device_id.startswith('emulator-'):
-                    try:
-                        avd_result = self.run_command(f"-s {device_id} emu avd name", timeout=5)
-                        if avd_result['success'] and avd_result['stdout'].strip():
-                            # Parse output: first line is AVD name, subsequent lines (e.g., "OK") are status
-                            output_lines = avd_result['stdout'].strip().split('\n')
-                            avd_name = output_lines[0].strip()
-                            # Filter out empty lines and common status messages
-                            if avd_name and avd_name not in ('OK', 'ok', ''):
-                                device['avd_name'] = avd_name
-                    except Exception:
-                        pass
+        # For local emulators (e.g., emulator-5554), try to get the AVD name.
+        # This gives a friendly name like "Pixel_9_Pro" instead of the generic
+        # product name. Only works for local emulators, not seat/adb-connect ones.
+        for device in devices:
+            device_id = device['id']
+            if device_id.startswith('emulator-'):
+                try:
+                    avd_result = self.run_command(f"-s {device_id} emu avd name", timeout=5)
+                    if avd_result['success'] and avd_result['stdout'].strip():
+                        # Parse output: first line is AVD name, subsequent lines (e.g., "OK") are status
+                        output_lines = avd_result['stdout'].strip().split('\n')
+                        avd_name = output_lines[0].strip()
+                        # Filter out empty lines and common status messages
+                        if avd_name and avd_name not in ('OK', 'ok', ''):
+                            device['avd_name'] = avd_name
+                except Exception:
+                    pass
 
-        # Filter to only include usable devices (online or needing authorization).
-        # Exclude offline/unknown devices that can't be used and cause confusion.
-        # Status values: 'device' (online), 'offline' (unreachable), 'unknown' (no status),
-        # 'unauthorized' (needs permission), 'no device', etc.
+        # Filter to only include usable devices (online, unauthorized, or offline).
+        # We include 'offline' because network seats often start as offline
+        # before authorization, and we need to see them to auto-disconnect
+        # stale tunnels.
         usable_devices = [
             d for d in devices
-            if d.get('status') in ('device', 'unauthorized')
+            if d.get('status') in ('device', 'unauthorized', 'offline')
         ]
 
-        # If all devices were filtered out (all offline/unknown), return empty list
-        # rather than falling back to the unfiltered list
         return usable_devices
 
     def get_device_info(self, device_id):

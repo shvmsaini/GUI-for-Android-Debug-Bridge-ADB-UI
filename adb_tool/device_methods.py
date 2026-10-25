@@ -34,38 +34,97 @@ class DeviceMixin:
         if not silent:
             self.update_status("Refreshing devices...")
 
-        # Test ADB connection first
-        test_result = self.adb.run_command('version')
-        if not test_result['success']:
-            error_msg = test_result['stderr'] if test_result['stderr'] else "Unknown error"
-            self.log(f"ADB test failed: {error_msg}", "ERROR")
-            self.log(f"ADB path: {self.adb.adb_path}", "ERROR")
-            self.update_status(f"ADB error: {error_msg[:50]}")
-            self.device_info_label.setText(f"ADB Error: {error_msg[:100]}")
-            self.device_info_label.setStyleSheet(f"color: {self.colors['error']};")
+        # Log that we are starting a refresh
+        self.log(f"Refreshing devices (silent={silent})", "INFO" if not silent else "DEBUG")
+
+        try:
+            # Check if adb is initialized
+            if not hasattr(self, 'adb') or self.adb is None:
+                self.log("ADB Manager not initialized", "ERROR")
+                return
+
+            # Test ADB connection first
+            test_result = self.adb.run_command('version')
+            if not test_result['success']:
+                error_msg = test_result['stderr'] if test_result['stderr'] else "Unknown error"
+                self.log(f"ADB test failed: {error_msg}", "ERROR")
+                self.log(f"ADB path: {self.adb.adb_path}", "ERROR")
+                self.update_status(f"ADB error: {error_msg[:50]}")
+                self.device_info_label.setText(f"ADB Error: {error_msg[:100]}")
+                self.device_info_label.setStyleSheet(f"color: {self.colors['error']};")
+                return
+
+            # Check if seat_port_manager is initialized
+            if not hasattr(self, 'seat_port_manager') or self.seat_port_manager is None:
+                self.log("Seat Port Manager not initialized", "ERROR")
+                return
+
+            # Get devices from seat.sh
+            seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+            seat_device_map = {}  # Map device ID to seat info
+            connected_seats = set()
+
+            # Build map from seat.sh output
+            for dev_info in seat_sh_devices:
+                seat_device_map[dev_info['device']] = dev_info
+                if dev_info['seat']:  # If seat is not empty
+                    connected_seats.add(dev_info['device'])
+
+            # Get all devices from adb
+            all_adb_devices = self.adb.get_devices(silent=silent)
+
+            # Merge adb devices and seat.sh devices
+            # We want to show a device if it's in ADB OR if it's reported as connected by seat.sh
+            # (the latter helps when ADB hasn't picked it up yet or it's transiently missing from ADB).
+
+            devices_by_id = {d['id']: d for d in all_adb_devices}
+
+            for sd in seat_sh_devices:
+                dev_id = sd['device']
+                if not dev_id:
+                    continue
+                if dev_id not in devices_by_id:
+                    # Add seat.sh device to the list even if ADB doesn't see it yet
+                    devices_by_id[dev_id] = {
+                        'id': dev_id,
+                        'status': sd['status'] if sd['status'] else 'offline',
+                        'model': None,
+                        'product': None
+                    }
+                elif sd['status'] == 'device' and devices_by_id[dev_id]['status'] != 'device':
+                    # seat.sh says it's online, ADB might be lagging
+                    devices_by_id[dev_id]['status'] = 'device'
+
+            all_devices = list(devices_by_id.values())
+
+            if not silent:
+                self.log(f"All devices (merged): {all_devices}", "INFO")
+                self.log(f"Seat.sh devices: {seat_sh_devices}", "INFO")
+            else:
+                self.log(f"All devices (merged): {all_devices}", "DEBUG")
+                self.log(f"Seat.sh devices: {seat_sh_devices}", "DEBUG")
+        except Exception as e:
+            self.log(f"Error refreshing devices: {str(e)}", "ERROR")
+            import traceback
+            self.log(traceback.format_exc(), "DEBUG")
+            self.update_status("Error refreshing devices")
             return
-
-        # Get devices from seat.sh
-        seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
-        seat_device_map = {}  # Map device ID to seat info
-        connected_seats = set()
-
-        # Build map from seat.sh output
-        for dev_info in seat_sh_devices:
-            seat_device_map[dev_info['device']] = dev_info
-            if dev_info['seat']:  # If seat is not empty
-                connected_seats.add(dev_info['device'])
-
-        # Get all devices from adb
-        all_devices = self.adb.get_devices(silent=silent)
 
         # Sort devices: connected (with seat) first, then others
         connected_device_list = []
         other_device_list = []
 
+        # Re-derive connected_seats from the merged devices_by_id list
+        # to ensure newly discovered seat.sh devices (even if not in ADB yet)
+        # are prioritized at the top.
+        connected_device_ids = set()
+        for sd in seat_sh_devices:
+            if sd.get('seat') and sd.get('device'):
+                connected_device_ids.add(sd['device'])
+
         for d in all_devices:
             device_id = d['id']
-            if device_id in connected_seats:
+            if device_id in connected_device_ids:
                 connected_device_list.append(d)
             else:
                 other_device_list.append(d)
@@ -133,205 +192,186 @@ class DeviceMixin:
         # A seat whose device (e.g. localhost:64491) is no longer in
         # `adb devices -l` has dropped in the background; clear it so
         # the seat panel stops highlighting it.
+        #
+        # Grace period: ADB server restarts or transient network blips
+        # can make devices disappear for one or two refresh cycles.
+        # Don't clear the seat immediately; wait until it's been missing
+        # for a few consecutive checks.
         live_device_ids = {d['id'] for d in devices}
+        if not hasattr(self, '_seat_missing_count'):
+            self._seat_missing_count = {}  # seat_name -> int
+
+        # Use both adb-connected devices AND seat.sh reported devices
+        # to ensure seats that have a tunnel but aren't yet in adb
+        # don't get cleared prematurely.
+        seat_sh_device_ids = {d['device'] for d in seat_sh_devices if d.get('device')}
+        all_live_ids = live_device_ids.union(seat_sh_device_ids)
+
         for dev_info in seat_sh_devices:
             seat = dev_info.get('seat')
             device = dev_info.get('device')
-            if seat and device and device not in live_device_ids:
-                self.seat_port_manager.connected_seats.pop(seat, None)
+            if seat and device:
+                if device not in all_live_ids:
+                    count = self._seat_missing_count.get(seat, 0) + 1
+                    self._seat_missing_count[seat] = count
+                    if count >= 3:  # ~15 seconds if refresh is every 5s
+                        self.seat_port_manager.connected_seats.pop(seat, None)
+                        self._seat_missing_count.pop(seat, None)
+                else:
+                    # Device is back (or still there)
+                    self._seat_missing_count[seat] = 0
 
-        # Get current device list for comparison
+        # Get current device metadata for comparison
         current_device_ids = set()
         if hasattr(self, 'device_display_map'):
             current_device_ids = set(self.device_display_map.values())
+        current_labels = getattr(self, '_cached_device_labels', {})
 
         if devices:
-            # Create display strings with device name/model
-            device_list = []
-            device_display_map = {}  # Map display string to device ID
+            # Consolidate device metadata and build display strings
+            new_devices_data = []
             new_device_ids = set()
+            device_display_map = {}
+            new_labels = {}
+            new_device_statuses = {}
 
             for d in devices:
                 device_id = d['id']
                 new_device_ids.add(device_id)
+                status = d.get('status', 'unknown')
+                new_device_statuses[device_id] = status
+
+                # Base display name
+                avd_name = d.get('avd_name')
                 model = d.get('model')
                 manufacturer = d.get('manufacturer', '')
                 product = d.get('product')
-                avd_name = d.get('avd_name')
 
-                # Build display name
-                # Priority: AVD name (local emulators) > model > product > "Unknown Device"
                 if avd_name:
-                    # Local emulator with AVD name - use friendly AVD name
                     display_name = avd_name
                 elif model:
-                    if manufacturer:
-                        display_name = f"{manufacturer} {model}"
-                    else:
-                        display_name = model
+                    display_name = f"{manufacturer} {model}".strip() if manufacturer else model
                 elif product:
                     display_name = product.replace('_', ' ').title()
                 else:
                     display_name = "Unknown Device"
 
-                # If this device comes from a seat tunnel, append seat name and
-                # gateway (rack) so the user can tell seats apart at a glance.
-                seat_for_device = None
-                gateway_for_device = None
-                try:
-                    for seat, gateway in (self.seat_port_manager.connected_seats or {}).items():
-                        # Look up the port that seat.sh assigned to this seat.
-                        port = None
-                        try:
+                # Seat metadata
+                seat_name = ""
+                gateway_name = ""
+
+                # 1. Try seat_device_map (from seat.sh output)
+                if device_id in seat_device_map:
+                    seat_name = seat_device_map[device_id].get('seat', '')
+                    gateway_name = seat_device_map[device_id].get('gateway', '')
+
+                # 2. Try connected_seats tracker (for transient/manual connections)
+                if not seat_name:
+                    try:
+                        for s, g in (self.seat_port_manager.connected_seats or {}).items():
+                            port = None
                             history = self.seat_port_manager.load_history('seat') or []
                             for h in history:
-                                if h.get('seat') == seat:
+                                if h.get('seat') == s:
                                     p = h.get('port')
                                     if p:
                                         port = str(p)
                                         break
-                        except Exception:
-                            port = None
-                        if port and device_id.endswith(f":{port}"):
-                            seat_for_device = seat
-                            gateway_for_device = gateway
-                            break
-                except Exception:
-                    pass
-                if seat_for_device and gateway_for_device:
-                    host = gateway_for_device.split('@', 1)[-1]
-                    display_str = f"{display_name} ({device_id}) — seat {seat_for_device} @ {host}"
-                else:
-                    # Format: "Device Name (ID)"
-                    display_str = f"{display_name} ({device_id})"
-                device_list.append(display_str)
-                device_display_map[display_str] = device_id
+                            if port and device_id.endswith(f":{port}"):
+                                seat_name = s
+                                gateway_name = g
+                                break
+                    except Exception:
+                        pass
 
-            # Detect any change worth rebuilding buttons for: device IDs
-            # added/removed, OR a device's status flipped (e.g. a freshly-
-            # connected seat device went from `offline` to `device` after
-            # the phone authorized the adb key). Without the status check
-            # the device button would stay labeled the same even though
-            # the underlying state changed — leaving the user thinking
-            # the device is still unusable.
-            current_device_statuses = {}
-            if hasattr(self, '_cached_device_statuses'):
-                current_device_statuses = self._cached_device_statuses
-            new_device_statuses = {d['id']: d.get('status') for d in devices}
+                # 3. Fallback to history lookup
+                if not seat_name:
+                    try:
+                        for seat_entry in self.seat_port_manager.load_history():
+                            if seat_entry['seat'] == device_id or device_id in seat_entry['seat']:
+                                seat_name = seat_entry['seat']
+                                gw = seat_entry.get('gateway', '')
+                                gateway_name = gw.split('@', 1)[1] if '@' in gw else gw
+                                break
+                    except Exception:
+                        pass
+
+                # Build UI labels
+                status_dot = "🟢" if status == 'device' else "🟡"
+                host = gateway_name.split('@')[-1] if '@' in gateway_name else gateway_name
+
+                if seat_name:
+                    if host:
+                        button_label = f"{status_dot} 💺 {seat_name}\n📡 {host}\n📱 {device_id}"
+                        display_str = f"{display_name} ({device_id}) — seat {seat_name} @ {host}"
+                    else:
+                        button_label = f"{status_dot} 💺 {seat_name}\n📱 {device_id}"
+                        display_str = f"{display_name} ({device_id}) — seat {seat_name}"
+                else:
+                    button_label = f"📱 {display_name}\n{device_id}"
+                    display_str = f"{display_name} ({device_id})"
+
+                device_display_map[display_str] = device_id
+                new_labels[device_id] = button_label
+
+                new_devices_data.append({
+                    'id': device_id,
+                    'status': status,
+                    'button_label': button_label,
+                    'display_str': display_str,
+                    'tooltip': (
+                        f"🟡 Seat device not yet authorized.\nCheck the phone for an 'Allow USB debugging?' prompt.\nStatus: {status}"
+                        if status == 'offline' and seat_name else f"Status: {status}"
+                    )
+                })
+
+            # Detect changes: IDs, button labels (captures status and seat metadata updates),
+            # OR force rebuild if the UI is currently empty despite finding devices.
+            ids_changed = current_device_ids != new_device_ids
+            labels_changed = current_labels != new_labels
+            ui_empty = len(self.device_buttons) == 0
+
+            devices_changed = ids_changed or labels_changed or (ui_empty and new_devices_data)
+
+            # Update cache for next refresh
+            self.device_display_map = device_display_map
+            self._cached_device_labels = new_labels
             self._cached_device_statuses = new_device_statuses
 
-            devices_changed = (
-                current_device_ids != new_device_ids
-                or current_device_statuses != new_device_statuses
-            )
-
-            # Store device_display_map as instance variable for future comparisons
-            self.device_display_map = device_display_map
-
-            # Only rebuild buttons if device list changed
+            # Rebuild UI if anything changed
             if devices_changed:
-                # Clear old device buttons and stretch
+                # Clear old device buttons
                 for btn in self.device_buttons.values():
                     btn.deleteLater()
                 self.device_buttons.clear()
 
-                # Clear all items from layout (buttons and stretches)
+                # Clear layout (buttons, containers, and stretches)
                 while self.devices_layout.count() > 0:
                     item = self.devices_layout.takeAt(0)
                     if item.widget():
                         item.widget().deleteLater()
 
-            # Create new device buttons (only if changed)
-            if devices_changed:
-                for d in devices:
-                    device_id = d['id']
-                    model = d.get('model')
-                    manufacturer = d.get('manufacturer', '')
-                    product = d.get('product')
-                    avd_name = d.get('avd_name')
+                # Create new device buttons
+                for d_data in new_devices_data:
+                    device_id = d_data['id']
 
-                    # Build display name
-                    # Priority: AVD name (local emulators) > model > product > "Unknown Device"
-                    if avd_name:
-                        # Local emulator with AVD name - use friendly AVD name
-                        display_name = avd_name
-                    elif model:
-                        if manufacturer:
-                            display_name = f"{manufacturer} {model}"
-                        else:
-                            display_name = model
-                    elif product:
-                        display_name = product.replace('_', ' ').title()
-                    else:
-                        display_name = "Unknown Device"
-
-                    # Try to find SEAT for this device from seat.sh
-                    seat_name = ""
-                    gateway_name = ""
-                    if device_id in seat_device_map:
-                        seat_name = seat_device_map[device_id].get('seat', '')
-                        gateway_name = seat_device_map[device_id].get('gateway', '')
-
-                    # If not found in seat.sh, try history
-                    if not seat_name:
-                        for seat_entry in self.seat_port_manager.load_history():
-                            if seat_entry['seat'] == device_id or device_id in seat_entry['seat']:
-                                seat_name = seat_entry['seat']
-                                # Gateway may include user@host; show only the host
-                                gw = seat_entry.get('gateway', '')
-                                if '@' in gw:
-                                    gateway_name = gw.split('@', 1)[1]
-                                else:
-                                    gateway_name = gw
-                                break
-
-                    # Create container widget with button and play button (no gap between them)
                     container = QWidget()
                     container_layout = QHBoxLayout(container)
                     container_layout.setContentsMargins(0, 0, 0, 0)
-                    container_layout.setSpacing(0)  # No space between main button and play button
+                    container_layout.setSpacing(0)
 
-                    # Create button for this device
-                    # If SEAT is available from seat.sh, use it as primary name with DEVICE as port
-                    if seat_name:
-                        if gateway_name:
-                            # Show a status dot so the user can tell at a glance
-                            # whether the seat's device is actually online. The
-                            # phone needs to authorize the adb key before a
-                            # freshly-connected seat device flips from `offline`
-                            # to `device`; until then it's stuck in "offline"
-                            # even though the SSH tunnel is up.
-                            status_dot = "🟢" if d.get('status') == 'device' else "🟡"
-                            device_display = f"{status_dot} 💺 {seat_name}\n📡 {gateway_name}\n📱 {device_id}"
-                        else:
-                            status_dot = "🟢" if d.get('status') == 'device' else "🟡"
-                            device_display = f"{status_dot} 💺 {seat_name}\n📱 {device_id}"
-                    else:
-                        device_display = f"📱 {display_name}\n{device_id}"
-
-                    btn = QPushButton(device_display)
+                    btn = QPushButton(d_data['button_label'])
                     btn.setMinimumHeight(60)
                     btn.setMaximumHeight(60)
                     btn.setMinimumWidth(160)
                     btn.setMaximumWidth(160)
                     btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
                     btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                    btn.setToolTip(d_data['tooltip'])
                     btn.clicked.connect(lambda checked, did=device_id: self.select_device_button(did))
-                    # Tooltip explains the status dot, so a 🟡 (offline) seat
-                    # device tells the user to tap "Allow USB debugging?" on
-                    # the phone instead of just looking broken.
-                    if d.get('status') == 'offline' and seat_name:
-                        btn.setToolTip(
-                            f"🟡 Seat device not yet authorized.\n"
-                            f"Check the phone for an 'Allow USB debugging?' prompt.\n"
-                            f"Status: {d.get('status', 'unknown')}"
-                        )
-                    else:
-                        btn.setToolTip(f"Status: {d.get('status', 'unknown')}")
 
-                    # Apply styling with NO border (removes visual gap)
+                    # Selected device styling
                     if device_id == self.current_device:
-                        # Selected: Green background, red on hover (to indicate disconnect)
                         btn.setStyleSheet(f"""
                             QPushButton {{
                                 background-color: {self.colors['success']};
@@ -348,7 +388,6 @@ class DeviceMixin:
                             }}
                         """)
                     else:
-                        # Not selected: Default background, blue on hover (indicates select)
                         btn.setStyleSheet(f"""
                             QPushButton {{
                                 text-align: left;
@@ -362,7 +401,6 @@ class DeviceMixin:
                             }}
                         """)
 
-                    # Play button for scrcpy (tightly attached, no gap, no border)
                     play_btn = QPushButton("▶")
                     play_btn.setMaximumWidth(40)
                     play_btn.setMinimumWidth(40)
@@ -371,44 +409,28 @@ class DeviceMixin:
                     play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
                     play_btn.clicked.connect(lambda checked=False, did=device_id: self._launch_scrcpy_for_device(did))
                     play_btn.setToolTip("Mirror screen via scrcpy")
-                    play_btn.setStyleSheet("""
-                        QPushButton {
-                            border: none;
-                            margin: 0px;
-                            padding: 0px;
-                        }
-                        QPushButton:hover {
-                            background-color: #888;
-                        }
-                    """)
+                    play_btn.setStyleSheet("QPushButton { border: none; margin: 0px; padding: 0px; } QPushButton:hover { background-color: #888; }")
 
                     container_layout.addWidget(btn, 0)
                     container_layout.addWidget(play_btn, 0)
-                    container_layout.setContentsMargins(0, 0, 0, 0)
-                    container_layout.setSpacing(0)
 
-                    # Store button in dict for select_device_button to find
                     self.device_buttons[device_id] = btn
-
                     self.devices_layout.addWidget(container)
 
-                self.devices_layout.addStretch()  # Add stretch at the end
+                self.devices_layout.addStretch()
 
                 # Auto-select first device if none selected
-                was_no_device = not self.current_device
-                if was_no_device and devices:
-                    first_device_id = devices[0]['id']
-                    self.select_device_button(first_device_id)
+                if not self.current_device and new_devices_data:
+                    self.select_device_button(new_devices_data[0]['id'])
             
             if devices_changed:
-                # Only log when device list actually changes, not on every refresh
                 self.update_status(f"Found {len(devices)} device(s)")
-                # Log with device names only when list changes
                 device_names = [f"{d.get('model', d.get('product', 'Unknown'))} ({d['id']})" for d in devices]
-                self.log(f"Found {len(devices)} device(s): {', '.join(device_names)}")
+                self.log(f"Found {len(devices)} device(s): {', '.join(device_names)}", "INFO")
             elif not silent:
-                # Update status bar even if devices didn't change (for manual refresh)
+                # Update status and log even if devices didn't change (for manual refresh feedback)
                 self.update_status(f"Found {len(devices)} device(s)")
+                self.log(f"Found {len(devices)} device(s) (no changes)", "INFO")
         else:
             had_devices = len(self.device_buttons) > 0
             # Clear all device buttons
@@ -423,6 +445,9 @@ class DeviceMixin:
                     item.widget().deleteLater()
 
             self.current_device = None
+            self.device_display_map = {}
+            self._cached_device_labels = {}
+            self._cached_device_statuses = {}
             self.device_info_label.setText("No devices connected - Check USB connection and USB debugging")
             self.device_info_label.setStyleSheet(f"color: {self.colors['warning']};")
             if not silent or had_devices:

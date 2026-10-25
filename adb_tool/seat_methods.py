@@ -845,7 +845,7 @@ class SeatMixin:
 
         return True
 
-    def _start_seat_device_watcher(self, seat, port='5555', max_wait=30, interval=2):
+    def _start_seat_device_watcher(self, seat, port='5555', max_wait=60, interval=2):
         """Poll adb devices until the seat's device finishes authorizing.
 
         Right after `seat.sh auto-connect`, `adb connect localhost:<port>`
@@ -969,10 +969,22 @@ class SeatMixin:
         # A seat that we previously marked connected (via the click handler)
         # but no longer appears in `seat.sh devices` has dropped in the
         # background — clear our internal flag so the highlight goes away.
+        #
+        # Grace period: If seat.sh is slow or intermittently fails, don't clear
+        # connected state immediately. Wait for 3 consecutive failures.
         current_seat_names = {d['seat'] for d in seat_sh_devices if d.get('seat')}
+        if not hasattr(self, '_seat_sh_missing_count'):
+            self._seat_sh_missing_count = {}
+
         for seat in list(self.seat_port_manager.connected_seats.keys()):
             if seat not in current_seat_names:
-                self.seat_port_manager.connected_seats.pop(seat, None)
+                count = self._seat_sh_missing_count.get(seat, 0) + 1
+                self._seat_sh_missing_count[seat] = count
+                if count >= 3:
+                    self.seat_port_manager.connected_seats.pop(seat, None)
+                    self._seat_sh_missing_count.pop(seat, None)
+            else:
+                self._seat_sh_missing_count[seat] = 0
 
         # Clear existing buttons
         while self.seat_list_layout.count() > 0:
@@ -991,14 +1003,18 @@ class SeatMixin:
             else:
                 top_seats.append(entry)
 
-        # Get connected seats from seat.sh devices (using cached data)
-        # Note: we only use the seat-name here — the port is intentionally NOT
-        # added to a shared set, because seats and port forwards use the same
-        # adb port range and would falsely cross-highlight each other.
-        connected_seat_names = set()
+        # Create map for live status and gateway reconciliation: seat -> {gateway: status}
+        # This ensures we only highlight seats when the gateway also matches,
+        # preventing false positives in the UI.
+        live_seat_map = {}
         for dev_info in seat_sh_devices:
-            if dev_info.get('seat'):  # If seat is not empty
-                connected_seat_names.add(dev_info['seat'])
+            s = dev_info.get('seat', '')
+            g = dev_info.get('gateway', '')
+            st = dev_info.get('status', '').strip().lower()
+            if s and g:
+                if s not in live_seat_map:
+                    live_seat_map[s] = {}
+                live_seat_map[s][g] = st
 
         # Add connected seats from seat.sh that aren't in the history file
         existing_seat_keys = set((e['seat'], e['gateway']) for e in top_seats)
@@ -1020,17 +1036,16 @@ class SeatMixin:
                     })
                     existing_seat_keys.add(key)
 
+        # Reconcile status for all seats (history + live)
+        for entry in top_seats:
+            st = live_seat_map.get(entry['seat'], {}).get(entry['gateway'])
+            if st:
+                entry['status'] = st
+
         # Cache for click handler to use (needs to stay in sync with highlighting)
-        # Store as dict: seat_name -> set of gateways for this seat
-        connected_seat_gateways = {}
-        for dev_info in seat_sh_devices:
-            seat = dev_info.get('seat', '')
-            gateway = dev_info.get('gateway', '')
-            if seat:
-                if seat not in connected_seat_gateways:
-                    connected_seat_gateways[seat] = set()
-                connected_seat_gateways[seat].add(gateway)
-        self._connected_seat_gateways_cached = connected_seat_gateways
+        self._connected_seat_gateways_cached = {
+            s: set(g_map.keys()) for s, g_map in live_seat_map.items()
+        }
 
         # Sort: Connected seats first (from both connection state and seat.sh), then disconnected
         connected_seats = []
@@ -1038,13 +1053,11 @@ class SeatMixin:
         for entry in top_seats:
             # A seat is connected only if:
             #  - internal state marks it connected AND the gateway matches, OR
-            #  - seat.sh devices currently lists this seat as connected.
-            # Note: do NOT use port fallback — ports are shared between seat entries
-            # and would incorrectly highlight unrelated seats.
+            #  - seat.sh devices currently lists this seat as connected for this gateway.
             is_conn = (
                 (self.seat_port_manager.is_seat_connected(entry['seat']) and
                  self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
-                or entry['seat'] in connected_seat_names
+                or entry['gateway'] in live_seat_map.get(entry['seat'], {})
             )
             if is_conn:
                 connected_seats.append(entry)
@@ -1060,7 +1073,7 @@ class SeatMixin:
             is_connected = (
                 (self.seat_port_manager.is_seat_connected(entry['seat']) and
                  self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
-                or entry['seat'] in connected_seat_names
+                or entry['gateway'] in live_seat_map.get(entry['seat'], {})
             )
             btn_connected = is_connected
             # Format: two lines with Port info on the seat line
@@ -1090,20 +1103,22 @@ class SeatMixin:
             btn.clicked.connect(lambda checked=False, e=entry: self._on_seat_clicked(e))
 
             if btn_connected:
-                # Show yellow/orange ONLY when seat.sh reports the device as
-                # "offline". Other non-"device" states (e.g. unauthorized,
-                # no permissions) keep the green "connected" color — they
-                # mean the seat tunnel is up and the device just needs
-                # the user to tap "Allow USB debugging?".
+                # Connected seats use "success" (green) for active devices,
+                # and "warning" (yellow/orange) for "unauthorized" or "offline"
+                # to prompt user action (e.g., check phone for ADB dialog).
                 device_status = entry.get('status', '').strip().lower()
                 if device_status == 'offline':
                     btn_bg = self.colors['warning']
-                    tooltip_extra = "\n\n⚠️ Device is offline (per seat.sh devices) — phone not reachable."
+                    tooltip_extra = "\n\n⚠️ Device is offline — phone not reachable or disconnected from seat."
+                elif device_status == 'unauthorized':
+                    btn_bg = self.colors['warning']
+                    tooltip_extra = "\n\n🔑 Device is unauthorized — check phone for 'Allow USB debugging?' prompt."
                 else:
                     btn_bg = self.colors['success']
                     tooltip_extra = ""
+
                 hover_bg = self.colors['error']
-                # Connected: Green (online / unauthorized) or yellow (offline). Red on hover = disconnect.
+                # Connected styling: Red on hover indicates disconnect action.
                 btn.setStyleSheet(f"""
                     QPushButton {{
                         background-color: {btn_bg};
@@ -1842,10 +1857,11 @@ class SeatMixin:
 
         def do_reconnect():
             # Give adbd a moment to come back up after ctl.restart.
-            time.sleep(3)
+            # Some devices are slow to restart adbd, so we wait 5s instead of 3s.
+            time.sleep(5)
             try:
                 self.adb.run_command(f"disconnect {seat_dev}")
-                time.sleep(0.5)
+                time.sleep(1)
                 self.adb.run_command(f"connect {seat_dev}")
             except Exception as e:
                 self.log(f"Reconnect {seat_dev} failed: {e}", "WARNING")
