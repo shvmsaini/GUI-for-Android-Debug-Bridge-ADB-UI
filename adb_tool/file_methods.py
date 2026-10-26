@@ -24,6 +24,51 @@ import bundled_scripts
 class FileMixin:
     """Mixin class providing file operations functionality."""
 
+    def _get_remote_file_size(self, target_path):
+        """Return the size of a file on the current device as a formatted string,
+        or '—' if it cannot be determined.
+
+        Uses `ls -l` and parses the size column. Android's `ls` prints
+        the size in column 4 (after perms, links, owner, group); dirs
+        omit it, in which case we return '—'.
+        """
+        try:
+            cmd = (
+                f"{self.get_device_flag()} shell ls -ld "
+                f"{shlex.quote(target_path)} 2>/dev/null"
+            )
+            res = self.adb.run_command(cmd)
+            if not res.get("success"):
+                return "—"
+            out = (res.get("stdout") or "").strip()
+            if not out:
+                return "—"
+            # First character: 'd' = directory, '-' = file. Dirs have no size column.
+            if out.startswith("d") or out.startswith("l"):
+                return "—"
+            parts = out.split()
+            # `-rwxrwx--- root sdcard_r 2752512 2026-10-20 19:42 name`
+            if len(parts) < 5:
+                return "—"
+            size_str = parts[4]
+            if not size_str.isdigit():
+                return "—"
+            return self._format_size(int(size_str))
+        except Exception:
+            return "—"
+
+    @staticmethod
+    def _format_size(size_bytes):
+        if size_bytes < 0:
+            return "?"
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024.0:
+                if unit == 'B':
+                    return f"{int(size_bytes)} {unit}"
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} PB"
+
     def push_file(self):
         """Push file to device"""
         if not self.current_device:

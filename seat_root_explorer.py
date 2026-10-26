@@ -10,9 +10,9 @@ import sys
 import shlex
 import time
 import threading
-import base64
 import tarfile
-import io
+import uuid
+import tempfile
 
 # Ensure we can import adb_tool modules
 sys.path.insert(0, os.path.dirname(__file__))
@@ -198,16 +198,18 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
 
         # Buttons row
         btn_row = QHBoxLayout()
-        upload_btn = QPushButton("⬆️ Upload as root")
-        download_btn = QPushButton("⬇️ Download")
+        push_btn = QPushButton("⬆️ Push as root")
+        copy_gw_btn = QPushButton("⬆️ Copy to Gateway")
+        pull_btn = QPushButton("⬇️ Pull")
         edit_btn = QPushButton("📝 Edit")
         delete_btn = QPushButton("🗑️ Delete")
         mkdir_btn = QPushButton("📁 New Folder")
         rename_btn = QPushButton("📝 Rename")
         run_btn = QPushButton("▶️ Run Command")
         close_btn = QPushButton("Close")
-        btn_row.addWidget(upload_btn)
-        btn_row.addWidget(download_btn)
+        btn_row.addWidget(push_btn)
+        btn_row.addWidget(copy_gw_btn)
+        btn_row.addWidget(pull_btn)
         btn_row.addWidget(edit_btn)
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(mkdir_btn)
@@ -332,286 +334,197 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     pass
             threading.Thread(target=check, daemon=True).start()
 
-        def upload():
-            files, _ = QFileDialog.getOpenFileNames(parent, "Select files")
+        def push():
+            files, _ = QFileDialog.getOpenFileNames(parent, "Select files to push")
             if not files:
                 return
+
+            # Destination is the current path on the seat
             dest = current_path()
 
-            # Pre-compute total size so the progress dialog can show an
-            # overall % across multiple files (matches the gateway
-            # explorer's upload pattern).
-            def _local_size(path):
-                if os.path.isfile(path):
-                    return os.path.getsize(path)
-                total = 0
-                for root, _dirs, fnames in os.walk(path):
-                    for fn in fnames:
-                        try:
-                            total += os.path.getsize(os.path.join(root, fn))
-                        except OSError:
-                            pass
-                return total
+            parent.log(f"Pushing {len(files)} file(s) from local to {seat_hostname}:{dest}", "INFO")
+            parent.update_status("Pushing to seat…")
 
-            # Show the dialog immediately on the GUI thread so it appears
-            # before any I/O — the user should see "Uploading…" the moment
-            # they hit the button, even if the file enumeration takes a
-            # second or two.
-            progress = QProgressDialog("Preparing upload…", "Cancel", 0, 100, explorer)
-            progress.setWindowTitle("Uploading")
+            progress = QProgressDialog("Pushing to seat…", None, 0, 100, explorer)
+            progress.setWindowTitle("Push to Seat")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(0)
+            progress.setMinimumDuration(500)
             progress.setValue(0)
-            progress.setCancelButton(None)  # Cancel is complex with chained SSH; omit for now
-
-            cancel_flag = [False]
-            def _on_cancel():
-                cancel_flag[0] = True
-            # Re-enable cancel button AFTER show (we kept it None to avoid the
-            # initial-flash disable; wire a real handler instead).
-            try:
-                progress.setCancelButtonText("Cancel")
-                cancel_btn = progress.findChild(QPushButton)
-                if cancel_btn is not None:
-                    cancel_btn.clicked.connect(_on_cancel)
-            except Exception:
-                pass
-
-            # Track ETA across chunks
-            start_time = [0.0]
-
-            total_bytes = [0]
-            for f in files:
-                try:
-                    total_bytes[0] += _local_size(f)
-                except OSError:
-                    pass
-
-            parent.log(
-                f"Uploading {len(files)} file(s) as root to {dest} "
-                f"({_format_size(total_bytes[0])} total)",
-                "INFO",
-            )
-            parent.update_status("Uploading as root…")
 
             def _set_progress(pct, label):
-                # Always marshal UI updates onto the GUI thread.
                 ui.call.emit(lambda p=pct, l=label: (
                     progress.setValue(p),
                     progress.setLabelText(l),
-                    parent.update_status(l),
                 ))
 
             def do_upload():
                 ok = 0
                 failed = 0
-                failed_items = []
-                bytes_done_total = [0]
-                start_time[0] = time.monotonic()
 
-                # 48KB raw → 64KB base64 → ~66KB quoted shell arg. Stays
-                # well under ARG_MAX on every platform while keeping
-                # round-trip overhead low.
-                CHUNK_RAW = 48 * 1024
+                for i, f in enumerate(files):
+                    basename = os.path.basename(f)
+                    target_path = join_remote(dest, basename)
 
-                # Per-chunk timeout: 15s for a single chunk transfer
-                # (very generous). Total timeout scales with file size
-                # but we don't pre-compute it — the per-chunk timeout
-                # is what matters because each shell.run waits for its
-                # own end-marker.
-                CHUNK_TIMEOUT = 15
+                    parent.log(f"Local: scp {basename} → {seat_hostname}:{target_path}", "INFO")
+                    _set_progress(int(100 * i / len(files)), f"Copying {basename}…")
 
-                try:
-                    for f in files:
-                        if cancel_flag[0]:
-                            break
-                        target_file = join_remote(dest, os.path.basename(f))
-                        file_size = _local_size(f)
-                        if file_size == 0:
-                            # Empty file: still create a 0-byte target.
-                            try:
-                                shell.run(
-                                    f"umask 022; : > {shlex.quote(target_file)}",
-                                    timeout=10,
-                                )
-                                ok += 1
-                                parent.log(
-                                    f"Seat Root: uploaded empty file {os.path.basename(f)}",
-                                    "DEBUG",
-                                )
-                            except Exception as e:
-                                failed += 1
-                                failed_items.append(f"{os.path.basename(f)}: {e}")
-                                parent.log(
-                                    f"Seat Root: upload failed for {f}: {e}",
-                                    "ERROR",
-                                )
-                            continue
+                    # Run SCP from LOCAL machine directly to seat
+                    # This goes through the gateway tunnel (localhost:port)
+                    scp_cmd = [
+                        "scp",
+                        "-o", "StrictHostKeyChecking=accept-new",
+                        "-o", "UserKnownHostsFile=/dev/null",
+                        f,
+                        f"mtc@{seat_hostname}:{shlex.quote(target_path)}"
+                    ]
 
-                        # Use a temp file in /tmp so partial uploads don't
-                        # leave a half-written file at the target path.
-                        # `mktemp` on the seat avoids any name collision.
-                        tmp = ""
-                        try:
-                            _set_progress(0, f"Preparing {os.path.basename(f)}…")
-                            out, code = shell.run(
-                                "mktemp /tmp/.seat-root-upload.XXXXXX",
-                                timeout=10,
-                            )
-                            if code != 0 or not out.strip():
-                                raise Exception(
-                                    f"could not create temp file on seat (exit {code})"
-                                )
-                            tmp = out.strip().splitlines()[-1].strip()
+                    import subprocess
+                    result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=300)
 
-                            file_bytes_done = 0
-                            last_emit = [time.monotonic()]
+                    if result.returncode == 0:
+                        ok += 1
+                        parent.log(f"Copied {basename} to {seat_hostname}:{target_path}", "INFO")
+                    else:
+                        failed += 1
+                        parent.log(f"Failed to copy {basename}: {result.stderr}", "ERROR")
 
-                            with open(f, 'rb') as rf:
-                                while True:
-                                    if cancel_flag[0]:
-                                        break
-                                    chunk = rf.read(CHUNK_RAW)
-                                    if not chunk:
-                                        break
-                                    b64_chunk = base64.b64encode(chunk).decode('ascii')
-                                    # `printf '%s'` (not `echo`) avoids a
-                                    # trailing newline that would corrupt
-                                    # binary files mid-stream.
-                                    cmd = (
-                                        f"umask 022; "
-                                        f"printf '%s' {shlex.quote(b64_chunk)} "
-                                        f">> {shlex.quote(tmp)}"
-                                    )
-                                    try:
-                                        shell.run(cmd, timeout=CHUNK_TIMEOUT)
-                                    except Exception as e:
-                                        raise Exception(
-                                            f"chunk at offset {file_bytes_done} "
-                                            f"failed: {e}"
-                                        )
-                                    file_bytes_done += len(chunk)
-                                    bytes_done_total[0] += len(chunk)
+                def done():
+                    try:
+                        progress.setValue(100)
+                        progress.close()
+                    except Exception:
+                        pass
+                    if failed:
+                        QMessageBox.warning(
+                            explorer, "Copy Complete with Errors",
+                            f"Copied: {ok}\nFailed: {failed}\n\n"
+                            f"Destination: {seat_hostname}:{dest}"
+                        )
+                    else:
+                        QMessageBox.information(
+                            explorer, "Copy Complete",
+                            f"Copied {ok} file(s) to:\n\n{seat_hostname}:{dest}"
+                        )
+                    if ok:
+                        refresh_listing()
 
-                                    # Throttle UI updates to ~5/sec.
-                                    now = time.monotonic()
-                                    if now - last_emit[0] >= 0.2:
-                                        last_emit[0] = now
-                                        pct = (
-                                            100 * bytes_done_total[0] // total_bytes[0]
-                                            if total_bytes[0] else 0
-                                        )
-                                        elapsed = now - start_time[0]
-                                        rate = (
-                                            bytes_done_total[0] / elapsed
-                                            if elapsed > 0 else 0
-                                        )
-                                        eta_s = (
-                                            (total_bytes[0] - bytes_done_total[0]) / rate
-                                            if rate > 0 else 0
-                                        )
-                                        label = (
-                                            f"Uploading {os.path.basename(f)}… "
-                                            f"{_format_size(bytes_done_total[0])}/"
-                                            f"{_format_size(total_bytes[0])}"
-                                            + (f" · ~{int(eta_s)}s left" if eta_s > 1 else "")
-                                        )
-                                        _set_progress(pct, label)
-
-                            if cancel_flag[0]:
-                                # Best-effort cleanup of the partial file.
-                                try:
-                                    shell.run(f"rm -f {shlex.quote(tmp)}", timeout=5)
-                                except Exception:
-                                    pass
-                                break
-
-                            # Decode base64 → target in one shot. The file
-                            # is now complete so this is safe even though
-                            # it's a single command — base64 -d of a
-                            # 66MB file is well under ARG_MAX because the
-                            # *input* is read from the temp file, not the
-                            # command line.
-                            decode_cmd = (
-                                f"base64 -d < {shlex.quote(tmp)} > {shlex.quote(target_file)} "
-                                f"&& rm -f {shlex.quote(tmp)}"
-                            )
-                            # Generous timeout: base64 decode + write of a
-                            # large file locally takes a few seconds.
-                            decode_timeout = max(30, file_size // (256 * 1024))
-                            shell.run(decode_cmd, timeout=decode_timeout)
-                            tmp = ""  # consumed successfully
-
-                            ok += 1
-                            file_elapsed = time.monotonic() - start_time[0]
-                            parent.log(
-                                f"Seat Root: uploaded {os.path.basename(f)} "
-                                f"({_format_size(file_size)}) to {target_file} "
-                                f"in {file_elapsed:.1f}s",
-                                "INFO",
-                            )
-                        except Exception as e:
-                            failed += 1
-                            failed_items.append(f"{os.path.basename(f)}: {e}")
-                            parent.log(
-                                f"Seat Root: upload failed for {f}: {e}",
-                                "ERROR",
-                            )
-                            if tmp:
-                                try:
-                                    shell.run(f"rm -f {shlex.quote(tmp)}", timeout=5)
-                                except Exception:
-                                    pass
-
-                    elapsed = time.monotonic() - start_time[0]
-                    summary = (
-                        f"Uploaded {ok} of {len(files)} file(s) "
-                        f"({_format_size(bytes_done_total[0])} in {elapsed:.1f}s)"
-                        + (f", {failed} failed" if failed else "")
-                    )
-                    parent.update_status(summary)
-                    parent.log(
-                        f"Seat Root: {summary}",
-                        "INFO" if not failed else "WARNING",
-                    )
-
-                    def _finish():
-                        try:
-                            progress.setValue(100)
-                            progress.close()
-                        except Exception:
-                            pass
-                        if failed:
-                            msg = (
-                                f"Uploaded: {ok}\nFailed: {failed}\n\n"
-                                f"Destination:\n{dest}"
-                            )
-                            if failed_items:
-                                msg += "\n\nFailures:\n" + "\n".join(failed_items[:5])
-                                if len(failed_items) > 5:
-                                    msg += f"\n…and {len(failed_items) - 5} more"
-                            QMessageBox.warning(explorer, "Upload finished with errors", msg)
-                        elif ok:
-                            QMessageBox.information(
-                                explorer, "Upload complete",
-                                f"Uploaded {ok} file(s) in {elapsed:.1f}s\n\n"
-                                f"Destination:\n{dest}",
-                            )
-                        if ok:
-                            refresh_listing()
-
-                    ui.call.emit(_finish)
-                except Exception as e:
-                    err = str(e)
-                    parent.log(f"Seat Root: upload thread crashed: {err}", "ERROR")
-                    ui.call.emit(lambda: (
-                        progress.close(),
-                        QMessageBox.critical(explorer, "Upload failed", err),
-                    ))
+                ui.call.emit(done)
 
             threading.Thread(target=do_upload, daemon=True).start()
 
-        def download():
+        def copy_to_gateway():
+            """Copy selected files from this seat TO the gateway via SCP run ON the seat."""
+            sel = selected()
+            if not sel:
+                QMessageBox.information(explorer, "Copy to Gateway", "Select files to copy first.")
+                return
+
+            # Ask user for destination path on gateway (default: gateway user's home)
+            default_path = f"/home/{gateway_user}/"
+            target_path, ok = QInputDialog.getText(
+                explorer, "Copy to Gateway",
+                f"Destination path on gateway {gateway_host}:\n\n"
+                f"(from: {seat_hostname})\n"
+                f"Default: {default_path}",
+                text=default_path,
+            )
+            if not ok or not target_path:
+                return
+
+            # Build list of source files
+            files_to_copy = []
+            for _row, _display, raw, _is_dir in sel:
+                remote_path = join_remote(current_path(), raw)
+                files_to_copy.append((raw, remote_path))
+
+            progress = QProgressDialog("Copying to gateway…", None, 0, 100, explorer)
+            progress.setWindowTitle("Copy to Gateway")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(500)
+            progress.setValue(0)
+
+            def do_copy():
+                parent.log(f"Copying {len(files_to_copy)} file(s) from {seat_hostname} to {gateway_host}:{target_path}", "INFO")
+
+                for i, (name, remote_path) in enumerate(files_to_copy):
+                    pct = int(100 * i / len(files_to_copy))
+                    QTimer.singleShot(0, lambda p=pct: (
+                        progress.setValue(p),
+                        progress.setLabelText(f"Copying {name} to gateway…"),
+                    ))
+
+                    # Run scp ON the seat (we already have a root shell there).
+                    # mtc account on the seat can ssh to {gateway_user}@{gateway_host}
+                    # via the LAN. We use SSH_ASKPASS so the password is fed
+                    # non-interactively.
+                    #
+                    # Note: from inside the seat shell, "gateway" needs to be
+                    # resolvable from the seat's perspective. Use gateway_host
+                    # as-is — seats on the same LAN can reach the gateway.
+                    askpass_tmp = f"/tmp/.adb-gui-askpass-{uuid.uuid4().hex}.sh"
+                    askpass_script = f"#!/bin/sh\necho {shlex.quote(gateway_password)}\n"
+
+                    try:
+                        # Write askpass script on the seat
+                        _, code_w = shell.run(
+                            f"printf %s {shlex.quote(askpass_script)} > {askpass_tmp} && chmod 700 {askpass_tmp}",
+                            timeout=10,
+                        )
+                        if code_w != 0:
+                            raise Exception("Could not write askpass script on seat")
+
+                        # Build scp command. From the seat, this looks like:
+                        #   mtc@seat:~$ scp <local_file> <gateway_user>@<gateway_host>:<dest>
+                        # The "local_file" is on the seat — we want to send
+                        # the file at `remote_path` (which may be in /data, /system, etc).
+                        # `scp` source paths are local to the seat, so we can
+                        # use the full seat path directly.
+                        scp_cmd = (
+                            f"SSH_ASKPASS={shlex.quote(askpass_tmp)} "
+                            f"SSH_ASKPASS_REQUIRE=force "
+                            f"DISPLAY=:0 "
+                            f"scp -o StrictHostKeyChecking=accept-new "
+                            f"-o UserKnownHostsFile=/dev/null "
+                            f"-o ConnectTimeout=15 "
+                            f"{shlex.quote(remote_path)} "
+                            f"{gateway_user}@{gateway_host}:{shlex.quote(target_path + '/' + name if target_path.endswith('/') else target_path)}"
+                        )
+                        parent.log(f"Seat: running {scp_cmd}", "DEBUG")
+
+                        out, code = shell.run(scp_cmd, timeout=300)
+
+                        if code != 0:
+                            raise Exception(out or f"scp exited with code {code}")
+
+                        parent.log(f"  Copied {name} to {gateway_host}:{target_path}", "INFO")
+
+                    except Exception as e:
+                        parent.log(f"  Failed to copy {name}: {e}", "ERROR")
+                        QTimer.singleShot(0, lambda n=name, err=str(e): QMessageBox.critical(
+                            explorer, "Copy Failed",
+                            f"Failed to copy {n}:\n\n{err}"
+                        ))
+                        return
+                    finally:
+                        # Clean up askpass script on seat
+                        try:
+                            shell.run(f"rm -f {shlex.quote(askpass_tmp)}", timeout=5)
+                        except:
+                            pass
+
+                QTimer.singleShot(0, lambda: (
+                    progress.setValue(100),
+                    progress.close(),
+                    QMessageBox.information(
+                        explorer, "Copy to Gateway Complete",
+                        f"Copied {len(files_to_copy)} file(s) to:\n\n{gateway_host}:{target_path}"
+                    ),
+                ))
+
+            threading.Thread(target=do_copy, daemon=True).start()
+
+        def pull():
+            """Download selected files from the seat to a local directory via SCP."""
             sel = selected()
             if not sel:
                 QMessageBox.information(explorer, "Download", "Select files to download first.")
@@ -619,89 +532,122 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             dest_dir = QFileDialog.getExistingDirectory(explorer, "Download to…")
             if not dest_dir:
                 return
-            parent.update_status("Downloading as root…")
 
-            def _extract_base64(out):
-                """Extract valid base64 data from shell output.
+            progress = QProgressDialog("Downloading…", "Cancel", 0, 100, explorer)
+            progress.setWindowTitle("Downloading")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
 
-                shell.run() returns the raw output which includes the
-                command echo and shell prompt mixed with the actual
-                base64 data. We filter to only lines that look like
-                base64 (A-Z, a-z, 0-9, +, /, =).
-                """
-                b64_chars = set(
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
-                )
-                lines = []
-                for line in out.splitlines():
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    if all(c in b64_chars for c in stripped):
-                        lines.append(stripped)
-                return "".join(lines)
+            cancel_flag = [False]
+            def _on_cancel():
+                cancel_flag[0] = True
+            progress.canceled.connect(_on_cancel)
+
+            def _set_progress(pct, label):
+                ui.call.emit(lambda p=pct, l=label: (
+                    progress.setValue(p),
+                    progress.setLabelText(l),
+                    parent.update_status(l),
+                ))
 
             def do_download():
                 ok = 0
                 failed = 0
                 failed_items = []
-                for _row, display, raw, is_dir in sel:
+                total = len(sel)
+                for i, (_row, display, raw, is_dir) in enumerate(sel):
+                    if cancel_flag[0]:
+                        break
+
+                    tmp_remote = f"/tmp/.seat-root-download-{uuid.uuid4().hex}"
                     try:
                         remote_path = join_remote(current_path(), raw)
                         local_path = os.path.join(dest_dir, raw)
+
+                        _set_progress(int(100 * i / total), f"Downloading {raw}…")
+
                         if is_dir:
-                            parent.log(f"Downloading directory {remote_path}…", "INFO")
-                            out, code = shell.run(
-                                f"tar cf - -C {shlex.quote(os.path.dirname(remote_path) or '/')} "
-                                f"{shlex.quote(os.path.basename(remote_path))} 2>/dev/null | base64",
-                                timeout=120,
+                            # Stage directory into a tarball in /tmp, then pull
+                            tar_cmd = (
+                                f"tar cf {shlex.quote(tmp_remote)} "
+                                f"-C {shlex.quote(os.path.dirname(remote_path) or '/')} "
+                                f"{shlex.quote(os.path.basename(remote_path))}"
                             )
-                            if code != 0:
-                                raise Exception(f"tar failed (exit {code})")
-                            b64_str = _extract_base64(out)
-                            if not b64_str:
-                                raise Exception("no base64 data in output")
-                            raw_bytes = base64.b64decode(b64_str)
-                            with tarfile.open(fileobj=io.BytesIO(raw_bytes)) as tf:
-                                tf.extractall(dest_dir)
+                            _, code_tar = shell.run(tar_cmd, timeout=300)
+                            if code_tar != 0:
+                                raise Exception(f"tar stage failed with code {code_tar}")
+
+                            local_tar = os.path.join(dest_dir, f".tmp-{uuid.uuid4().hex}.tar")
+                            jump.run_scp(
+                                local_path=local_tar,
+                                remote_path=tmp_remote,
+                                seat_host=seat_hostname,
+                                mtc_password=mtc_password,
+                                to_remote=False,
+                                timeout=600
+                            )
+
+                            try:
+                                with tarfile.open(local_tar) as tf:
+                                    tf.extractall(dest_dir)
+                            finally:
+                                if os.path.exists(local_tar):
+                                    os.unlink(local_tar)
                         else:
-                            parent.log(f"Downloading {remote_path}…", "INFO")
-                            out, code = shell.run(
-                                f"base64 {shlex.quote(remote_path)}", timeout=60
+                            # Copy file to /tmp so mtc can read it
+                            cp_cmd = f"cp {shlex.quote(remote_path)} {shlex.quote(tmp_remote)} && chmod 644 {shlex.quote(tmp_remote)}"
+                            _, code_cp = shell.run(cp_cmd, timeout=30)
+                            if code_cp != 0:
+                                raise Exception(f"sudo cp to /tmp failed with code {code_cp}")
+
+                            jump.run_scp(
+                                local_path=local_path,
+                                remote_path=tmp_remote,
+                                seat_host=seat_hostname,
+                                mtc_password=mtc_password,
+                                to_remote=False,
+                                timeout=600
                             )
-                            if code != 0:
-                                raise Exception(f"base64 failed (exit {code})")
-                            b64_str = _extract_base64(out)
-                            if not b64_str:
-                                raise Exception("no base64 data in output")
-                            raw_bytes = base64.b64decode(b64_str)
-                            with open(local_path, 'wb') as wf:
-                                wf.write(raw_bytes)
+
                         ok += 1
                     except Exception as e:
                         parent.log(f"Download failed for {raw}: {e}", "ERROR")
                         failed += 1
                         failed_items.append(f"{raw}: {e}")
+                    finally:
+                        # Cleanup temp file on seat
+                        try:
+                            shell.run(f"rm -f {shlex.quote(tmp_remote)}", timeout=5)
+                        except:
+                            pass
 
-                ui.call.emit(lambda: parent.update_status(
-                    f"Downloaded {ok} item(s)" + (f", {failed} failed" if failed else "")
-                ))
+                def _finish():
+                    try:
+                        progress.setValue(100)
+                        progress.close()
+                    except Exception:
+                        pass
+                    parent.update_status(
+                        f"Pulled {ok} item(s)" + (f", {failed} failed" if failed else "")
+                    )
+                    if ok or failed:
+                        msg = f"Pulled: {ok}\nFailed: {failed}\n\nDestination:\n{dest_dir}"
+                        if failed_items:
+                            msg += "\n\nFailures:\n" + "\n".join(failed_items[:5])
+                            if len(failed_items) > 5:
+                                msg += f"\n…and {len(failed_items) - 5} more"
+                        QMessageBox.information(explorer, "Pull complete", msg)
+                    if ok:
+                        refresh_listing()
+
+                ui.call.emit(_finish)
+
                 if ok:
                     parent.log(
-                        f"Downloaded {ok} item(s) to {dest_dir}" + (f", {failed} failed" if failed else ""),
+                        f"Pulled {ok} item(s) to {dest_dir}" + (f", {failed} failed" if failed else ""),
                         "INFO" if not failed else "WARNING",
                     )
-                if failed:
-                    parent.log(f"{failed} download(s) failed", "ERROR")
-                if ok or failed:
-                    msg = f"Downloaded: {ok}\nFailed: {failed}\n\nDestination:\n{dest_dir}"
-                    if failed_items:
-                        msg += "\n\nFailures:\n" + "\n".join(failed_items[:5])
-                        if len(failed_items) > 5:
-                            msg += f"\n…and {len(failed_items) - 5} more"
-                    ui.call.emit(lambda: QMessageBox.information(explorer, "Download complete", msg))
-                if ok:
-                    ui.call.emit(refresh_listing)
             threading.Thread(target=do_download, daemon=True).start()
 
         def delete():
@@ -829,26 +775,38 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             remote_path = join_remote(current_path(), raw)
 
             def _do_load():
+                tmp_remote = f"/tmp/.seat-root-edit-{uuid.uuid4().hex}"
+                local_tmp = os.path.join(tempfile.gettempdir(), f"seat-edit-{uuid.uuid4().hex}")
                 try:
-                    # base64-encode on the remote to safely transfer
-                    out, code = shell.run(f"base64 {shlex.quote(remote_path)}", timeout=30)
-                    if code != 0:
-                        ui.call.emit(lambda: QMessageBox.warning(explorer, "Edit", f"Failed to read file (exit {code})"))
-                        return
-                    # Extract only valid base64 lines
-                    b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
-                    b64_str = "".join(
-                        l.strip() for l in out.splitlines()
-                        if l.strip() and all(c in b64_chars for c in l.strip())
+                    # sudo cp to /tmp to ensure mtc can read it for scp
+                    cp_cmd = f"cp {shlex.quote(remote_path)} {shlex.quote(tmp_remote)} && chmod 644 {shlex.quote(tmp_remote)}"
+                    _, code_cp = shell.run(cp_cmd, timeout=30)
+                    if code_cp != 0:
+                        raise Exception(f"sudo cp to /tmp failed (code {code_cp})")
+
+                    # Pull via SCP
+                    jump.run_scp(
+                        local_path=local_tmp,
+                        remote_path=tmp_remote,
+                        seat_host=seat_hostname,
+                        mtc_password=mtc_password,
+                        to_remote=False,
+                        timeout=60
                     )
-                    if not b64_str:
-                        ui.call.emit(lambda: QMessageBox.warning(explorer, "Edit", "No data in file."))
-                        return
-                    content = base64.b64decode(b64_str).decode("utf-8", "replace")
+
+                    with open(local_tmp, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+
                     ui.call.emit(lambda: _show_editor(content))
                 except Exception as e:
                     err = str(e)
                     ui.call.emit(lambda: QMessageBox.warning(explorer, "Edit", f"Failed to read: {err}"))
+                finally:
+                    if os.path.exists(local_tmp):
+                        try: os.unlink(local_tmp)
+                        except: pass
+                    try: shell.run(f"rm -f {shlex.quote(tmp_remote)}", timeout=5)
+                    except: pass
 
             def _show_editor(content):
                 editor = QDialog(explorer)
@@ -870,15 +828,38 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                 def _do_save():
                     new_content = etext.toPlainText()
                     def _save_thread():
+                        tmp_remote = f"/tmp/.seat-root-edit-save-{uuid.uuid4().hex}"
+                        local_tmp = os.path.join(tempfile.gettempdir(), f"seat-save-{uuid.uuid4().hex}")
                         try:
-                            b64 = base64.b64encode(new_content.encode("utf-8")).decode("ascii")
-                            cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(remote_path)}"
-                            shell.run(cmd, timeout=30)
-                            ui.call.emit(lambda: parent.log(f"Seat Root: saved {remote_path}", "INFO"))
+                            with open(local_tmp, 'w', encoding='utf-8') as f:
+                                f.write(new_content)
+
+                            # SCP to /tmp
+                            jump.run_scp(
+                                local_path=local_tmp,
+                                remote_path=tmp_remote,
+                                seat_host=seat_hostname,
+                                mtc_password=mtc_password,
+                                timeout=60
+                            )
+
+                            # sudo mv to target
+                            move_cmd = f"mv {shlex.quote(tmp_remote)} {shlex.quote(remote_path)} && chmod 644 {shlex.quote(remote_path)}"
+                            _, code_mv = shell.run(move_cmd, timeout=30)
+                            if code_mv != 0:
+                                raise Exception(f"sudo mv failed (code {code_mv})")
+
+                            ui.call.emit(lambda: parent.log(f"Seat Root: saved {remote_path} via SCP", "INFO"))
                             ui.call.emit(editor.accept)
                         except Exception as e:
                             err = str(e)
                             ui.call.emit(lambda: QMessageBox.warning(editor, "Save Failed", err))
+                        finally:
+                            if os.path.exists(local_tmp):
+                                try: os.unlink(local_tmp)
+                                except: pass
+                            try: shell.run(f"rm -f {shlex.quote(tmp_remote)}", timeout=5)
+                            except: pass
 
                     threading.Thread(target=_save_thread, daemon=True).start()
 
@@ -888,8 +869,9 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
 
             threading.Thread(target=_do_load, daemon=True).start()
 
-        upload_btn.clicked.connect(upload)
-        download_btn.clicked.connect(download)
+        push_btn.clicked.connect(push)
+        copy_gw_btn.clicked.connect(copy_to_gateway)
+        pull_btn.clicked.connect(pull)
         edit_btn.clicked.connect(edit_file)
         delete_btn.clicked.connect(delete)
         mkdir_btn.clicked.connect(mkdir)

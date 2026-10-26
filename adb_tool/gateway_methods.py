@@ -13,6 +13,7 @@ import time
 import shlex
 import re
 import tempfile
+import uuid
 from datetime import datetime
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
 from PyQt6.QtWidgets import (
@@ -1135,46 +1136,146 @@ class GatewayMixin:
             remote_path = join_remote(current_path(), raw_name)
             if not remote_path.startswith('/'):
                 remote_path = '/' + remote_path
-            self.log(f"Gateway: copying {raw_name} to seat device…", "INFO")
-            self.update_status("Copy to Seat…")
-            self.log(f"Gateway: current_device={getattr(self, 'current_device', None)}", "DEBUG")
 
-            # Get file size for progress dialog
-            file_size = _sftp_size(sftp, remote_path, is_dir=False)
-            phase = ["sftp"]  # Track which phase we're in: 'sftp' or 'push'
+            # Try to find the seat's actual IP/hostname (not localhost:port).
+            # The gateway runs SCP and needs to reach the seat over the LAN,
+            # so localhost:port won't work — we need the real seat address.
+            seat_host = None
+            current_device = getattr(self, 'current_device', None)
 
-            progress = QProgressDialog(f"Downloading from gateway…", None, 0, 100, explorer)
+            if current_device and current_device.startswith('localhost:'):
+                port = current_device.split(':', 1)[1]
+                # Look up connected seat by port to find the actual seat name/IP
+                spm = getattr(self, 'seat_port_manager', None)
+                if spm:
+                    # Check seat.sh devices cache for matching port
+                    seat_sh_devices = getattr(self, '_cached_seat_sh_devices', None) or []
+                    for dev in seat_sh_devices:
+                        if dev.get('device', '').endswith(':' + port) and dev.get('gateway', '') == f"{user}@{host}":
+                            seat_host = dev.get('seat', '').strip()
+                            if seat_host:
+                                break
+                    # Fallback: scan connected_seats for the seat on this gateway
+                    if not seat_host:
+                        for seat, gw in (spm.connected_seats or {}).items():
+                            if gw == f"{user}@{host}":
+                                seat_host = seat
+                                break
+
+            # If no current seat device, ask user
+            if not seat_host:
+                seat_host, ok = QInputDialog.getText(
+                    explorer, "Copy to Seat",
+                    "Enter seat IP or hostname:\n(e.g., 172.17.144.5 or seat01)"
+                )
+                if not ok or not seat_host:
+                    return
+
+            # Determine destination path on seat
+            dest_path = f"/media/sdcard/home/mtc/{raw_name}"
+
+            # Get the mtc password — needed for SCP from gateway to seat.
+            # The mtc password is cached globally (same across all seats).
+            creds = CredentialManager()
+            mtc_password = creds.get_password("mtc_global", "mtc")
+            if not mtc_password:
+                mtc_password, ok = QInputDialog.getText(
+                    explorer, "MTC Password",
+                    "Enter the mtc password (used for SSH to the seat):",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok or not mtc_password:
+                    return
+                creds.set_password("mtc_global", "mtc", mtc_password)
+
+            self.log(f"Gateway: copying {raw_name} to seat {seat_host}:{dest_path} via SCP on gateway", "INFO")
+            self.update_status(f"Copying to {seat_host}…")
+
+            progress = QProgressDialog(f"Copying to seat…", None, 0, 100, explorer)
             progress.setWindowTitle("Copy to Seat")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(500)
             progress.setValue(0)
             progress.setCancelButton(None)
 
-            def progress_cb(transferred, total):
-                # When transferred == total, we're transitioning to the 'push' phase
-                if transferred == total:
-                    phase[0] = "push"
-                    ui.call.emit(lambda: progress.setLabelText("Pushing to seat device…"))
-                else:
-                    pct = (100 * transferred // total) if total else 0
-                    ui.call.emit(lambda p=pct: progress.setValue(p))
+            def _set_progress(pct, label):
+                ui.call.emit(lambda p=pct, l=label: (
+                    progress.setValue(p),
+                    progress.setLabelText(l),
+                ))
 
             def do_copy():
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    ok, err = _sftp_download_to_seat(remote_path, tmpdir, progress_cb)
-                    def done():
-                        try:
-                            progress.close()
-                        except Exception:
-                            pass
-                        self.update_status("Copy complete" if ok else "Copy failed")
-                        if ok:
-                            self.log("Gateway: Copy-to-Seat succeeded", "INFO")
-                            QMessageBox.information(self, "Copy Complete", f"File copied to seat at /sdcard/{raw_name}")
-                        else:
-                            self.log(f"Gateway Copy-to-Seat failed: {err}", "ERROR")
-                            QMessageBox.critical(self, "Copy Failed", f"Could not copy to seat:\n\n{err}")
-                    ui.call.emit(done)
+                # Set up SSH_ASKPASS on the gateway so scp can authenticate
+                # to mtc@seat non-interactively. We write a small script to
+                # /tmp on the gateway that echoes the mtc password, then run
+                # scp with SSH_ASKPASS pointing at it.
+                askpass_path = f"/tmp/.adb-gui-askpass-{uuid.uuid4().hex}.sh"
+                askpass_script = f"#!/bin/sh\necho {shlex.quote(mtc_password)}\n"
+
+                try:
+                    # Write askpass script to gateway
+                    stdin, stdout, stderr = ssh_client.exec_command(
+                        f"cat > {askpass_path} && chmod 700 {askpass_path}",
+                        timeout=10,
+                    )
+                    stdin.write(askpass_script)
+                    stdin.channel.shutdown_write()
+
+                    # Build the SCP command with SSH_ASKPASS env vars
+                    # SSH_ASKPASS_REQUIRE=force ensures ssh uses the askpass
+                    # helper even without a tty.
+                    scp_cmd = (
+                        f"SSH_ASKPASS={shlex.quote(askpass_path)} "
+                        f"SSH_ASKPASS_REQUIRE=force "
+                        f"DISPLAY=:0 "
+                        f"scp -o StrictHostKeyChecking=accept-new "
+                        f"-o UserKnownHostsFile=/dev/null "
+                        f"-o ConnectTimeout=15 "
+                        f"{shlex.quote(remote_path)} "
+                        f"mtc@{seat_host}:{shlex.quote(dest_path)}"
+                    )
+                    self.log(f"Gateway: running SCP on {user}@{host} to {seat_host}", "DEBUG")
+
+                    stdin, stdout, stderr = ssh_client.exec_command(scp_cmd, timeout=300)
+                    exit_code = stdout.channel.recv_exit_status()
+                    out = stdout.read().decode('utf-8', 'replace')
+                    err = stderr.read().decode('utf-8', 'replace')
+                except Exception as e:
+                    self.log(f"Failed to execute SCP on gateway: {e}", "ERROR")
+                    exit_code = -1
+                    out = str(e)
+                    err = ""
+                finally:
+                    # Clean up askpass script on gateway
+                    try:
+                        ssh_client.exec_command(f"rm -f {askpass_path}", timeout=5)
+                    except Exception:
+                        pass
+
+                def done(success, message):
+                    try:
+                        progress.close()
+                    except Exception:
+                        pass
+                    self.update_status(message)
+                    if success:
+                        self.log(f"Gateway: Copy-to-Seat succeeded via SCP on gateway", "INFO")
+                        QMessageBox.information(
+                            self, "Copy Complete",
+                            f"Copied to seat:\n\n{seat_host}:{dest_path}\n\n"
+                            f"Command ran on {user}@{host}:\n"
+                            f"scp {raw_name} mtc@{seat_host}:/media/sdcard/home/mtc/"
+                        )
+                    else:
+                        self.log(f"Gateway Copy-to-Seat failed: {message}", "ERROR")
+                        QMessageBox.critical(self, "Copy Failed", f"Could not copy to seat:\n\n{message}")
+
+                if exit_code == 0:
+                    ui.call.emit(lambda: done(True, "Copy complete"))
+                else:
+                    error_msg = err or out or f"Exit code {exit_code}"
+                    ui.call.emit(lambda: done(False, error_msg))
+
             threading.Thread(target=do_copy, daemon=True).start()
 
         def ensure_dir(path):

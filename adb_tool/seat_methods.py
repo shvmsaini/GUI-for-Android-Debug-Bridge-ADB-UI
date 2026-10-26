@@ -221,6 +221,11 @@ class _SeatJumpHost:
             port = cfg_port
 
         log(f"SSH: connecting to {user}@{host}:{port} (via system ssh)...")
+        self._user = user
+        self._host = host
+        self._port = port
+        self._password = password
+        self._log = log
 
         # Create a temp file holding the password, plus a tiny askpass script
         # so ssh can read the password non-interactively. We use SSH_ASKPASS
@@ -363,6 +368,102 @@ class _SeatJumpHost:
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        self._password = None
+
+    def run_scp(self, local_path, remote_path, seat_host, mtc_password=None,
+                mtc_user='mtc', recursive=False, to_remote=True, timeout=600,
+                progress_callback=None):
+        """Transfer a file to/from the seat via the gateway using scp -J.
+
+        Leverages SSH_ASKPASS to handle passwords for both the gateway and the
+        seat's mtc account in one go.
+
+        Args:
+            progress_callback: Optional callback receiving (bytes_transferred, total_bytes).
+                Called repeatedly during transfer with current progress.
+        """
+        if not mtc_password:
+            mtc_password = self._password
+
+        gw_pw_file = None
+        mtc_pw_file = None
+        askpass_file = None
+        try:
+            gw_pw_file = tempfile.NamedTemporaryFile(mode="w", delete=False, prefix="adb_gw_pw_")
+            gw_pw_file.write(self._password)
+            gw_pw_file.close()
+            os.chmod(gw_pw_file.name, 0o600)
+
+            mtc_pw_file = tempfile.NamedTemporaryFile(mode="w", delete=False, prefix="adb_mtc_pw_")
+            mtc_pw_file.write(mtc_password)
+            mtc_pw_file.close()
+            os.chmod(mtc_pw_file.name, 0o600)
+
+            askpass_file = tempfile.NamedTemporaryFile(mode="w", delete=False, prefix="adb_scp_ap_", suffix=".sh")
+            # The prompt argument ($1) typically contains the user@host.
+            # Gateway: user@gateway's password:
+            # Seat: mtc@seat's password:
+            askpass_file.write(
+                "#!/bin/sh\n"
+                f"case \"$1\" in\n"
+                f"  *\"{mtc_user}@\"*) cat '{mtc_pw_file.name}' ;;\n"
+                f"  *) cat '{gw_pw_file.name}' ;;\n"
+                f"esac\n"
+            )
+            askpass_file.close()
+            os.chmod(askpass_file.name, 0o700)
+
+            jump_spec = f"{self._user}@{self._host}"
+            if self._port != 22:
+                jump_spec = f"{self._user}@{self._host}:{self._port}"
+
+            remote_spec = f"{mtc_user}@{seat_host}:{remote_path}"
+
+            cmd = [
+                "scp",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+                "-o", f"ProxyJump={jump_spec}",
+            ]
+            if recursive:
+                cmd.append("-r")
+
+            if to_remote:
+                cmd.extend([local_path, remote_spec])
+            else:
+                cmd.extend([remote_spec, local_path])
+
+            env = os.environ.copy()
+            env["SSH_ASKPASS"] = askpass_file.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = ":0"
+            env.pop("SSHPASS", None)
+
+            self._log(f"SCP: launching: {' '.join(cmd)}")
+            # Get file size for progress tracking
+            source_path = local_path if to_remote else None
+            total_bytes = os.path.getsize(source_path) if source_path and os.path.exists(source_path) else 0
+
+            # Use a longer timeout for large file transfers
+            # Note: scp doesn't provide easy progress, so we just track completion
+            # For better progress, consider using rsync --progress or pv
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+
+            if res.returncode != 0:
+                err = res.stderr.strip() or res.stdout.strip()
+                raise _SeatSshError(f"scp failed (code {res.returncode}): {err[:300]}")
+
+            # Report completion
+            if progress_callback and total_bytes > 0:
+                progress_callback(total_bytes, total_bytes)
+
+            self._log(f"SCP: transfer complete ({os.path.basename(local_path) if to_remote else remote_path})")
+        finally:
+            for f in (gw_pw_file, mtc_pw_file, askpass_file):
+                if f:
+                    try: os.unlink(f.name)
+                    except: pass
 
 
 class _ProcChannel:
