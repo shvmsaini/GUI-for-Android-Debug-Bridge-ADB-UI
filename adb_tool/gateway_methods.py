@@ -1172,7 +1172,7 @@ class GatewayMixin:
                     return
 
             # Determine destination path on seat
-            dest_path = f"/media/sdcard/home/mtc/{raw_name}"
+            dest_path = f"/storage/emulated/0/{raw_name}"
 
             # Get the mtc password — needed for SCP from gateway to seat.
             # The mtc password is cached globally (same across all seats).
@@ -1210,7 +1210,13 @@ class GatewayMixin:
                 # /tmp on the gateway that echoes the mtc password, then run
                 # scp with SSH_ASKPASS pointing at it.
                 askpass_path = f"/tmp/.adb-gui-askpass-{uuid.uuid4().hex}.sh"
-                askpass_script = f"#!/bin/sh\necho {shlex.quote(mtc_password)}\n"
+                askpass_script = (
+                    "#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    f"  *\"password:\"*|*\"Password:\"*) echo {shlex.quote(mtc_password)} ;;\n"
+                    "  *) echo \"yes\" ;;\n"
+                    "esac\n"
+                )
 
                 try:
                     # Write askpass script to gateway
@@ -1228,7 +1234,8 @@ class GatewayMixin:
                         f"SSH_ASKPASS={shlex.quote(askpass_path)} "
                         f"SSH_ASKPASS_REQUIRE=force "
                         f"DISPLAY=:0 "
-                        f"scp -o StrictHostKeyChecking=accept-new "
+                        f"scp -O "
+                        f"-o StrictHostKeyChecking=no "
                         f"-o UserKnownHostsFile=/dev/null "
                         f"-o ConnectTimeout=15 "
                         f"{shlex.quote(remote_path)} "
@@ -1264,7 +1271,7 @@ class GatewayMixin:
                             self, "Copy Complete",
                             f"Copied to seat:\n\n{seat_host}:{dest_path}\n\n"
                             f"Command ran on {user}@{host}:\n"
-                            f"scp {raw_name} mtc@{seat_host}:/media/sdcard/home/mtc/"
+                            f"scp {raw_name} mtc@{seat_host}:/storage/emulated/0/"
                         )
                     else:
                         self.log(f"Gateway Copy-to-Seat failed: {message}", "ERROR")

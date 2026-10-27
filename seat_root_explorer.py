@@ -360,6 +360,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             def do_upload():
                 ok = 0
                 failed = 0
+                readonly_fallbacks = 0  # Files that hit read-only FS and got copied to /storage/emulated/0
 
                 for i, f in enumerate(files):
                     basename = os.path.basename(f)
@@ -368,25 +369,60 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     parent.log(f"Local: scp {basename} → {seat_hostname}:{target_path}", "INFO")
                     _set_progress(int(100 * i / len(files)), f"Copying {basename}…")
 
-                    # Run SCP from LOCAL machine directly to seat
-                    # This goes through the gateway tunnel (localhost:port)
-                    scp_cmd = [
-                        "scp",
-                        "-o", "StrictHostKeyChecking=accept-new",
-                        "-o", "UserKnownHostsFile=/dev/null",
-                        f,
-                        f"mtc@{seat_hostname}:{shlex.quote(target_path)}"
-                    ]
-
-                    import subprocess
-                    result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=300)
-
-                    if result.returncode == 0:
+                    # Run SCP from LOCAL machine to seat via gateway tunnel
+                    try:
+                        jump.run_scp(
+                            local_path=f,
+                            remote_path=shlex.quote(target_path),
+                            seat_host=seat_hostname,
+                            mtc_password=mtc_password,
+                            timeout=300
+                        )
                         ok += 1
                         parent.log(f"Copied {basename} to {seat_hostname}:{target_path}", "INFO")
-                    else:
-                        failed += 1
-                        parent.log(f"Failed to copy {basename}: {result.stderr}", "ERROR")
+                    except _SeatSshError as e:
+                        stderr = str(e)
+                        # Detect read-only filesystem errors
+                        is_readonly = (
+                            "Read-only file system" in stderr or
+                            "read-only file system" in stderr.lower() or
+                            "Read-only" in stderr or
+                            "EROFS" in stderr
+                        )
+
+                        if is_readonly:
+                            # Fallback: copy to /storage/emulated/0 instead
+                            fallback_path = f"/storage/emulated/0/{basename}"
+                            parent.log(
+                                f"Target path {target_path} is read-only on seat {seat_hostname}. "
+                                f"Falling back to {fallback_path}",
+                                "WARNING"
+                            )
+                            _set_progress(int(100 * i / len(files)), f"Retrying {basename}…")
+
+                            try:
+                                jump.run_scp(
+                                    local_path=f,
+                                    remote_path=shlex.quote(fallback_path),
+                                    seat_host=seat_hostname,
+                                    mtc_password=mtc_password,
+                                    timeout=300
+                                )
+                                ok += 1
+                                readonly_fallbacks += 1
+                                parent.log(
+                                    f"Copied {basename} to fallback path {fallback_path}",
+                                    "INFO"
+                                )
+                            except _SeatSshError as fb_err:
+                                failed += 1
+                                parent.log(
+                                    f"Fallback copy also failed for {basename}: {str(fb_err)}",
+                                    "ERROR"
+                                )
+                        else:
+                            failed += 1
+                            parent.log(f"Failed to copy {basename}: {stderr}", "ERROR")
 
                 def done():
                     try:
@@ -395,10 +431,22 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     except Exception:
                         pass
                     if failed:
-                        QMessageBox.warning(
-                            explorer, "Copy Complete with Errors",
-                            f"Copied: {ok}\nFailed: {failed}\n\n"
-                            f"Destination: {seat_hostname}:{dest}"
+                        msg = f"Copied: {ok}\nFailed: {failed}\n\n"
+                        if readonly_fallbacks:
+                            msg += (
+                                f"Note: {readonly_fallbacks} file(s) hit a read-only "
+                                f"filesystem and were copied to /storage/emulated/0/ instead.\n\n"
+                            )
+                        msg += f"Destination: {seat_hostname}:{dest}"
+                        QMessageBox.warning(explorer, "Copy Complete with Errors", msg)
+                    elif readonly_fallbacks:
+                        # All succeeded but some went to the fallback path
+                        QMessageBox.information(
+                            explorer, "Copy Complete (with fallbacks)",
+                            f"Copied {ok} file(s), but {readonly_fallbacks} of them hit a "
+                            f"read-only filesystem and were copied to:\n\n"
+                            f"{seat_hostname}:/storage/emulated/0/\n\n"
+                            f"Intended destination: {seat_hostname}:{dest}"
                         )
                     else:
                         QMessageBox.information(
@@ -483,8 +531,10 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             f"SSH_ASKPASS={shlex.quote(askpass_tmp)} "
                             f"SSH_ASKPASS_REQUIRE=force "
                             f"DISPLAY=:0 "
-                            f"scp -o StrictHostKeyChecking=accept-new "
+                            f"scp -O "
+                            f"-o StrictHostKeyChecking=no "
                             f"-o UserKnownHostsFile=/dev/null "
+                            f"-o CheckHostIP=no "
                             f"-o ConnectTimeout=15 "
                             f"{shlex.quote(remote_path)} "
                             f"{gateway_user}@{gateway_host}:{shlex.quote(target_path + '/' + name if target_path.endswith('/') else target_path)}"

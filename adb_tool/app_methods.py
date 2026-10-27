@@ -6,13 +6,13 @@ import time
 import shlex
 import re
 from datetime import datetime
-from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread, QEvent
 from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QWidget, QLineEdit, QCheckBox, QComboBox, QTableWidgetItem, QSizePolicy, QFrame,
     QScrollArea, QGroupBox, QTextEdit, QListWidget, QListWidgetItem, QTabWidget,
     QMainWindow, QGridLayout, QButtonGroup, QRadioButton, QCompleter, QDialogButtonBox,
-    QApplication, QHeaderView
+    QApplication, QHeaderView, QProgressDialog
 )
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QDrag
 
@@ -20,6 +20,7 @@ from .adb_manager import ADBManager
 from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
+from .seat_methods import _SeatJumpHost, _SeatSshError, _SeatAuthError
 import bundled_scripts
 
 
@@ -32,17 +33,177 @@ class AppMixin:
             QMessageBox.warning(self, "No Device", "Please select a device first")
             return
 
-        apk_paths, _ = QFileDialog.getOpenFileNames(self, "Select APK file(s)", "", "APK files (*.apk);;All files (*.*)")
-        if not apk_paths:
+        # Show dialog first to let user choose deployment method
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Install APK")
+        dialog.setMinimumWidth(450)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # File selection
+        file_label = QLabel("Select APK file(s):")
+        layout.addWidget(file_label)
+
+        file_path = QLineEdit()
+        file_path.setReadOnly(True)
+        file_path.setPlaceholderText("Click Browse or drag APKs here...")
+        # Accept APK drops directly on this field
+        file_path.setAcceptDrops(True)
+        layout.addWidget(file_path)
+
+        browse_btn = QPushButton("Browse...")
+        layout.addWidget(browse_btn)
+
+        # Gateway checkbox - enabled, will prompt for mtc password if needed
+        gateway_checkbox = QCheckBox("Deploy using gateway (for seat devices)")
+        gateway_checkbox.setToolTip("Uses SCP tunnel to copy APK directly to seat")
+        layout.addWidget(gateway_checkbox)
+
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(button_box)
+
+        # Store file_path for use in the signal handler
+        dialog.file_path = file_path
+
+        browse_btn.clicked.connect(lambda: self._select_apk_for_install(dialog, file_path))
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+
+        # Enable drag-and-drop anywhere on the dialog (so the user can drop
+        # onto the label, browse button, or the field itself).
+        dialog.setAcceptDrops(True)
+        file_path.installEventFilter(self._ApkDropFilter(dialog, file_path))
+        dialog._apk_drop_handler = self._ApkDropFilter(dialog, file_path)
+        dialog.installEventFilter(dialog._apk_drop_handler)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        self._install_apk_files(apk_paths)
+        # Get the selected file(s) from dialog
+        if not (hasattr(dialog, 'selected_files') and dialog.selected_files):
+            return
 
-    def _install_apk_files(self, apk_paths):
+        # If gateway requested, ensure mtc password is available
+        mtc_password = None
+        if gateway_checkbox.isChecked():
+            # Try to get cached mtc password
+            if hasattr(self, 'credential_manager'):
+                mtc_password = self.credential_manager.get_password("mtc_global", "mtc")
+
+            # If not cached, prompt user
+            if not mtc_password:
+                if hasattr(self, 'credential_manager'):
+                    mtc_password = self.credential_manager.prompt_password(
+                        self, "mtc_global", "mtc", auto_save=True
+                    )
+                else:
+                    # Fallback simple prompt (use fully-qualified import to avoid shadowing)
+                    from PyQt6.QtWidgets import QInputDialog as _QInputDialog
+                    from PyQt6.QtWidgets import QLineEdit as _QLineEdit
+                    mtc_password, ok = _QInputDialog.getText(
+                        self,
+                        "MTC Password Required",
+                        "Enter mtc password for seat:",
+                        _QLineEdit.EchoMode.Password
+                    )
+                    if not ok:
+                        return
+
+            if not mtc_password:
+                return
+
+        self._install_apk_files(
+            dialog.selected_files,
+            use_gateway=gateway_checkbox.isChecked(),
+            mtc_password=mtc_password
+        )
+
+    class _ApkDropFilter(QObject):
+        """Event filter that accepts APK file drags dropped onto the install
+        dialog (or the read-only QLineEdit inside it) and updates the
+        dialog's selection in place.
+
+        Used by ``install_apk`` so the user can drag one or more APKs onto
+        the "Select APK file(s)" field (or anywhere on the dialog) without
+        having to click Browse first. Reuses the same selection shape as
+        ``_select_apk_for_install`` — sets ``dialog.selected_files`` and
+        updates the QLineEdit text/tooltip.
+        """
+
+        def __init__(self, dialog, file_path):
+            super().__init__(dialog)
+            self._dialog = dialog
+            self._file_path = file_path
+
+        @staticmethod
+        def _apk_paths_from_mime(mime):
+            """Return list of local .apk file paths in mime data, or [].
+
+            Mirrors the logic in adb_gui._has_apk_urls so the behaviour is
+            consistent with the main-window drop overlay.
+            """
+            paths = []
+            if mime is None or not mime.hasUrls():
+                return paths
+            for url in mime.urls():
+                path = url.toLocalFile()
+                if path and path.lower().endswith('.apk'):
+                    paths.append(path)
+            return paths
+
+        def eventFilter(self, obj, event):
+            et = event.type()
+            if et == QEvent.Type.DragEnter:
+                apks = self._apk_paths_from_mime(event.mimeData())
+                if apks:
+                    event.acceptProposedAction()
+                    return True
+            elif et == QEvent.Type.DragMove:
+                apks = self._apk_paths_from_mime(event.mimeData())
+                if apks:
+                    event.acceptProposedAction()
+                    return True
+            elif et == QEvent.Type.Drop:
+                apks = self._apk_paths_from_mime(event.mimeData())
+                if apks:
+                    # Replace any existing selection — dropping is a fresh
+                    # selection. If the user wants to add files, they can
+                    # use Browse (which appends via setText below) or drop
+                    # them all at once.
+                    self._dialog.selected_files = apks
+                    self._file_path.setText(
+                        ', '.join(os.path.basename(p) for p in apks)
+                    )
+                    self._file_path.setToolTip('\n'.join(apks))
+                    event.acceptProposedAction()
+                    return True
+            return super().eventFilter(obj, event)
+
+    def _select_apk_for_install(self, dialog, file_path):
+        """Show file dialog and store selected files in dialog"""
+        apk_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select APK file(s)", "", "APK files (*.apk);;All files (*.*)"
+        )
+        if apk_paths:
+            dialog.selected_files = apk_paths
+            file_path.setText(', '.join(os.path.basename(p) for p in apk_paths))
+            file_path.setToolTip('\n'.join(apk_paths))
+
+    def _install_apk_files(self, apk_paths, use_gateway=False, mtc_password=None):
         """Install one or more APK files in the currently selected device.
 
         Called from both the file dialog (install_apk) and drag-and-drop.
         Runs installs sequentially in a background thread.
+
+        Args:
+            apk_paths: List of paths to APK files
+            use_gateway: If True, deploy via gateway for seat devices
+            mtc_password: mtc user password for gateway deployment
         """
         if not self.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first")
@@ -59,27 +220,50 @@ class AppMixin:
 
         device_label = self.current_device
         total = len(apk_files)
-        self.log(f"Installing {total} APK(s) on {device_label}…")
-        self.update_status(f"Installing {total} APK(s)…")
+        self.log(f"Installing {total} APK(s) on {device_label}...")
+        self.update_status(f"Installing {total} APK(s)...")
+
+        # Initialize progress bar
+        if hasattr(self, 'progress_bar'):
+            QTimer.singleShot(0, lambda: self._show_progress(total, total))
 
         def do_install():
             for idx, apk_path in enumerate(apk_files, 1):
                 try:
                     fname = os.path.basename(apk_path)
-                    self.update_status(f"Installing [{idx}/{total}] {fname}…")
-                    self.log(f"[{idx}/{total}] Installing {fname}…")
-                    cmd = f"{self.get_device_flag()} install {shlex.quote(apk_path)}"
-                    result = self.adb.run_command(cmd, timeout=120)
-                    if result['success']:
-                        self.log(f"✅ [{idx}/{total}] {fname} installed successfully")
+                    self.update_status(f"Installing [{idx}/{total}] {fname}...")
+                    self.log(f"[{idx}/{total}] Installing {fname}...")
+
+                    # Update progress bar
+                    if hasattr(self, 'progress_bar'):
+                        QTimer.singleShot(0, lambda i=idx: self._update_progress(i))
+
+                    if use_gateway and self._is_seat_device(self.current_device):
+                        # Gateway deployment for seat devices
+                        self.log(f"Using gateway deployment", "INFO")
+                        self._install_via_gateway(apk_path, fname, mtc_password)
                     else:
-                        stderr = (result.get('stderr') or '').strip()
-                        self.log(f"❌ [{idx}/{total}] {fname} failed: {stderr[:200]}", "ERROR")
+                        # Regular ADB install
+                        if use_gateway:
+                            self.log(f"Not a seat device, using standard ADB install", "INFO")
+                        cmd = f"{self.get_device_flag()} install {shlex.quote(apk_path)}"
+                        self.update_status(f"Installing via ADB: {fname}...")
+                        result = self.adb.run_command(cmd, timeout=120)
+                        if result['success']:
+                            self.log(f"✅ [{idx}/{total}] {fname} installed successfully")
+                            self.update_status(f"✅ Completed [{idx}/{total}]")
+                        else:
+                            stderr = (result.get('stderr') or '').strip()
+                            self.log(f"❌ [{idx}/{total}] {fname} failed: {stderr[:200]}", "ERROR")
+                            self.update_status(f"❌ Failed [{idx}/{total}]")
                 except Exception as e:
                     self.log(f"❌ Error installing {apk_path}: {e}", "ERROR")
+                    self.update_status(f"❌ Error: {str(e)[:50]}")
 
-            # Final status update
+            # Hide progress bar and show completion
             def _done():
+                if hasattr(self, 'progress_bar'):
+                    self._hide_progress()
                 self.update_status(f"Finished installing {total} APK(s) on {device_label}")
                 QMessageBox.information(
                     self, "Install Complete",
@@ -88,6 +272,193 @@ class AppMixin:
             QTimer.singleShot(0, _done)
 
         threading.Thread(target=do_install, daemon=True).start()
+
+    def _install_via_gateway(self, apk_path, apk_name, mtc_password=None):
+        """Install APK via gateway using SCP with ProxyCommand tunnel
+
+        Args:
+            apk_path: Local path to APK
+            apk_name: APK filename
+            mtc_password: mtc user password for SCP authentication
+        """
+        device_id = self.current_device
+
+        # Get seat info
+        seat_name = ""
+        gateway = ""
+        try:
+            seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+            for dev_info in seat_sh_devices:
+                if dev_info.get('device') == device_id:
+                    seat_name = dev_info.get('seat', '')
+                    gateway = dev_info.get('gateway', '')
+                    break
+        except Exception as e:
+            self.log(f"Error getting seat info: {e}", "ERROR")
+            self.update_status("Gateway: Failed")
+            return
+
+        if not seat_name or not gateway or '@' not in gateway:
+            self.log("Missing seat/gateway info", "ERROR")
+            self.update_status("Gateway: Missing info")
+            return
+
+        gateway_user, gateway_host = gateway.split('@', 1)
+        # Copy to /tmp on the seat (was previously /storage/emulated/0/, i.e. /sdcard/).
+        remote_path = f"/tmp/{apk_name}"
+
+        self.log(f"Gateway: Copying {apk_name} → {seat_name}:{remote_path}", "INFO")
+        self.update_status(f"Gateway: Copying via SCP...")
+
+        # Get mtc password - try cache or use provided
+        if not mtc_password and hasattr(self, 'credential_manager'):
+            mtc_password = self.credential_manager.get_password("mtc_global", "mtc")
+
+        if not mtc_password:
+            self.log("No mtc password - falling back to adb push", "WARNING")
+            cmd = f"{self.get_device_flag()} push {shlex.quote(apk_path)} /sdcard/{apk_name}"
+            result = self.adb.run_command(cmd, timeout=120)
+            if result['success']:
+                cmd = f"{self.get_device_flag()} shell pm install -r -t /sdcard/{apk_name}"
+                result = self.adb.run_command(cmd, timeout=180)
+                if result['success']:
+                    self.update_status("✅ Installed (fallback)")
+                else:
+                    self.log("Install failed", "ERROR")
+            else:
+                self.log("Push failed", "ERROR")
+            return
+
+        # Establish jump host connection
+        try:
+            from .credentials import CredentialManager
+            creds = CredentialManager()
+            gw_pw = creds.get_password(gateway_host, gateway_user)
+            if not gw_pw:
+                # We can't prompt for the password here — we're on the
+                # install worker thread, and constructing a QInputDialog
+                # (or any QWidget) with parent=self would crash with
+                # "QObject::setParent: Cannot set parent, new parent is
+                # in a different thread" / "NSWindow should only be
+                # instantiated on the main thread". Normal flow caches
+                # the gateway password at seat-connect time, so this is
+                # rare. Tell the user how to fix it and fall back to
+                # adb-push.
+                self.log(
+                    f"Gateway password for {gateway_user}@{gateway_host} not "
+                    f"cached — connect to the seat once to cache it, then "
+                    f"retry. Falling back to adb push.",
+                    "WARNING",
+                )
+                self.update_status("Gateway: Password missing — connect seat first")
+                # Bail; the user can retry after connecting to the seat
+                # once to cache the gateway password.
+                raise _SeatSshError("gateway password not cached")
+
+            jump = _SeatJumpHost(f"{gateway_user}@{gateway_host}", gw_pw, self.log)
+
+            # No modal progress dialog here — we are inside the install
+            # worker thread, so any QWidget (including QProgressDialog) we
+            # construct with parent=self would crash with
+            # "QObject::setParent: Cannot set parent, new parent is in a
+            # different thread" / "NSWindow should only be instantiated on
+            # the main thread". Use self.log / self.update_status (which
+            # already marshal to the GUI thread) for feedback instead.
+
+            self.log(f"SCP: transferring {apk_name} via jump host helper...", "DEBUG")
+            try:
+                jump.run_scp(
+                    local_path=apk_path,
+                    remote_path=remote_path,
+                    seat_host=seat_name,
+                    mtc_password=mtc_password,
+                    timeout=300
+                )
+                self.log("SCP transfer successful", "INFO")
+            finally:
+                pass
+
+            # scp-as-mtc leaves the file at 0600; pm install runs as the
+            # shell user and can't read it. chmod 644 via the gateway →
+            # seat ssh chain before installing.
+            try:
+                jump.run_remote_command(
+                    seat_host=seat_name,
+                    mtc_password=mtc_password,
+                    command=f"chmod 644 {shlex.quote(remote_path)}",
+                    timeout=30,
+                )
+                self.log(f"chmod 644 {remote_path} on {seat_name} OK", "DEBUG")
+            except _SeatSshError as e:
+                self.log(f"chmod on seat failed: {e}", "WARNING")
+
+        except _SeatSshError as e:
+            self.log(f"SCP failed: {e}", "ERROR")
+            self.update_status("Gateway: SCP failed")
+            return
+        except Exception as e:
+            self.log(f"SCP exception: {e}", "ERROR")
+            self.update_status("Gateway: Exception")
+            return
+        finally:
+            if 'jump' in locals():
+                try: jump.close()
+                except: pass
+
+        # Install via pm install
+        self.update_status(f"Gateway: Installing {apk_name}...")
+        self.log("Running pm install...", "INFO")
+        cmd = f"{self.get_device_flag()} shell pm install -r -t {shlex.quote(remote_path)}"
+        result = self.adb.run_command(cmd, timeout=180)
+
+        stdout = (result.get('stdout') or '').strip()
+        stderr = (result.get('stderr') or '').strip()
+
+        if result['success'] and ('Success' in stdout or 'success' in stdout.lower() or not stdout):
+            self.log(f"✅ {apk_name} installed via gateway", "INFO")
+            self.update_status("Gateway: ✅ Installed")
+        else:
+            error_msg = stderr or stdout or 'Unknown'
+            self.log(f"❌ Install failed: {error_msg[:200]}", "ERROR")
+            self.update_status("Gateway: ❌ Install failed")
+
+    def _show_progress(self, current, total):
+        """Show progress bar and initialize values"""
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setMinimum(0)
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(current)
+
+    def _update_progress(self, value):
+        """Update progress bar value"""
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar.setValue(value)
+
+    def _hide_progress(self):
+        """Hide progress bar"""
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar.setVisible(False)
+
+    def _is_seat_device(self, device_id):
+        """Check if the given device ID is a seat device (connected via gateway)"""
+        if not device_id:
+            return False
+
+        # Seat devices are typically localhost:<port> format
+        if device_id.startswith('localhost:'):
+            return True
+
+        # Also check if this device is known to seat.sh
+        try:
+            seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+            for dev_info in seat_sh_devices:
+                if dev_info.get('device') == device_id and dev_info.get('seat'):
+                    return True
+        except Exception:
+            pass
+
+        return False
 
     def uninstall_app(self):
         """Uninstall app"""

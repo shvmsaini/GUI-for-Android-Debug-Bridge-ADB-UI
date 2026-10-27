@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QTextEdit, QLineEdit, QFileDialog,
     QMessageBox, QInputDialog, QFrame, QScrollArea, QGroupBox, QSizePolicy,
     QDialog, QListWidget, QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup, QTabWidget,
-    QCompleter, QDialogButtonBox, QTableWidgetItem
+    QCompleter, QDialogButtonBox, QTableWidgetItem, QProgressBar
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStandardPaths
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
@@ -926,7 +926,16 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
 
         content_layout.addWidget(self.logs_group, 2)
         main_layout.addLayout(content_layout, 1)
-        
+
+        # Progress bar for showing installation/operation progress
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMaximumHeight(20)
+        self.progress_bar.setMinimumHeight(20)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v / %m")
+        main_layout.addWidget(self.progress_bar)
+
         # Status bar - fixed height to prevent growing too big with long messages
         self.status_bar = QLabel("Ready")
         self.status_bar.setMaximumHeight(40)
@@ -1226,57 +1235,6 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
                     self.refresh_devices()
                 else:
                     QMessageBox.critical(self, "Error", "Failed to set ADB path")
-
-    def _install_apk_files(self, apk_paths):
-        """Install one or more APK files in the currently selected device.
-
-        Called from both the file dialog (install_apk) and drag-and-drop.
-        Runs installs sequentially in a background thread.
-        """
-        if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
-            return
-
-        if not apk_paths:
-            return
-
-        # Filter to APK files only
-        apk_files = [p for p in apk_paths if isinstance(p, str) and p.lower().endswith('.apk')]
-        if not apk_files:
-            QMessageBox.warning(self, "Invalid File", "No APK files selected.")
-            return
-
-        device_label = self.current_device
-        total = len(apk_files)
-        self.log(f"Installing {total} APK(s) on {device_label}…")
-        self.update_status(f"Installing {total} APK(s)…")
-
-        def do_install():
-            for idx, apk_path in enumerate(apk_files, 1):
-                try:
-                    fname = os.path.basename(apk_path)
-                    self.update_status(f"Installing [{idx}/{total}] {fname}…")
-                    self.log(f"[{idx}/{total}] Installing {fname}…")
-                    cmd = f"{self.get_device_flag()} install {shlex.quote(apk_path)}"
-                    result = self.adb.run_command(cmd, timeout=120)
-                    if result['success']:
-                        self.log(f"✅ [{idx}/{total}] {fname} installed successfully")
-                    else:
-                        stderr = (result.get('stderr') or '').strip()
-                        self.log(f"❌ [{idx}/{total}] {fname} failed: {stderr[:200]}", "ERROR")
-                except Exception as e:
-                    self.log(f"❌ Error installing {apk_path}: {e}", "ERROR")
-
-            # Final status update
-            def _done():
-                self.update_status(f"Finished installing {total} APK(s) on {device_label}")
-                QMessageBox.information(
-                    self, "Install Complete",
-                    f"Finished installing {total} APK file(s) on {device_label}."
-                )
-            QTimer.singleShot(0, _done)
-
-        threading.Thread(target=do_install, daemon=True).start()
 
     def extract_base_apk(self, package_name):
         """Extract the base APK from an installed app to local disk"""

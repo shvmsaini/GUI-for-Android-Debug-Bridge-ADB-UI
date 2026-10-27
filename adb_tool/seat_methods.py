@@ -40,7 +40,7 @@ import bundled_scripts
 # SSH helpers for the "Install ADB keys on seat" flow.
 #
 # Single paramiko transport to the gateway, then a `ssh -t mtc@<seat>
-# 'sudo -i'` chain driven by an interactive shell (same approach as
+# 'sudo -S su -'` chain driven by an interactive shell (same approach as
 # pac-seat-connector). The mtc password is fed twice — once for the SSH
 # login, once for the sudo password — so the user only ever types one
 # password (besides the gateway password).
@@ -247,7 +247,10 @@ class _SeatJumpHost:
             )
             askpass_file.write(
                 "#!/bin/sh\n"
-                f"cat '{pw_file.name}'\n"
+                f"case \"$1\" in\n"
+                f"  *\"password:\"*|*\"Password:\"*) cat '{pw_file.name}' ;;\n"
+                "  *) echo \"yes\" ;;\n"
+                "esac\n"
             )
             askpass_file.close()
             os.chmod(askpass_file.name, 0o700)
@@ -259,8 +262,9 @@ class _SeatJumpHost:
             ssh_cmd = [
                 "ssh",
                 "-tt",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "CheckHostIP=no",
                 "-o", f"ConnectTimeout=15",
                 "-p", str(port),
                 f"{user}@{host}",
@@ -407,24 +411,26 @@ class _SeatJumpHost:
                 "#!/bin/sh\n"
                 f"case \"$1\" in\n"
                 f"  *\"{mtc_user}@\"*) cat '{mtc_pw_file.name}' ;;\n"
-                f"  *) cat '{gw_pw_file.name}' ;;\n"
-                f"esac\n"
+                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
+                "  *) echo \"yes\" ;;\n"
+                "esac\n"
             )
             askpass_file.close()
             os.chmod(askpass_file.name, 0o700)
 
-            jump_spec = f"{self._user}@{self._host}"
-            if self._port != 22:
-                jump_spec = f"{self._user}@{self._host}:{self._port}"
-
             remote_spec = f"{mtc_user}@{seat_host}:{remote_path}"
+
+            proxy_cmd = f"ssh -W {seat_host}:22 {self._user}@{self._host}"
+            if self._port != 22:
+                proxy_cmd = f"ssh -p {self._port} -W {seat_host}:22 {self._user}@{self._host}"
 
             cmd = [
                 "scp",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-O",
+                "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "ConnectTimeout=15",
-                "-o", f"ProxyJump={jump_spec}",
+                "-o", f"ProxyCommand={proxy_cmd}",
             ]
             if recursive:
                 cmd.append("-r")
@@ -459,6 +465,90 @@ class _SeatJumpHost:
                 progress_callback(total_bytes, total_bytes)
 
             self._log(f"SCP: transfer complete ({os.path.basename(local_path) if to_remote else remote_path})")
+        finally:
+            for f in (gw_pw_file, mtc_pw_file, askpass_file):
+                if f:
+                    try: os.unlink(f.name)
+                    except: pass
+
+    def run_remote_command(self, seat_host, mtc_password, command,
+                           mtc_user='mtc', timeout=60):
+        """Run an arbitrary command on the seat as the mtc user via the gateway.
+
+        Uses the same SSH_ASKPASS plumbing as ``run_scp`` so the seat's
+        mtc password is supplied non-interactively. Returns the
+        ``subprocess.CompletedProcess`` so callers can inspect stdout /
+        stderr / returncode.
+
+        Args:
+            seat_host: Seat hostname (e.g. ``seat01`` or an IP).
+            mtc_password: Password for the seat's mtc account.
+            command: Shell command to run on the seat (passed verbatim
+                to ``ssh mtc@<seat> <command>``).
+            timeout: Seconds before the underlying ``ssh`` is killed.
+        """
+        if not mtc_password:
+            mtc_password = self._password
+
+        gw_pw_file = None
+        mtc_pw_file = None
+        askpass_file = None
+        try:
+            gw_pw_file = tempfile.NamedTemporaryFile(mode="w", delete=False, prefix="adb_gw_pw_")
+            gw_pw_file.write(self._password)
+            gw_pw_file.close()
+            os.chmod(gw_pw_file.name, 0o600)
+
+            mtc_pw_file = tempfile.NamedTemporaryFile(mode="w", delete=False, prefix="adb_mtc_pw_")
+            mtc_pw_file.write(mtc_password)
+            mtc_pw_file.close()
+            os.chmod(mtc_pw_file.name, 0o600)
+
+            askpass_file = tempfile.NamedTemporaryFile(mode="w", delete=False, prefix="adb_ssh_ap_", suffix=".sh")
+            # The prompt argument ($1) typically contains the user@host.
+            # Gateway: user@gateway's password:
+            # Seat: mtc@seat's password:
+            askpass_file.write(
+                "#!/bin/sh\n"
+                f"case \"$1\" in\n"
+                f"  *\"{mtc_user}@\"*) cat '{mtc_pw_file.name}' ;;\n"
+                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
+                "  *) echo \"yes\" ;;\n"
+                "esac\n"
+            )
+            askpass_file.close()
+            os.chmod(askpass_file.name, 0o700)
+
+            proxy_cmd = f"ssh -W {seat_host}:22 {self._user}@{self._host}"
+            if self._port != 22:
+                proxy_cmd = f"ssh -p {self._port} -W {seat_host}:22 {self._user}@{self._host}"
+
+            cmd = [
+                "ssh",
+                "-tt",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+                "-o", f"ProxyCommand={proxy_cmd}",
+                f"{mtc_user}@{seat_host}",
+                command,
+            ]
+
+            env = os.environ.copy()
+            env["SSH_ASKPASS"] = askpass_file.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = ":0"
+            env.pop("SSHPASS", None)
+
+            self._log(f"SSH: running on {seat_host}: {command}")
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+
+            if res.returncode != 0:
+                err = (res.stderr or res.stdout or "").strip()
+                raise _SeatSshError(
+                    f"ssh {mtc_user}@{seat_host} {command!r} failed (code {res.returncode}): {err[:300]}"
+                )
+            return res
         finally:
             for f in (gw_pw_file, mtc_pw_file, askpass_file):
                 if f:
@@ -607,8 +697,8 @@ def _clean_adb_key_line(raw_lines):
 
 
 def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
-    """From the jump host, run `ssh -t mtc@<seat> 'sudo -i'` and return the
-    resulting root shell.
+    """From the jump host, run `ssh -t mtc@<seat> 'sudo -S su -'` and
+    return the resulting root shell.
 
     The mtc password is fed twice:
       1. SSH to mtc@<seat> (login)
@@ -622,15 +712,18 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
         sh.drain(quiet=1.0, maxwait=8)
 
         # Build the SSH-to-seat command. -t forces a tty allocation so sudo
-        # reads its password from the remote tty (which is the only place our
-        # shell can write to).
+        # reads its password from the remote tty (the only place our shell
+        # can write to).
         #
-        # Use `sudo -i` to land in root's login shell so the append-key
-        # # command runs as root without further prompts.
+        # We use `sudo -S su -` rather than `sudo -i` because on some seat
+        # images `sudo -i` initialises a PAM session that mounts /data as
+        # read-only or otherwise blocks writing to /data/misc/adb — even
+        # though `id -u` still returns 0. `sudo -S su -` matches the working
+        # bundled-script path and lands us in a true root login shell.
         ssh_seat_cmd = (
             f"ssh -o StrictHostKeyChecking=accept-new "
             f"-o UserKnownHostsFile=/dev/null "
-            f"-tt mtc@{seat} 'sudo -i'"
+            f"-tt mtc@{seat} 'sudo -S su -'"
         )
         log(f"SEAT: {ssh_seat_cmd}")
         sh.buf = ""
@@ -692,19 +785,24 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
         out, _ = sh.run("id -u", timeout=10)
         if not re.search(r"^\s*0\s*$", out, re.M):
             raise _SeatSshError(
-                f"sudo -i did not land in root (id -u output: {out.strip()!r}). "
+                f"sudo -S su - did not land in root (id -u output: {out.strip()!r}). "
                 "Check the mtc password."
             )
 
-        # Sanity check: confirm /data/misc/adb exists — if not, we may have
-        # landed on the jump host, not the seat.
-        _, on_seat = sh.run("test -d /data/misc/adb", timeout=10)
-        if on_seat != 0:
+        # Sanity check: confirm we're on a seat shell. `/data/misc/adb` is
+        # created by adbd on first start, but on a freshly-imaged seat (or
+        # one where adbd hasn't run yet) the directory may not exist yet.
+        # Create it as root — that's safe on a seat — and bail only if even
+        # that fails, which means we landed on the jump host instead.
+        mkdir_out, mkdir_code = sh.run(
+            "mkdir -p /data/misc/adb && ls -ld /data/misc/adb", timeout=10)
+        if mkdir_code != 0:
             raise _SeatSshError(
-                f"This does not look like a seat shell (no /data/misc/adb), "
-                f"so nothing was written. Is `{seat}` correct?"
+                "Could not create /data/misc/adb on the remote shell — "
+                f"this does not look like a seat shell. Is `{seat}` correct? "
+                f"(mkdir output: {mkdir_out.strip()[:300]})"
             )
-        log("SEAT: root on seat")
+        log("SEAT: root on seat (/data/misc/adb ready)")
         return sh
     except Exception:
         if sh:
@@ -1615,6 +1713,37 @@ class SeatMixin:
                 # a tty AND DISPLAY is non-empty.
                 env.setdefault('DISPLAY', ':0')
 
+                # Pre-connect cleanup: run `seat.sh disconnect <seat>` BEFORE
+                # `auto-connect` so any saved port mapping for this seat is
+                # cleared and any lingering adb device binding is torn down.
+                # `auto-connect` reuses the saved port if one exists — even if
+                # the underlying SSH tunnel is dead — and that races with our
+                # `kill_seat_tunnel` pkill, leaving us bound to a stale port.
+                # Letting seat.sh do the disconnect also removes the seat's
+                # entry from the port map file, so `auto-connect` will fall
+                # through to `findFreePort` and pick a guaranteed-free port.
+                #
+                # This is best-effort: a non-zero return just means "no prior
+                # port mapping for this seat" — log and continue. We do not
+                # gate the connect on this succeeding.
+                try:
+                    self.log(f"Pre-connect: seat.sh disconnect {seat}", "DEBUG")
+                    _pre_dc = subprocess.run(
+                        [script_path, 'disconnect', seat],
+                        capture_output=True, text=True, timeout=10, env=env,
+                    )
+                    if _pre_dc.returncode != 0:
+                        self.log(
+                            f"Pre-connect disconnect returned {_pre_dc.returncode} "
+                            f"(treating as no-op); stderr={(_pre_dc.stderr or '').strip()[:200]}",
+                            "DEBUG",
+                        )
+                    else:
+                        self.log(f"Pre-connect disconnect OK: {(_pre_dc.stdout or '').strip()[:200]}", "DEBUG")
+                except Exception as _pre_dc_err:
+                    # Never fail connect because pre-cleanup hiccuped.
+                    self.log(f"Pre-connect disconnect failed (non-fatal): {_pre_dc_err}", "DEBUG")
+
                 cmd = [script_path, 'auto-connect', seat, gateway]
                 # IMPORTANT: redirect stdout/stderr to temp files instead of
                 # using capture_output=True. seat.sh runs `ssh -f -N -L ...`
@@ -1840,11 +1969,11 @@ class SeatMixin:
              password). Honours ``~/.ssh/config`` for ``ProxyCommand``
              (``*.vrack`` HTTPS tunnels).
           2. Open an interactive PTY shell on the gateway, then run
-             ``ssh -t mtc@<seat> 'sudo -i'``.
+             ``ssh -t mtc@<seat> 'sudo -S su -'``.
           3. Feed the mtc password for SSH login, then again for the sudo
              prompt on the seat.
           4. Verify we're root on the seat (``id -u`` = 0 and
-             ``/data/misc/adb`` exists).
+             ``/data/misc/adb`` exists, creating the dir if necessary).
           5. Dedup-check, then append ``adb_key`` to
              ``/data/misc/adb/adb_keys`` and verify by reading it back.
 
@@ -2208,16 +2337,59 @@ class SeatMixin:
         """SSH into the gateway and run `arp -a` to discover connected seats.
 
         Returns dict {name: ip} like _read_arp_table() but from the gateway's
-        network, not the local machine.
+        network, not the local machine. Honours ``~/.ssh/config`` ProxyCommand
+        (so ``*.vrack`` hosts tunnel via the configured jump host).
         """
         import paramiko
         arp_entries = {}
 
+        # Resolve ProxyCommand / User / Port from ~/.ssh/config so vrack
+        # gateways (which SSH-over-HTTPS through a jump host) work.
+        cfg_user, cfg_host, cfg_port, proxy_cmd = _lookup_ssh_config(gateway_host)
+        if cfg_user and not gateway_user:
+            gateway_user = cfg_user
+        if cfg_host:
+            gateway_host = cfg_host
+
+        sock = None
+        proc = None
+        if proxy_cmd:
+            try:
+                # Split the proxy command into argv (shlex honours quoted args).
+                proxy_argv = shlex.split(proxy_cmd)
+                proc = subprocess.Popen(
+                    proxy_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                sock = _ProxySocket(proc)
+            except Exception as e:
+                self.log(f"ProxyCommand setup failed: {e}", "DEBUG")
+                sock = None
+                try:
+                    if proc is not None:
+                        proc.kill()
+                except Exception:
+                    pass
+
+        client = None
         try:
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(gateway_host, username=gateway_user, password=password,
-                         timeout=8, banner_timeout=8, auth_timeout=8)
+            connect_kwargs = dict(
+                username=gateway_user,
+                password=password,
+                timeout=8, banner_timeout=8, auth_timeout=8,
+                allow_agent=False, look_for_keys=False,
+            )
+            if cfg_port:
+                connect_kwargs['port'] = cfg_port
+            if sock is not None:
+                connect_kwargs['sock'] = sock
+
+            client.connect(gateway_host, **connect_kwargs)
 
             stdin, stdout, stderr = client.exec_command('arp -a', timeout=8)
             # Read with timeout to prevent hanging forever
@@ -2252,9 +2424,24 @@ class SeatMixin:
                 if ip and name:
                     arp_entries[name] = ip
 
-            client.close()
         except Exception as e:
             self.log(f"SSH arp discovery failed: {e}", "DEBUG")
+        finally:
+            try:
+                if client is not None:
+                    client.close()
+            except Exception:
+                pass
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
 
         return arp_entries
 
@@ -2446,20 +2633,73 @@ class SeatMixin:
             # Show "Loading..." and disable button
             seat_combo.blockSignals(True)
             seat_combo.clear()
-            seat_combo.addItem("⏳ Loading seats...")
+            seat_combo.addItem("⏳ Loading seats from gateway...")
             seat_combo.blockSignals(False)
             search_btn.setEnabled(False)
 
-            # Run scan synchronously (no SSH, just local lookup)
-            try:
-                suggestions = populate_seat_options_gw(gateway_text)
-                seat_cache[gateway_host] = suggestions
-                update_seat_combo(suggestions)
-            except Exception as e:
-                self.log(f"Scan failed: {e}", "DEBUG")
-                update_seat_combo([])
-            finally:
-                search_btn.setEnabled(True)
+            # Try to get a cached password; if not, prompt once and cache.
+            gw_password = self.credential_manager.get_password(gateway_host, gateway_user)
+            if not gw_password:
+                gw_password, ok = QInputDialog.getText(
+                    dialog, "Gateway Password",
+                    f"Enter SSH password for {gateway_text} (cached for future scans):",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok or not gw_password:
+                    search_btn.setEnabled(True)
+                    update_seat_combo([])
+                    return
+                try:
+                    self.credential_manager.set_password(gateway_host, gateway_user, gw_password)
+                except Exception:
+                    pass
+
+            def do_scan():
+                """Run remote arp first, fall back to local arp on failure."""
+                suggestions = []
+                source = "none"
+                try:
+                    remote = self._ssh_run_arp_on_gateway(
+                        gateway_user, gateway_host, gw_password
+                    )
+                    if remote:
+                        # Sort by IP for stable ordering; use "name (ip)" so the
+                        # user can see which seat each IP belongs to.
+                        def _ip_key(entry):
+                            try:
+                                return tuple(int(p) for p in entry[1].split('.'))
+                            except Exception:
+                                return (0, 0, 0, 0)
+                        for name, ip in sorted(remote.items(), key=_ip_key):
+                            suggestions.append(f"{name} ({ip})" if name and name != '?' else ip)
+                        source = "gateway"
+                    else:
+                        self.log("Remote arp returned no entries; falling back to local", "DEBUG")
+                except Exception as e:
+                    self.log(f"Remote arp failed: {e}", "DEBUG")
+
+                if not suggestions:
+                    try:
+                        local = self._read_arp_table()
+                        for name, ip in local.items():
+                            if ip:
+                                suggestions.append(f"{name} ({ip})" if name and name != '?' else ip)
+                        if suggestions:
+                            source = "local"
+                    except Exception:
+                        pass
+
+                def apply():
+                    if gateway_host not in seat_cache:
+                        seat_cache[gateway_host] = suggestions
+                    update_seat_combo(suggestions)
+                    search_btn.setEnabled(True)
+                    if source == "none":
+                        self.log("Seat scan: no entries found", "DEBUG")
+
+                QTimer.singleShot(0, apply)
+
+            threading.Thread(target=do_scan, daemon=True).start()
 
         search_btn.clicked.connect(on_search_clicked)
 
@@ -2538,8 +2778,8 @@ class SeatMixin:
             if install_adb_key:
                 # Single mtc password covers both the SSH login to the seat
                 # and the sudo prompt on the seat (the user's flow: ssh to
-                # gateway, then `ssh -t mtc@<seat> 'sudo -i'` using the same
-                # password twice). The mtc password is the same across ALL
+                # gateway, then `ssh -t mtc@<seat> 'sudo -S su -'` using the
+                # same password twice). The mtc password is the same across ALL
                 # seats and gateways, so we cache it under one canonical key
                 # and only re-prompt if the install fails with auth error.
                 mtc_key = "mtc@adb-gui-ui"

@@ -179,10 +179,10 @@ class FileMixin:
 
         # Buttons
         btn_row = QHBoxLayout()
-        upload_btn = QPushButton("⬆️ Upload…")
-        download_btn = QPushButton("⬇️ Download…")
+        upload_btn = QPushButton("⬆️ Push")
+        download_btn = QPushButton("⬇️ Pull")
         delete_btn = QPushButton("🗑️ Delete")
-        mkdir_btn = QPushButton("📁 New Folder…")
+        mkdir_btn = QPushButton("📁 New Folder")
         rename_btn = QPushButton("📝 Rename")
         install_apk_btn = QPushButton("📱 Install APK")
         close_btn = QPushButton("Close")
