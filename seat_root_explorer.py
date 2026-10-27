@@ -198,7 +198,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
 
         # Buttons row
         btn_row = QHBoxLayout()
-        push_btn = QPushButton("⬆️ Push as root")
+        push_btn = QPushButton("⬆️ Push")
         copy_gw_btn = QPushButton("⬆️ Copy to Gateway")
         pull_btn = QPushButton("⬇️ Pull")
         edit_btn = QPushButton("📝 Edit")
@@ -252,7 +252,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             listbox.setItem(0, 0, QTableWidgetItem("Loading…"))
             def do_ls():
                 try:
-                    cmd = f"cd {shlex.quote(p)} 2>/dev/null; LC_ALL=C ls -la"
+                    cmd = f"cd {shlex.quote(p)} 2>/dev/null ; LC_ALL=C ls -la"
                     out, code = shell.run(cmd, timeout=20)
                     if code != 0:
                         raise Exception("ls failed")
@@ -264,9 +264,18 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         parts = line.split()
                         if len(parts) < 6:
                             continue
+                        # For ls -la, parts[0] = mode, [1] = links, [2] = user, [3] = group, [4] = size
+                        # [5] = month, [6] = day, [7] = time/year, rest = filename
+                        # Make sure we have enough parts before trying to extract
+                        if len(parts) < 9:
+                            continue
                         size_col = parts[4]
                         name = ' '.join(parts[8:])
+                        # Skip . and .. entries
                         if name in ('.', '..'):
+                            continue
+                        # Also skip if the name is the command itself
+                        if name.lower() in ('ls', 'l'):
                             continue
                         is_dir = parts[0][0] == 'd'
                         if is_dir:

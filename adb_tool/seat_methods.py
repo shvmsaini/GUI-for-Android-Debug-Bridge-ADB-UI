@@ -426,6 +426,7 @@ class _SeatJumpHost:
 
             cmd = [
                 "scp",
+                "-v",  # verbose: emits per-progress lines to stderr
                 "-O",
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
@@ -451,16 +452,85 @@ class _SeatJumpHost:
             source_path = local_path if to_remote else None
             total_bytes = os.path.getsize(source_path) if source_path and os.path.exists(source_path) else 0
 
-            # Use a longer timeout for large file transfers
-            # Note: scp doesn't provide easy progress, so we just track completion
-            # For better progress, consider using rsync --progress or pv
-            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+            # Stream stderr with -v so we can parse per-percent progress.
+            # Format we care about (scp OpenBSD):
+            #     <pct>%   <sent>   <rate>   <eta>
+            # e.g. "foo.apk    42%   512KB   1.2MB/s   00:01"
+            # Earlier lines (debug, banners) are ignored.
+            proc = subprocess.Popen(
+                cmd, env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True, bufsize=1,
+            )
+            sent_last = 0
+            progress_re = re.compile(
+                r"\S+\s+(\d+)%\s+(\d+)(KB|MB|GB|B)\s+"
+            )
+            try:
+                # Read stderr line-by-line on a worker thread so we can
+                # parse progress live. stdout is drained on the same
+                # thread to keep scp from blocking.
+                stderr_lines = []
+                stdout_lines = []
 
-            if res.returncode != 0:
-                err = res.stderr.strip() or res.stdout.strip()
-                raise _SeatSshError(f"scp failed (code {res.returncode}): {err[:300]}")
+                def _drain(stream, sink, parse_progress=False):
+                    for line in stream:
+                        sink.append(line)
+                        if parse_progress and progress_callback and total_bytes > 0:
+                            m = progress_re.search(line)
+                            if m:
+                                pct = int(m.group(1))
+                                # Use percentage to compute bytes so the
+                                # bar reflects actual progress, not the
+                                # cumulative "sent this round" figure
+                                # scp emits (which resets per buffer).
+                                sent = total_bytes * pct // 100
+                                if sent > sent_last:
+                                    sent_last = sent
+                                    try:
+                                        progress_callback(sent, total_bytes)
+                                    except Exception:
+                                        pass
 
-            # Report completion
+                t_err = threading.Thread(
+                    target=_drain, args=(proc.stderr, stderr_lines),
+                    kwargs={"parse_progress": True}, daemon=True)
+                t_out = threading.Thread(
+                    target=_drain, args=(proc.stdout, stdout_lines),
+                    daemon=True)
+                t_err.start()
+                t_out.start()
+
+                try:
+                    returncode = proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    t_err.join(timeout=2)
+                    t_out.join(timeout=2)
+                    raise _SeatSshError(
+                        f"scp timed out after {timeout}s"
+                    )
+
+                t_err.join(timeout=5)
+                t_out.join(timeout=5)
+            finally:
+                try:
+                    if proc.stdout: proc.stdout.close()
+                except Exception: pass
+                try:
+                    if proc.stderr: proc.stderr.close()
+                except Exception: pass
+
+            stderr = ''.join(stderr_lines)
+
+            if returncode != 0:
+                raise _SeatSshError(
+                    f"scp failed (code {returncode}): "
+                    f"{stderr.strip()[:300] or '(no stderr)'}"
+                )
+
+            # Report final completion
             if progress_callback and total_bytes > 0:
                 progress_callback(total_bytes, total_bytes)
 

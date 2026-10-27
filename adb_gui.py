@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QTextEdit, QLineEdit, QFileDialog,
     QMessageBox, QInputDialog, QFrame, QScrollArea, QGroupBox, QSizePolicy,
     QDialog, QListWidget, QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup, QTabWidget,
-    QCompleter, QDialogButtonBox, QTableWidgetItem, QProgressBar
+    QCompleter, QDialogButtonBox, QTableWidgetItem
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStandardPaths
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
@@ -926,15 +926,6 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
 
         content_layout.addWidget(self.logs_group, 2)
         main_layout.addLayout(content_layout, 1)
-
-        # Progress bar for showing installation/operation progress
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setMaximumHeight(20)
-        self.progress_bar.setMinimumHeight(20)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%v / %m")
-        main_layout.addWidget(self.progress_bar)
 
         # Status bar - fixed height to prevent growing too big with long messages
         self.status_bar = QLabel("Ready")

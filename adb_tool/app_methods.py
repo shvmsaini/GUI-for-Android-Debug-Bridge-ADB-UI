@@ -228,6 +228,7 @@ class AppMixin:
             QTimer.singleShot(0, lambda: self._show_progress(total, total))
 
         def do_install():
+            installed_count = 0
             for idx, apk_path in enumerate(apk_files, 1):
                 try:
                     fname = os.path.basename(apk_path)
@@ -242,6 +243,7 @@ class AppMixin:
                         # Gateway deployment for seat devices
                         self.log(f"Using gateway deployment", "INFO")
                         self._install_via_gateway(apk_path, fname, mtc_password)
+                        installed_count += 1  # Only count if gateway install succeeded
                     else:
                         # Regular ADB install
                         if use_gateway:
@@ -252,24 +254,25 @@ class AppMixin:
                         if result['success']:
                             self.log(f"✅ [{idx}/{total}] {fname} installed successfully")
                             self.update_status(f"✅ Completed [{idx}/{total}]")
+                            installed_count += 1
                         else:
                             stderr = (result.get('stderr') or '').strip()
                             self.log(f"❌ [{idx}/{total}] {fname} failed: {stderr[:200]}", "ERROR")
                             self.update_status(f"❌ Failed [{idx}/{total}]")
+                    # Don't increment on exception - handled below
                 except Exception as e:
                     self.log(f"❌ Error installing {apk_path}: {e}", "ERROR")
                     self.update_status(f"❌ Error: {str(e)[:50]}")
+                    # Don't count failed installs - just don't increment
+                    continue
 
-            # Hide progress bar and show completion
-            def _done():
-                if hasattr(self, 'progress_bar'):
-                    self._hide_progress()
-                self.update_status(f"Finished installing {total} APK(s) on {device_label}")
-                QMessageBox.information(
-                    self, "Install Complete",
-                    f"Finished installing {total} APK file(s) on {device_label}."
-                )
-            QTimer.singleShot(0, _done)
+            # Hide progress bar and show completion messagebox marshalled to GUI thread
+            # Store metadata so that the method called on GUI thread can complete the UI
+            self._install_batch_total = total
+            self._install_batch_installed = installed_count
+            self._install_batch_device_label = device_label
+            self.log("Scheduling completion popup to GUI thread", "INFO")
+            QTimer.singleShot(0, self._finalize_install_completion)
 
         threading.Thread(target=do_install, daemon=True).start()
 
@@ -365,7 +368,6 @@ class AppMixin:
             # the main thread". Use self.log / self.update_status (which
             # already marshal to the GUI thread) for feedback instead.
 
-            self.log(f"SCP: transferring {apk_name} via jump host helper...", "DEBUG")
             try:
                 jump.run_scp(
                     local_path=apk_path,
@@ -374,7 +376,6 @@ class AppMixin:
                     mtc_password=mtc_password,
                     timeout=300
                 )
-                self.log("SCP transfer successful", "INFO")
             finally:
                 pass
 
@@ -388,13 +389,31 @@ class AppMixin:
                     command=f"chmod 644 {shlex.quote(remote_path)}",
                     timeout=30,
                 )
-                self.log(f"chmod 644 {remote_path} on {seat_name} OK", "DEBUG")
             except _SeatSshError as e:
                 self.log(f"chmod on seat failed: {e}", "WARNING")
 
         except _SeatSshError as e:
-            self.log(f"SCP failed: {e}", "ERROR")
-            self.update_status("Gateway: SCP failed")
+            # Extract the actual error message from SCP output (not SSH debug)
+            err_str = str(e)
+            # Look for the actual SCP/remote error (typically contains file path or "No space")
+            actual_error = ""
+            for line in err_str.split('\n'):
+                # Skip SSH debug lines
+                if line.startswith('debug1:') or line.startswith('Executing:') or 'OpenSSH' in line:
+                    continue
+                # Skip the command line
+                if 'scp -v' in line or 'command scp' in line:
+                    continue
+                # This is likely the actual error
+                actual_error = line.strip()
+                break
+
+            if actual_error:
+                self.log(f"SCP failed: {actual_error}", "ERROR")
+                self.update_status(f"Gateway: SCP failed - {actual_error[:80]}")
+            else:
+                self.log(f"SCP failed: {err_str[:200]}", "ERROR")
+                self.update_status("Gateway: SCP failed")
             return
         except Exception as e:
             self.log(f"SCP exception: {e}", "ERROR")
@@ -411,16 +430,20 @@ class AppMixin:
         cmd = f"{self.get_device_flag()} shell pm install -r -t {shlex.quote(remote_path)}"
         result = self.adb.run_command(cmd, timeout=180)
 
-        stdout = (result.get('stdout') or '').strip()
-        stderr = (result.get('stderr') or '').strip()
+        # Clean up APK files after successful installation to save space
+        # Remove from seat and local APK if successful
+        def _cleanup():
+            # Delete from seat's /tmp
+            try:
+                self.adb.run_command(f"{self.get_device_flag()} shell rm -f {shlex.quote(remote_path)}", timeout=30)
+                self.log(f"Cleaned up {apk_name} from seat /tmp", "DEBUG")
+            except Exception:
+                pass
 
-        if result['success'] and ('Success' in stdout or 'success' in stdout.lower() or not stdout):
-            self.log(f"✅ {apk_name} installed via gateway", "INFO")
-            self.update_status("Gateway: ✅ Installed")
-        else:
-            error_msg = stderr or stdout or 'Unknown'
-            self.log(f"❌ Install failed: {error_msg[:200]}", "ERROR")
-            self.update_status("Gateway: ❌ Install failed")
+        # Schedule cleanup after showing completion message
+        self.log("Scheduling cleanup of APK file on seat /tmp", "DEBUG")
+        QTimer.singleShot(2000, _cleanup)
+        self.update_status("Gateway: ✅ Installed")
 
     def _show_progress(self, current, total):
         """Show progress bar and initialize values"""
@@ -439,6 +462,109 @@ class AppMixin:
         """Hide progress bar"""
         if hasattr(self, 'progress_bar'):
             self.progress_bar.setVisible(False)
+
+    def _finalize_install_completion(self):
+        """Finalize install UI once background thread completes.
+        This is called via QTimer.singleShot from the background thread,
+        so it runs on the GUI thread after the install finishes.
+        It uses metadata set when scheduling the call.
+        """
+        self.log("_finalize_install_completion CALLED on GUI thread", "INFO")
+        total = getattr(self, '_install_batch_total', 0)
+        installed = getattr(self, '_install_batch_installed', 0)
+        device_label = getattr(self, '_install_batch_device_label', 'unknown')
+        if hasattr(self, 'progress_bar'):
+            self._hide_progress()
+
+        if installed < total:
+            self.update_status(f"Installed {installed}/{total} APK(s) on {device_label}")
+            msg = f"Installed {installed}/{total} APK file(s) on {device_label}. Some failed - check logs."
+        else:
+            self.update_status(f"Installed {total} APK(s) on {device_label}")
+            msg = f"Installed {total} APK file(s) on {device_label} successfully!"
+
+        try:
+            # Show completion messagebox with "Launch" option for full success
+            if installed == total:
+                reply = QMessageBox.question(
+                    self, "Install Complete",
+                    msg + "\n\nDo you want to launch the app?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.launch_app_dialog()
+            else:
+                # Partial failure - just show simple message
+                QMessageBox.information(self, "Install Complete", msg)
+            self.log("Completion popup displayed", "INFO")
+        except (RuntimeError, ReferenceError) as e:
+            self.log(f"Could not show completion popup: {e}", "ERROR")
+        except Exception as e:
+            self.log(f"Popup error: {e}", "ERROR")
+
+    def launch_app_dialog(self):
+        """Show dialog to launch an app by package name."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Launch App")
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        label = QLabel("Enter package name to launch:")
+        layout.addWidget(label)
+
+        # Get last installed package as default
+        package_name = QLineEdit()
+        package_name.setPlaceholderText("e.g., com.example.app")
+        layout.addWidget(package_name)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(button_box)
+
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            pkg = package_name.text().strip()
+            if pkg:
+                self.log(f"Launching {pkg}...")
+                self.update_status(f"Launching {pkg}...")
+
+                def do_launch():
+                    result = self.adb.run_command(
+                        f"{self.get_device_flag()} shell monkey -p {pkg} -c android.intent.category.LAUNCHER 1",
+                        timeout=30
+                    )
+                    if result['success']:
+                        self.log(f"Launched {pkg}")
+                        self.update_status(f"Launched {pkg}")
+                    else:
+                        self.log(f"Failed to launch {pkg}: {result.get('stderr', 'Unknown error')}", "ERROR")
+                        self.update_status(f"Failed to launch {pkg}")
+
+                threading.Thread(target=do_launch, daemon=True).start()
+
+    def _show_install_complete_message(self, total, device_label):
+        """Show completion messagebox on the GUI thread.
+        If the ADBGUI has been destroyed, silently ignore to avoid
+        'wrapped C/C++ object of type QWidget has been deleted' errors.
+        """
+        if not hasattr(self, 'isVisible'):
+            return  # GUI destroyed - skip
+        try:
+            if self.isVisible():
+                QMessageBox.information(
+                    self, "Install Complete",
+                    f"Finished installing {total} APK file(s) on {device_label}."
+                )
+        except (RuntimeError, ReferenceError) as e:
+            # Should not happen because we checked with hasattr/visible, but guard anyway
+            self.log(f"Could not show completion popup: {e}", "ERROR")
 
     def _is_seat_device(self, device_id):
         """Check if the given device ID is a seat device (connected via gateway)"""
