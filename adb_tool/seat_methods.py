@@ -521,25 +521,51 @@ class _SeatJumpHost:
                     if proc.stderr: proc.stderr.close()
                 except Exception: pass
 
-# Filter out SSH debug noise to get the actual error
+            # Filter out SSH/ProxyCommand debug noise to get the actual error.
+            # scp on OpenBSD reports failures as:  scp: <path>: <reason>
+            # (e.g. "scp: /foo.apk: Read-only file system", "scp: /foo: Permission denied")
+            # Everything else is usually SSH/cert/ProxyCommand noise.
             actual_errors = []
+            scp_errors = []
             for line in stderr_lines:
-                # Skip SSH debug lines and noise
-                if (line.startswith('debug1:') or
-                    'Reading configuration data' in line or
-                    line.startswith('Executing:') or
-                    any(x in line for x in ['OpenSSH', 'LibreSSL', 'command scp', 'debug1: Entering', 'debug1:'])):
+                if (
+                    line.startswith('debug1:')
+                    or 'Reading configuration data' in line
+                    or line.startswith('Executing:')
+                    or 'OpenSSH' in line
+                    or 'LibreSSL' in line
+                    or 'command scp' in line
+                    # ProxyCommand / TLS cert chain noise from *.vrack gateways
+                    or line.startswith('depth=')
+                    or 'verify return:' in line
+                    or 'Verify return code' in line
+                    or line.startswith('debug')
+                ):
                     continue
-                line = line.strip()
-                if line:
-                    actual_errors.append(line)
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith('scp:'):
+                    scp_errors.append(stripped)
+                else:
+                    actual_errors.append(stripped)
 
-            stderr_clean = '\n'.join(actual_errors)
+            kept_lines = []
+            total = 0
+            for ln in (scp_errors + actual_errors):
+                if len(ln) > 400:
+                    ln = ln[:400] + '…'
+                if total + len(ln) + 1 > 800:
+                    kept_lines.append('…(truncated)')
+                    break
+                kept_lines.append(ln)
+                total += len(ln) + 1
+            stderr_clean = '\n'.join(kept_lines)
 
             if returncode != 0:
                 raise _SeatSshError(
                     f"scp failed (code {returncode}): "
-                    f"{stderr_clean.strip()[:300] or '(no stderr)'}"
+                    f"{stderr_clean.strip() or '(no stderr)'}"
                 )
 
             # Report final completion

@@ -371,13 +371,14 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             def do_upload():
                 ok = 0
                 failed = 0
-
+                failed_items = []
+                total = len(files)
                 for i, f in enumerate(files):
                     basename = os.path.basename(f)
                     target_path = join_remote(dest, basename)
 
                     parent.log(f"Copying {basename}…", "INFO")
-                    _set_progress(int(100 * i / len(files)), f"Copying {basename}…")
+                    _set_progress(int(100 * i / total), f"Copying {basename}…")
 
                     try:
                         jump.run_scp(
@@ -390,8 +391,10 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         ok += 1
                         parent.log(f"✓ {seat_hostname}:{target_path}", "INFO")
                     except _SeatSshError as e:
+                        err = str(e).strip()
                         failed += 1
-                        parent.log(f"✗ {basename}: {str(e).strip()[:100]}", "ERROR")
+                        failed_items.append(f"{basename}: {err}")
+                        parent.log(f"✗ {basename}: {err[:200]}", "ERROR")
 
                 def done():
                     try:
@@ -400,11 +403,52 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     except Exception:
                         pass
                     if failed == len(files):
-                        QMessageBox.warning(explorer, "Upload Failed",
-                            f"Failed to upload all files to {seat_hostname}:{dest}")
+                        summary = f"Failed to upload all files to {seat_hostname}:{dest}"
+                        box = QMessageBox(explorer)
+                        box.setIcon(QMessageBox.Icon.Warning)
+                        box.setWindowTitle("Upload Failed")
+                        box.setText(summary)
+                        if failed_items:
+                            if len(failed_items) <= 3:
+                                # Short — just show inline
+                                box.setInformativeText(
+                                    "Errors:\n" + "\n".join(failed_items)
+                                )
+                            else:
+                                # Longer — first 3 inline, the rest in the
+                                # collapsible "Show Details…" expander.
+                                box.setInformativeText(
+                                    "Errors (first 3):\n"
+                                    + "\n".join(failed_items[:3])
+                                    + f"\n…and {len(failed_items) - 3} more"
+                                )
+                                box.setDetailedText("\n".join(failed_items))
+                        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+                        box.exec()
                     elif failed > 0:
-                        QMessageBox.warning(explorer, "Upload Complete with Errors",
-                            f"Copied: {ok}\nFailed: {failed}\n\n{seat_hostname}:{dest}")
+                        summary = (
+                            f"Copied: {ok}\n"
+                            f"Failed: {failed}\n\n"
+                            f"Destination: {seat_hostname}:{dest}"
+                        )
+                        box = QMessageBox(explorer)
+                        box.setIcon(QMessageBox.Icon.Warning)
+                        box.setWindowTitle("Upload Complete with Errors")
+                        box.setText(summary)
+                        if failed_items:
+                            if len(failed_items) <= 3:
+                                box.setInformativeText(
+                                    "Errors:\n" + "\n".join(failed_items)
+                                )
+                            else:
+                                box.setInformativeText(
+                                    "Errors (first 3):\n"
+                                    + "\n".join(failed_items[:3])
+                                    + f"\n…and {len(failed_items) - 3} more"
+                                )
+                                box.setDetailedText("\n".join(failed_items))
+                        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+                        box.exec()
                     else:
                         QMessageBox.information(explorer, "Upload Complete",
                             f"Copied {ok} file(s) to:\n{seat_hostname}:{dest}")
