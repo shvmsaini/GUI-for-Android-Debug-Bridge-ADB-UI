@@ -426,7 +426,6 @@ class _SeatJumpHost:
 
             cmd = [
                 "scp",
-                "-v",  # verbose: emits per-progress lines to stderr
                 "-O",
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
@@ -522,12 +521,25 @@ class _SeatJumpHost:
                     if proc.stderr: proc.stderr.close()
                 except Exception: pass
 
-            stderr = ''.join(stderr_lines)
+# Filter out SSH debug noise to get the actual error
+            actual_errors = []
+            for line in stderr_lines:
+                # Skip SSH debug lines and noise
+                if (line.startswith('debug1:') or
+                    'Reading configuration data' in line or
+                    line.startswith('Executing:') or
+                    any(x in line for x in ['OpenSSH', 'LibreSSL', 'command scp', 'debug1: Entering', 'debug1:'])):
+                    continue
+                line = line.strip()
+                if line:
+                    actual_errors.append(line)
+
+            stderr_clean = '\n'.join(actual_errors)
 
             if returncode != 0:
                 raise _SeatSshError(
                     f"scp failed (code {returncode}): "
-                    f"{stderr.strip()[:300] or '(no stderr)'}"
+                    f"{stderr_clean.strip()[:300] or '(no stderr)'}"
                 )
 
             # Report final completion

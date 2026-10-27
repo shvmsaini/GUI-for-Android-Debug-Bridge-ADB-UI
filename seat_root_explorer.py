@@ -351,6 +351,8 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             # Destination is the current path on the seat
             dest = current_path()
 
+            # Use a simpler flow: just do the push right away
+            # Error handling will detect read-only and suggest fallback
             parent.log(f"Pushing {len(files)} file(s) from local to {seat_hostname}:{dest}", "INFO")
             parent.update_status("Pushing to seat…")
 
@@ -369,16 +371,14 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             def do_upload():
                 ok = 0
                 failed = 0
-                readonly_fallbacks = 0  # Files that hit read-only FS and got copied to /storage/emulated/0
 
                 for i, f in enumerate(files):
                     basename = os.path.basename(f)
                     target_path = join_remote(dest, basename)
 
-                    parent.log(f"Local: scp {basename} → {seat_hostname}:{target_path}", "INFO")
+                    parent.log(f"Copying {basename}…", "INFO")
                     _set_progress(int(100 * i / len(files)), f"Copying {basename}…")
 
-                    # Run SCP from LOCAL machine to seat via gateway tunnel
                     try:
                         jump.run_scp(
                             local_path=f,
@@ -388,50 +388,10 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             timeout=300
                         )
                         ok += 1
-                        parent.log(f"Copied {basename} to {seat_hostname}:{target_path}", "INFO")
+                        parent.log(f"✓ {seat_hostname}:{target_path}", "INFO")
                     except _SeatSshError as e:
-                        stderr = str(e)
-                        # Detect read-only filesystem errors
-                        is_readonly = (
-                            "Read-only file system" in stderr or
-                            "read-only file system" in stderr.lower() or
-                            "Read-only" in stderr or
-                            "EROFS" in stderr
-                        )
-
-                        if is_readonly:
-                            # Fallback: copy to /storage/emulated/0 instead
-                            fallback_path = f"/storage/emulated/0/{basename}"
-                            parent.log(
-                                f"Target path {target_path} is read-only on seat {seat_hostname}. "
-                                f"Falling back to {fallback_path}",
-                                "WARNING"
-                            )
-                            _set_progress(int(100 * i / len(files)), f"Retrying {basename}…")
-
-                            try:
-                                jump.run_scp(
-                                    local_path=f,
-                                    remote_path=shlex.quote(fallback_path),
-                                    seat_host=seat_hostname,
-                                    mtc_password=mtc_password,
-                                    timeout=300
-                                )
-                                ok += 1
-                                readonly_fallbacks += 1
-                                parent.log(
-                                    f"Copied {basename} to fallback path {fallback_path}",
-                                    "INFO"
-                                )
-                            except _SeatSshError as fb_err:
-                                failed += 1
-                                parent.log(
-                                    f"Fallback copy also failed for {basename}: {str(fb_err)}",
-                                    "ERROR"
-                                )
-                        else:
-                            failed += 1
-                            parent.log(f"Failed to copy {basename}: {stderr}", "ERROR")
+                        failed += 1
+                        parent.log(f"✗ {basename}: {str(e).strip()[:100]}", "ERROR")
 
                 def done():
                     try:
@@ -439,29 +399,15 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         progress.close()
                     except Exception:
                         pass
-                    if failed:
-                        msg = f"Copied: {ok}\nFailed: {failed}\n\n"
-                        if readonly_fallbacks:
-                            msg += (
-                                f"Note: {readonly_fallbacks} file(s) hit a read-only "
-                                f"filesystem and were copied to /storage/emulated/0/ instead.\n\n"
-                            )
-                        msg += f"Destination: {seat_hostname}:{dest}"
-                        QMessageBox.warning(explorer, "Copy Complete with Errors", msg)
-                    elif readonly_fallbacks:
-                        # All succeeded but some went to the fallback path
-                        QMessageBox.information(
-                            explorer, "Copy Complete (with fallbacks)",
-                            f"Copied {ok} file(s), but {readonly_fallbacks} of them hit a "
-                            f"read-only filesystem and were copied to:\n\n"
-                            f"{seat_hostname}:/storage/emulated/0/\n\n"
-                            f"Intended destination: {seat_hostname}:{dest}"
-                        )
+                    if failed == len(files):
+                        QMessageBox.warning(explorer, "Upload Failed",
+                            f"Failed to upload all files to {seat_hostname}:{dest}")
+                    elif failed > 0:
+                        QMessageBox.warning(explorer, "Upload Complete with Errors",
+                            f"Copied: {ok}\nFailed: {failed}\n\n{seat_hostname}:{dest}")
                     else:
-                        QMessageBox.information(
-                            explorer, "Copy Complete",
-                            f"Copied {ok} file(s) to:\n\n{seat_hostname}:{dest}"
-                        )
+                        QMessageBox.information(explorer, "Upload Complete",
+                            f"Copied {ok} file(s) to:\n{seat_hostname}:{dest}")
                     if ok:
                         refresh_listing()
 

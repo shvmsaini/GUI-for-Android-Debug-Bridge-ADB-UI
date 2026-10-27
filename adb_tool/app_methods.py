@@ -5,6 +5,8 @@ import threading
 import time
 import shlex
 import re
+import uuid
+import shutil
 from datetime import datetime
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread, QEvent
 from PyQt6.QtWidgets import (
@@ -229,6 +231,7 @@ class AppMixin:
 
         def do_install():
             installed_count = 0
+            last_apk = None
             for idx, apk_path in enumerate(apk_files, 1):
                 try:
                     fname = os.path.basename(apk_path)
@@ -244,6 +247,7 @@ class AppMixin:
                         self.log(f"Using gateway deployment", "INFO")
                         self._install_via_gateway(apk_path, fname, mtc_password)
                         installed_count += 1  # Only count if gateway install succeeded
+                        last_apk = apk_path
                     else:
                         # Regular ADB install
                         if use_gateway:
@@ -255,6 +259,7 @@ class AppMixin:
                             self.log(f"✅ [{idx}/{total}] {fname} installed successfully")
                             self.update_status(f"✅ Completed [{idx}/{total}]")
                             installed_count += 1
+                            last_apk = apk_path
                         else:
                             stderr = (result.get('stderr') or '').strip()
                             self.log(f"❌ [{idx}/{total}] {fname} failed: {stderr[:200]}", "ERROR")
@@ -266,11 +271,18 @@ class AppMixin:
                     # Don't count failed installs - just don't increment
                     continue
 
+            # Detect the package name of the last installed APK (for auto-launch)
+            detected_pkg = None
+            if last_apk and installed_count > 0:
+                detected_pkg = self._detect_package_name(last_apk)
+
             # Hide progress bar and show completion messagebox marshalled to GUI thread
             # Store metadata so that the method called on GUI thread can complete the UI
             self._install_batch_total = total
             self._install_batch_installed = installed_count
             self._install_batch_device_label = device_label
+            self._install_batch_package = detected_pkg
+            self.log(f"Detected package: {detected_pkg}", "INFO")
             self.log("Scheduling completion popup to GUI thread", "INFO")
             QTimer.singleShot(0, self._finalize_install_completion)
 
@@ -473,6 +485,7 @@ class AppMixin:
         total = getattr(self, '_install_batch_total', 0)
         installed = getattr(self, '_install_batch_installed', 0)
         device_label = getattr(self, '_install_batch_device_label', 'unknown')
+        detected_pkg = getattr(self, '_install_batch_package', None)
         if hasattr(self, 'progress_bar'):
             self._hide_progress()
 
@@ -485,15 +498,33 @@ class AppMixin:
 
         try:
             # Show completion messagebox with "Launch" option for full success
-            if installed == total:
-                reply = QMessageBox.question(
-                    self, "Install Complete",
-                    msg + "\n\nDo you want to launch the app?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes
-                )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.launch_app_dialog()
+            if installed == total and installed > 0:
+                if detected_pkg:
+                    # Auto-detected package: offer to launch it directly
+                    launch_text = (
+                        f"{msg}\n\n"
+                        f"Detected package: {detected_pkg}\n\n"
+                        f"Do you want to launch this app?"
+                    )
+                    reply = QMessageBox.question(
+                        self, "Install Complete",
+                        launch_text,
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.log(f"Auto-launching detected package: {detected_pkg}", "INFO")
+                        self._launch_package(detected_pkg)
+                else:
+                    # Couldn't auto-detect: fall back to manual package entry
+                    reply = QMessageBox.question(
+                        self, "Install Complete",
+                        msg + "\n\nDo you want to launch an app?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.launch_app_dialog()
             else:
                 # Partial failure - just show simple message
                 QMessageBox.information(self, "Install Complete", msg)
@@ -502,6 +533,105 @@ class AppMixin:
             self.log(f"Could not show completion popup: {e}", "ERROR")
         except Exception as e:
             self.log(f"Popup error: {e}", "ERROR")
+
+    def _detect_package_name(self, apk_path):
+        """Extract the package name from an APK using aapt or pm parse.
+
+        Tries multiple approaches in order:
+        1. ``aapt dump badging`` on local machine (most reliable)
+        2. ``aapt2 dump packagename`` (newer aapt)
+        3. Push to device and ``pm parse`` (fallback)
+
+        Returns the package name string or None if detection fails.
+        """
+        import re
+
+        # Method 1: aapt dump badging (fastest, runs locally)
+        aapt_paths = [
+            shutil.which("aapt"),
+            shutil.which("aapt2"),
+            # Common Android SDK locations
+            os.path.expanduser("~/Library/Android/sdk/build-tools/aapt"),
+            "/opt/homebrew/bin/aapt",
+            "/usr/local/bin/aapt",
+        ]
+        # Search for aapt in build-tools subdirs (newer SDKs)
+        sdk_build_tools = os.path.expanduser("~/Library/Android/sdk/build-tools")
+        if os.path.isdir(sdk_build_tools):
+            for entry in sorted(os.listdir(sdk_build_tools), reverse=True):
+                candidate = os.path.join(sdk_build_tools, entry, "aapt")
+                if os.path.isfile(candidate):
+                    aapt_paths.append(candidate)
+                    candidate2 = os.path.join(sdk_build_tools, entry, "aapt2")
+                    if os.path.isfile(candidate2):
+                        aapt_paths.append(candidate2)
+                    break
+
+        for aapt in aapt_paths:
+            if not aapt or not os.path.isfile(aapt):
+                continue
+            try:
+                cmd = [aapt, "dump", "badging", apk_path]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0:
+                    m = re.search(r"package:\s*name='([^']+)'", result.stdout)
+                    if m:
+                        return m.group(1).strip()
+            except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+                continue
+
+        # Method 2: pm parse on device (slow but always available)
+        try:
+            # Push APK to /data/local/tmp and parse
+            tmp_remote = f"/data/local/tmp/.adb-gui-parse-{uuid.uuid4().hex}.apk"
+            push_cmd = f"{self.get_device_flag()} push {shlex.quote(apk_path)} {tmp_remote}"
+            push_result = self.adb.run_command(push_cmd, timeout=60)
+            if push_result.get('success'):
+                parse_cmd = f"{self.get_device_flag()} shell pm parse {tmp_remote}"
+                parse_result = self.adb.run_command(parse_cmd, timeout=15)
+                # Cleanup
+                self.adb.run_command(f"{self.get_device_flag()} shell rm -f {tmp_remote}", timeout=10)
+                if parse_result.get('success'):
+                    # Output format: "package: name='com.foo' ..."
+                    out = parse_result.get('stdout') or ''
+                    m = re.search(r"package:\s*name='([^']+)'", out)
+                    if m:
+                        return m.group(1).strip()
+                    # Fallback: first line that looks like a package name
+                    for line in out.splitlines():
+                        line = line.strip()
+                        if line and '.' in line and not line.startswith('/'):
+                            return line
+        except Exception as e:
+            self.log(f"pm parse fallback failed: {e}", "DEBUG")
+
+        return None
+
+    def _launch_package(self, pkg):
+        """Launch an app by package name via monkey on the current device."""
+        if not pkg:
+            self.log("No package to launch", "ERROR")
+            return
+        self.log(f"Launching {pkg}...")
+        self.update_status(f"Launching {pkg}...")
+
+        def do_launch():
+            cmd = (
+                f"{self.get_device_flag()} shell monkey -p {shlex.quote(pkg)} "
+                f"-c android.intent.category.LAUNCHER 1"
+            )
+            result = self.adb.run_command(cmd, timeout=30)
+            if result['success']:
+                self.log(f"✅ {pkg} launched", "INFO")
+                self.update_status(f"✅ Launched {pkg}")
+            else:
+                stderr = (result.get('stderr') or '').strip()
+                self.log(f"❌ Failed to launch {pkg}: {stderr[:150]}", "ERROR")
+                self.update_status(f"❌ Launch failed")
+
+        threading.Thread(target=do_launch, daemon=True).start()
 
     def launch_app_dialog(self):
         """Show dialog to launch an app by package name."""
