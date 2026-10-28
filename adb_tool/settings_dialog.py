@@ -33,6 +33,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QD
 import bundled_scripts
 from .constants import APP_VERSION
 from .adb_manager import ADBManager
+from .migration_wizard import MigrationWizard
 
 
 class SettingsDialog(QDialog):
@@ -86,59 +87,67 @@ class SettingsDialog(QDialog):
         adb_layout.addLayout(adb_row)
         content_layout.addWidget(adb_group)
 
+        # TEMP-HIDE-SEAT-OVERRIDE: set to True to re-enable seat/port-forward
+        # script override UI in the settings dialog. The backend
+        # (SeatPortManager._get_*_script_path) still honours
+        # seat_script_path / portforward_script_path from settings.json, so
+        # existing custom paths keep working — only the controls are hidden.
+        _seat_override_visible = False
+
         # Seat Script section
-        seat_group = QGroupBox("Seat Management Script")
-        seat_layout = QVBoxLayout(seat_group)
+        if _seat_override_visible:
+            seat_group = QGroupBox("Seat Management Script")
+            seat_layout = QVBoxLayout(seat_group)
 
-        seat_label = QLabel("Seat Script Path:")
-        seat_layout.addWidget(seat_label)
+            seat_label = QLabel("Seat Script Path:")
+            seat_layout.addWidget(seat_label)
 
-        seat_row = QHBoxLayout()
-        # Empty means "use built-in"; migrate old 'seat.sh' default to empty
-        _seat_default = self.current_settings.get('seat_script_path', '')
-        if _seat_default == 'seat.sh':
-            _seat_default = ''
-        self.seat_path_edit = QLineEdit(_seat_default)
-        self.seat_path_edit.setPlaceholderText("Leave empty to use the built-in script")
-        seat_row.addWidget(self.seat_path_edit)
+            seat_row = QHBoxLayout()
+            # Empty means "use built-in"; migrate old 'seat.sh' default to empty
+            _seat_default = self.current_settings.get('seat_script_path', '')
+            if _seat_default == 'seat.sh':
+                _seat_default = ''
+            self.seat_path_edit = QLineEdit(_seat_default)
+            self.seat_path_edit.setPlaceholderText("Leave empty to use the built-in script")
+            seat_row.addWidget(self.seat_path_edit)
 
-        seat_browse_btn = QPushButton("📂 Browse")
-        seat_browse_btn.clicked.connect(self.browse_seat)
-        seat_row.addWidget(seat_browse_btn)
+            seat_browse_btn = QPushButton("📂 Browse")
+            seat_browse_btn.clicked.connect(self.browse_seat)
+            seat_row.addWidget(seat_browse_btn)
 
-        seat_layout.addLayout(seat_row)
+            seat_layout.addLayout(seat_row)
 
-        seat_info = QLabel("Leave empty to use the built-in seat.sh. Set a custom path to override.")
-        seat_info.setStyleSheet("color: #666; font-size: 9pt;")
-        seat_info.setWordWrap(True)
-        seat_layout.addWidget(seat_info)
+            seat_info = QLabel("Leave empty to use the built-in seat.sh. Set a custom path to override.")
+            seat_info.setStyleSheet("color: #666; font-size: 9pt;")
+            seat_info.setWordWrap(True)
+            seat_layout.addWidget(seat_info)
 
-        content_layout.addWidget(seat_group)
+            content_layout.addWidget(seat_group)
 
-        # Port Forward Script section
-        pf_group = QGroupBox("Port Forward Script")
-        pf_layout = QVBoxLayout(pf_group)
+            # Port Forward Script section
+            pf_group = QGroupBox("Port Forward Script")
+            pf_layout = QVBoxLayout(pf_group)
 
-        pf_label = QLabel("Port Forward Script Path:")
-        pf_layout.addWidget(pf_label)
+            pf_label = QLabel("Port Forward Script Path:")
+            pf_layout.addWidget(pf_label)
 
-        pf_row = QHBoxLayout()
-        self.pf_path_edit = QLineEdit(self.current_settings.get('portforward_script_path', ''))
-        self.pf_path_edit.setPlaceholderText("Leave empty to use the built-in script")
-        pf_row.addWidget(self.pf_path_edit)
+            pf_row = QHBoxLayout()
+            self.pf_path_edit = QLineEdit(self.current_settings.get('portforward_script_path', ''))
+            self.pf_path_edit.setPlaceholderText("Leave empty to use the built-in script")
+            pf_row.addWidget(self.pf_path_edit)
 
-        pf_browse_btn = QPushButton("📂 Browse")
-        pf_browse_btn.clicked.connect(self.browse_portforward)
-        pf_row.addWidget(pf_browse_btn)
+            pf_browse_btn = QPushButton("📂 Browse")
+            pf_browse_btn.clicked.connect(self.browse_portforward)
+            pf_row.addWidget(pf_browse_btn)
 
-        pf_layout.addLayout(pf_row)
+            pf_layout.addLayout(pf_row)
 
-        pf_info = QLabel("Leave empty to use the built-in portforwardRack.sh. Set a custom path to override.")
-        pf_info.setStyleSheet("color: #666; font-size: 9pt;")
-        pf_info.setWordWrap(True)
-        pf_layout.addWidget(pf_info)
+            pf_info = QLabel("Leave empty to use the built-in portforwardRack.sh. Set a custom path to override.")
+            pf_info.setStyleSheet("color: #666; font-size: 9pt;")
+            pf_info.setWordWrap(True)
+            pf_layout.addWidget(pf_info)
 
-        content_layout.addWidget(pf_group)
+            content_layout.addWidget(pf_group)
 
         # Screenshots section
         screenshots_group = QGroupBox("📸 Screenshots")
@@ -229,6 +238,25 @@ class SettingsDialog(QDialog):
         template_layout.addLayout(template_buttons_row)
         content_layout.addWidget(template_group)
 
+        # Connection History Import section
+        history_group = QGroupBox("📥 Connection History")
+        history_layout = QVBoxLayout(history_group)
+
+        history_info = QLabel(
+            "Import seat and portforward connections previously used in terminal.\n"
+            "Scans ~/.bash_history, ~/.zsh_history, and Fish Shell history for seat.sh/portforwardRack.sh commands."
+        )
+        history_info.setStyleSheet("color: #666; font-size: 9pt;")
+        history_info.setWordWrap(True)
+        history_layout.addWidget(history_info)
+
+        import_history_btn = QPushButton("🧅 Import from Shell History")
+        import_history_btn.setToolTip("Scan shell history and import missing connections")
+        import_history_btn.clicked.connect(self._import_connection_history)
+        history_layout.addWidget(import_history_btn)
+
+        content_layout.addWidget(history_group)
+
         # Buttons
         button_row = QHBoxLayout()
         button_row.addStretch()
@@ -256,44 +284,52 @@ class SettingsDialog(QDialog):
         # Add scroll area to main layout
         main_layout.addWidget(scroll_area)
 
+    def _import_connection_history(self):
+        """Launch the connection history import wizard."""
+        wizard = MigrationWizard(self)
+        if wizard.exec():
+            # Wizard accepted - connection history was imported
+            # Parent should refresh its seat/port lists
+            pass
+
     def clear_stored_passwords(self):
-        """Clear all stored passwords"""
         reply = QMessageBox.question(
             self,
             "Clear Passwords",
             "Clear all stored SSH passwords?\n\n"
-            "This will remove all Keychain entries for SSH credentials.\n\n"
+            "This will remove all Keychain entries for SSH credentials "
+            "(gateways, seats, MTC, etc.).\n\n"
             "You'll need to enter password again on next connection.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            # Clear from Keychain
-            try:
-                if sys.platform == 'darwin':
-                    # Delete all entries for our service
-                    result = subprocess.run(
-                        ['security', 'delete-generic-password',
-                         '-s', 'ADB-GUI-UI'],
-                        capture_output=True, timeout=5
-                    )
-                    QMessageBox.information(
-                        self,
-                        "Passwords Cleared",
-                        "All stored passwords have been cleared."
-                    )
-                else:
-                    QMessageBox.information(
-                        self,
-                        "Not Supported",
-                        "Password clearing is only supported on macOS.\n\n"
-                        "Please clear Keychain entries manually through System Settings."
-                    )
-            except Exception as e:
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    f"Error clearing Keychain entries: {e}"
-                )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if sys.platform == 'darwin':
+            from .credentials import CredentialManager
+            creds = CredentialManager()
+            deleted, failed = creds.clear_all()
+            if deleted == 0 and failed == 0:
+                msg = ("No stored passwords found.\n\n"
+                       "If passwords still appear cached, they may have been "
+                       "added outside this app. Check Keychain Access → "
+                       "search for 'ADB-GUI-UI'.")
+                QMessageBox.information(self, "No Passwords Found", msg)
+            else:
+                msg = f"Cleared {deleted} stored password(s)."
+                if failed:
+                    msg += f"\n\n{failed} entry(ies) could not be removed "
+                    msg += "(may require Keychain access approval).\n\n"
+                    msg += "You can clear them manually via Keychain Access → "
+                    msg += "search for 'ADB-GUI-UI'."
+                QMessageBox.information(self, "Passwords Cleared", msg)
+        else:
+            QMessageBox.information(
+                self,
+                "Not Supported",
+                "Password clearing is only supported on macOS.\n\n"
+                "Please clear Keychain entries manually through System Settings."
+            )
 
     def browse_adb(self):
         """Browse for ADB executable"""
@@ -314,7 +350,7 @@ class SettingsDialog(QDialog):
             os.path.expanduser('~'),
             "Shell scripts (*.sh);;All files (*.*)"
         )
-        if path:
+        if path and hasattr(self, 'seat_path_edit'):
             self.seat_path_edit.setText(path)
 
     def browse_portforward(self):
@@ -325,7 +361,7 @@ class SettingsDialog(QDialog):
             os.path.expanduser('~'),
             "Shell scripts (*.sh);;All files (*.*)"
         )
-        if path:
+        if path and hasattr(self, 'pf_path_edit'):
             self.pf_path_edit.setText(path)
 
     def browse_screenshot_path(self):
@@ -603,71 +639,78 @@ class SettingsDialog(QDialog):
         if self.parent:
             # Validate custom script paths before saving — but treat missing
             # scripts as "will use bundled" rather than blocking the save.
-            seat_path = self.seat_path_edit.text().strip()
-            if seat_path and seat_path != 'seat.sh':
-                if not os.path.exists(seat_path):
-                    reply = QMessageBox.warning(
-                        self,
-                        "Seat Script Not Found",
-                        f"The selected seat script cannot be found:\n"
-                        f"  {seat_path}\n\n"
-                        f"Missing custom scripts fall back to the built-in seat.sh — this will not block\n"
-                        f"seat connections. You can fix the path later, or clear it to remove the custom override.",
-                        QMessageBox.StandardButton.Ok,
-                    )
-                    if reply != QMessageBox.StandardButton.Ok:
-                        return
-                else:
-                    valid, msg = self.parent.seat_port_manager.validate_seat_script(seat_path)
-                    if not valid:
+            # TEMP-HIDE: gate whole block when UI is hidden
+            if hasattr(self, 'seat_path_edit'):
+                seat_path = self.seat_path_edit.text().strip()
+                if seat_path and seat_path != 'seat.sh':
+                    if not os.path.exists(seat_path):
                         reply = QMessageBox.warning(
                             self,
-                            "Seat Script Incompatible",
-                            f"The selected seat script is missing required commands:\n"
-                            f"  {msg}\n\n"
-                            f"Features like auto-connect, devices, and disconnect may not work.\n"
-                            f"Clear the path to use the built-in script.\n\n"
-                            f"Save anyway?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            "Seat Script Not Found",
+                            f"The selected seat script cannot be found:\n"
+                            f"  {seat_path}\n\n"
+                            f"Missing custom scripts fall back to the built-in seat.sh — this will not block\n"
+                            f"seat connections. You can fix the path later, or clear it to remove the custom override.",
+                            QMessageBox.StandardButton.Ok,
                         )
-                        if reply != QMessageBox.StandardButton.Yes:
+                        if reply != QMessageBox.StandardButton.Ok:
                             return
+                    else:
+                        valid, msg = self.parent.seat_port_manager.validate_seat_script(seat_path)
+                        if not valid:
+                            reply = QMessageBox.warning(
+                                self,
+                                "Seat Script Incompatible",
+                                f"The selected seat script is missing required commands:\n"
+                                f"  {msg}\n\n"
+                                f"Features like auto-connect, devices, and disconnect may not work.\n"
+                                f"Clear the path to use the built-in script.\n\n"
+                                f"Save anyway?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            )
+                            if reply != QMessageBox.StandardButton.Yes:
+                                return
 
-            pf_path = self.pf_path_edit.text().strip()
-            if pf_path:
-                if not os.path.exists(pf_path):
-                    reply = QMessageBox.warning(
-                        self,
-                        "Port Forward Script Not Found",
-                        f"The selected port forward script cannot be found:\n"
-                        f"  {pf_path}\n\n"
-                        f"Missing custom scripts fall back to the built-in portforwardRack.sh — this will\n"
-                        f"not block port forward connections. You can fix the path later, or clear it to remove\n"
-                        f"the custom override.",
-                        QMessageBox.StandardButton.Ok,
-                    )
-                    if reply != QMessageBox.StandardButton.Ok:
-                        return
-                else:
-                    valid, msg = self.parent.seat_port_manager.validate_portforward_script(pf_path)
-                    if not valid:
+                pf_path = self.pf_path_edit.text().strip()
+                if pf_path:
+                    if not os.path.exists(pf_path):
                         reply = QMessageBox.warning(
                             self,
-                            "Port Forward Script Incompatible",
-                            f"The selected port forward script is missing required commands:\n"
-                            f"  {msg}\n\n"
-                            f"Features like status and stop may not work.\n"
-                            f"Clear the path to use the built-in script.\n\n"
-                            f"Save anyway?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            "Port Forward Script Not Found",
+                            f"The selected port forward script cannot be found:\n"
+                            f"  {pf_path}\n\n"
+                            f"Missing custom scripts fall back to the built-in portforwardRack.sh — this will\n"
+                            f"not block port forward connections. You can fix the path later, or clear it to remove\n"
+                            f"the custom override.",
+                            QMessageBox.StandardButton.Ok,
                         )
-                        if reply != QMessageBox.StandardButton.Yes:
+                        if reply != QMessageBox.StandardButton.Ok:
                             return
+                    else:
+                        valid, msg = self.parent.seat_port_manager.validate_portforward_script(pf_path)
+                        if not valid:
+                            reply = QMessageBox.warning(
+                                self,
+                                "Port Forward Script Incompatible",
+                                f"The selected port forward script is missing required commands:\n"
+                                f"  {msg}\n\n"
+                                f"Features like status and stop may not work.\n"
+                                f"Clear the path to use the built-in script.\n\n"
+                                f"Save anyway?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            )
+                            if reply != QMessageBox.StandardButton.Yes:
+                                return
+
+                # Save the custom script paths (only when UI is visible)
+                self.parent.settings['seat_script_path'] = seat_path
+                self.parent.settings['portforward_script_path'] = pf_path
+            else:
+                # UI hidden — keep existing values in settings (don't touch them)
+                pass
 
             # Update parent's settings
             self.parent.settings['adb_path'] = self.adb_path_edit.text()
-            self.parent.settings['seat_script_path'] = self.seat_path_edit.text().strip()
-            self.parent.settings['portforward_script_path'] = self.pf_path_edit.text().strip()
             self.parent.settings['template_commands'] = self.template_commands
             self.parent.save_settings()
 
