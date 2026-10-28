@@ -1402,7 +1402,7 @@ class GatewayMixin:
                     def apply():
                         status.setText(f"✅ Done (exit {code})" if code == 0 else f"⚠️ Exit {code}")
                         output.setPlainText(combined or "(no output)")
-                        output.moveCursor(output.textCursor().End)
+                        output.moveCursor(QTextCursor.MoveOperation.End)
                     ui.call.emit(apply)
                 except Exception as e:
                     err = str(e)

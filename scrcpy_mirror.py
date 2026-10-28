@@ -563,12 +563,12 @@ class ScrcpyMirrorWindow(QMainWindow):
     # preset at index 0 is intended for seat/remote connections where
     # bandwidth is the bottleneck.
     _QUALITY_PRESETS = [
-        # Low (network): 1 Mbps / 24 fps / 800 long-edge. Tuned for slow
+        # Low (network): 500 kbps / 24 fps / 800 long-edge. Tuned for slow
         # network seats where bandwidth + frame-pipeline depth dominate
         # latency. 800px on phone aspect ratios is still readable; 24 fps
-        # is enough for fluid interaction; 1 Mbps caps the bitrate so
+        # is enough for fluid interaction; 500 kbps caps the bitrate so
         # the encoder doesn't blow past the link's capacity.
-        ("Low (network)",  1_000_000, 24, 800),
+        ("Low (network)",  500_000, 24, 800),
         ("Medium",         1_500_000, 30, 1024),
         ("High (local)",   3_000_000, 60, 1024),
         ("Ultra",          6_000_000, 60, 1920),
@@ -1334,7 +1334,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                     try:
                         self._log("DEBUG", f"start() attempt {attempt + 1}/3")
                         self._client.start()
-                        self._log("INFO", f"start() succeeded for {self.device_id}")
+                        self._log("DEBUG", f"start() succeeded for {self.device_id}")
                         break
                     except Exception as e:
                         last_exc = e
@@ -1360,7 +1360,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                     raise RuntimeError("Failed to start scrcpy client")
 
                 name = self._client.device_name or self.device_id
-                self._log("INFO", f"Connected to {name}")
+                self._log("DEBUG", f"Connected to {name}")
                 self.signal.init_done.emit(name)
 
                 # Start the frame-arrival watchdog.  QTimer.singleShot
@@ -1397,7 +1397,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
                 self._log("DEBUG", f"listen() starting — frame_timeout={frame_timeout}s")
                 self._client.listen(on_frame, timeout=frame_timeout)
-                self._log("INFO", f"listen() returned normally (stream ended cleanly) for {self.device_id}")
+                self._log("DEBUG", f"listen() returned normally (stream ended cleanly) for {self.device_id}")
 
             except Exception as e:
                 # If the user closed the window or restarted the client,
