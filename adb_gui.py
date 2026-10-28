@@ -1605,37 +1605,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         except Exception as e:
             self.log(f"Error saving DeGoogle state: {e}", "ERROR")
     
-    def is_system_dark_mode(self):
-        """Check if the system is in dark mode"""
-        try:
-            if sys.platform == 'darwin':
-                # macOS: Check for `defaults read -g AppleInterfaceStyle`
-                # Returns "Dark" if dark mode is enabled
-                result = subprocess.run(['defaults', 'read', '-g', 'AppleInterfaceStyle'],
-                                      capture_output=True, text=True)
-                return result.stdout.strip() == 'Dark'
-            elif sys.platform == 'win32':
-                # Windows: Check registry
-                try:
-                    winreg_module = sys.modules.get('winreg')
-                    if winreg_module:
-                        winreg = winreg_module
-                    else:
-                        import winreg
-                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                       r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize')
-                    value, _ = winreg.QueryValueEx(key, 'AppsUseLightTheme')
-                    winreg.CloseKey(key)
-                    return value == 0  # 0 = dark, 1 = light
-                except:
-                    return False
-            elif sys.platform.startswith('linux'):
-                # Linux: Check for common environment variables
-                return os.environ.get('GTK_THEME', '').lower().find('dark') != -1
-            return False
-        except:
-            return False
-
+    
     def toggle_dark_mode(self):
         """Deprecated: Toggle dark mode on/off (use cycle_theme instead)"""
         # Convert old theme to new theme mode

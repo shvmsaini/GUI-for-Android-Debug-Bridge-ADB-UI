@@ -14,9 +14,15 @@ class ThemeMixin:
         """Detect if the system is in dark mode."""
         try:
             if sys.platform == 'darwin':
-                # macOS dark mode detection
-                result = os.popen('defaults read -g AppleInterfaceStyle 2>/dev/null').read().strip()
-                return result == 'Dark'
+                # macOS dark mode detection using AppleScript
+                import subprocess
+                result = subprocess.run(
+                    ['osascript', '-e', 'tell application "System Events" to tell appearance preferences to get dark mode'],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip().lower() == 'true'
+                return False
             elif sys.platform == 'win32':
                 # Windows dark mode detection via registry
                 import winreg
@@ -106,9 +112,23 @@ class ThemeMixin:
         stylesheet += "QListWidget::item { min-height: 38px; padding: 4px; }"
         stylesheet += "QListWidget::item:selected { background: " + accent + "; color: white; }"
         stylesheet += "QListWidget::item:selected:hover { background: " + accent_hover + "; color: white; }"
+        # Make selected hover work properly with item background color - override button_hover_color
+        stylesheet += "QListWidget::item:hover { background-color: " + accent_hover + "; }"
+        # Alternating row colors - use darker bg in dark mode for better contrast
+        if self.dark_mode:
+            alt_row_color = '#2a2a2a'
+            stylesheet += "QListWidget::item:alternate { background-color: " + alt_row_color + "; color: " + fg + "; }"
+        else:
+            stylesheet += "QListWidget::item:alternate { background-color: " + bg + "; color: " + fg + "; }"
 
         # Scrollbar handle color enhancement - hide arrow buttons
-        scrollbar_handle = '#666666' if not self.dark_mode else '#cccccc'
+        # Darker handle in dark mode for better contrast
+        if self.dark_mode:
+            scrollbar_handle = '#888888'
+            scrollbar_hover = accent
+        else:
+            scrollbar_handle = '#555555'
+            scrollbar_hover = accent
         stylesheet += """
         QScrollBar:vertical { width: 14px; background: """ + bg + """; }
         QScrollBar:horizontal { height: 14px; background: """ + bg + """; }
@@ -125,7 +145,7 @@ class ThemeMixin:
             margin: 2px;
         }
         QScrollBar::handle:vertical:hover {
-            background: """ + accent + """;
+            background: """ + scrollbar_hover + """;
         }
         QScrollBar::handle:horizontal {
             background: """ + scrollbar_handle + """;
@@ -134,7 +154,7 @@ class ThemeMixin:
             margin: 2px;
         }
         QScrollBar::handle:horizontal:hover {
-            background: """ + accent + """;
+            background: """ + scrollbar_hover + """;
         }
         """
         stylesheet += "QStatusBar { background-color: " + card_bg + "; color: " + self.colors.get('text_secondary', fg) + "; } "
