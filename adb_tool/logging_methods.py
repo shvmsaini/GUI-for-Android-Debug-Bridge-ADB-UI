@@ -127,15 +127,17 @@ class LoggingMixin:
         panels = [self.output_text, self.logcat_text]
         if self.mirror_video is not None:
             panels.append(self.mirror_video)
+        # Note: deliberately no QApplication.processEvents() here. Calling it
+        # from inside a button's clicked slot re-enters the event loop while
+        # the button (and the widgets it's painting) are still on the stack,
+        # which lets deleteLater()/paint events run nested and triggers
+        # "Cannot destroy paint device that is being painted" → SIGSEGV on
+        # macOS. Qt repaints visibility changes on the next loop turn anyway.
         for p in panels:
             if p is not None and p is not except_widget:
                 p.setVisible(False)
             elif p is not None and p is except_widget:
                 p.setVisible(True)
-        # Force Qt to process the visibility changes immediately so
-        # there's no brief moment where two panels are both visible.
-        from PyQt6.QtWidgets import QApplication
-        QApplication.processEvents()
 
     def log_to_logcat(self, message):
         """Add message to logcat output area"""

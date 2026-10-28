@@ -348,15 +348,49 @@ class ScrcpyMixin:
                     "Install: pip install py-scrcpy-sdk opencv-python-headless imageio"))
                 return
 
+        # The body of this function actually constructs and shows the
+        # ScrcpyMirrorWindow. We schedule it via singleShot(0) so the
+        # caller's button-slot handler fully unwinds before any Qt
+        # window/NSWindow is allocated. Running the construction
+        # synchronously from inside a button click occasionally triggers
+        # "QPaintDevice: Cannot destroy paint device that is being painted"
+        # → SIGSEGV on macOS, because Qt repaints/widgets parented to the
+        # clicked button can fire while the new window is being created.
+        # Deferring is the same pattern already used for the in-panel
+        # mirror (toggle_screen_view → _start_in_window_mirror) and for
+        # the QMessageBox.safe_* dialogs in this same file.
         adb_path = getattr(self.adb, 'adb_path', 'adb')
 
         # Workaround adb 1.0.41 bug where 'adb reverse' fails with
         # 'more than one device/emulator' on localhost:PORT connections.
         # This clears any stale device state in adb's internal tracking
-        # so py_scrcpy_sdk can establish the reverse tunnel.
+        # so py_scrcpy_sdk can establish the reverse tunnel. Run this
+        # synchronously here (it's an adb subprocess, not Qt) so the
+        # mirror window opens against a clean state.
         if hasattr(self.adb, 'ensure_reverse_tunnel_works'):
             self.adb.ensure_reverse_tunnel_works(device_id)
 
+        QTimer.singleShot(
+            0,
+            lambda: self._open_mirror_window_impl(
+                device_id=device_id,
+                adb_path=adb_path,
+                bitrate=bitrate,
+                max_size=max_size,
+                max_fps=max_fps,
+                seat_context=seat_context,
+            ),
+        )
+
+    def _open_mirror_window_impl(self, device_id, adb_path, bitrate,
+                                 max_size, max_fps, seat_context):
+        """Deferred body of ``_open_mirror_window``.
+
+        Runs on the next event-loop tick so the originating button-slot
+        has fully returned before any Qt window construction. PyAV/numpy
+        native init and ``ScrcpyClient.start()`` retries are kept here;
+        see ``_open_mirror_window`` for the rationale.
+        """
         # py_scrcpy_sdk's native libraries (PyAV/FFmpeg, numpy C core) can
         # intermittently SIGSEGV during initialization on macOS. Retry a
         # few times — most attempts succeed.

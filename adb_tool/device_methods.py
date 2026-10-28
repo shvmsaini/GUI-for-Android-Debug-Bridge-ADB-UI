@@ -121,8 +121,7 @@ class DeviceMixin:
         all_devices = list(devices_by_id.values())
 
         if not silent:
-            self.log(f"All devices (merged): {all_devices}", "INFO")
-            self.log(f"Seat.sh devices: {seat_sh_devices}", "INFO")
+            pass
         else:
             self.log(f"All devices (merged): {all_devices}", "DEBUG")
             self.log(f"Seat.sh devices: {seat_sh_devices}", "DEBUG")

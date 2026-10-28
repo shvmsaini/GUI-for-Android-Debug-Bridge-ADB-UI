@@ -109,7 +109,7 @@ class ThemeMixin:
         stylesheet += "QTabBar::tab:selected { background-color: " + card_bg + "; } "
         stylesheet += "QScrollArea { background-color: " + card_bg + "; border: 1px solid " + border_color + "; } "
         stylesheet += "QDialog { background-color: " + bg + "; color: " + fg + "; }"
-        stylesheet += "QListWidget::item { min-height: 38px; padding: 4px; }"
+        stylesheet += "QListWidget::item { min-height: 25px; padding: 4px; }"
         stylesheet += "QListWidget::item:selected { background: " + accent + "; color: white; }"
         stylesheet += "QListWidget::item:selected:hover { background: " + accent_hover + "; color: white; }"
         # Make selected hover work properly with item background color - override button_hover_color
