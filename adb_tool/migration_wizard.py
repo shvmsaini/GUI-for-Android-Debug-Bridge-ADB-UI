@@ -710,9 +710,6 @@ class MigrationWizard(QDialog):
                 "You can manually add connections using the seat/portforward controls in the main UI."
             )
         else:
-            self.status_label.setText(
-                f"✅ Scan complete! Found {len(self.seat_entries)} seat and {len(self.portforward_entries)} portforward entries"
-            )
             self.summary_label.setText(
                 f"📊 <b>Found:</b> {new_seats} new seat(s), {new_racks} new portforward(s)\n"
                 f"   {len(self.seat_entries) - new_seats} seat(s) and {len(self.portforward_entries) - new_racks} portforward(s) already exist"
