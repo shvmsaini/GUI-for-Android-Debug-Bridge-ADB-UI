@@ -57,6 +57,12 @@ class MigrationWizard(QDialog):
     # Also handles full paths: /opt/homebrew/bin/seat.sh, ~/seat.sh
     # Also handles 'sh /path/to/seat.sh' format from fish history
     # Also handles 'bash /path/to/seat.sh' and ./seat.sh tunnel, etc.
+    # NOTE: we deliberately do NOT anchor with '$' — bash/zsh power users
+    # almost always chain seat.sh with the next command (`&& adb devices`,
+    # `; echo done`, trailing `# comment`, etc.), and a $ anchor silently
+    # drops every chained line. We anchor on `(?=\s|$)` instead so the
+    # optional port must be followed by whitespace or end-of-line, but
+    # trailing content after the port (e.g. `5555 && adb devices`) is fine.
     SEAT_PATTERNS = [
         # Standard seat.sh patterns (with optional path prefix, optional shell, and optional './')
         # Match: seat.sh tunnel SEAT GATEWAY [PORT]
@@ -64,13 +70,22 @@ class MigrationWizard(QDialog):
         # Match: /opt/homebrew/bin/seat.sh tunnel SEAT GATEWAY [PORT]
         # Match: sh /path/to/seat.sh tunnel SEAT GATEWAY [PORT]
         # Match: bash /path/to/seat.sh tunnel SEAT GATEWAY [PORT]
+        # Trailing `&&`, `;`, `# comment` are all allowed after the optional port.
         re.compile(
-            r'(?:(?:\S*(?:sh|bash)\s+)|(\.\/))?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)\s*(?:(\d{4,5}))?$',
+            r'(?:(?:\S*(?:sh|bash)\s+)|(\.\/))?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)(?:\s+(\d{4,5}))?(?=\s|$)',
+            re.IGNORECASE
+        ),
+        # Seat-only (gateway defaults). Some setups pass only the seat and let
+        # the script infer the gateway; without this pattern those entries
+        # silently disappear from the wizard. Tries to match before P1 so that
+        # the more specific P0 (seat + gateway) wins when both apply.
+        re.compile(
+            r'(?:(?:\S*(?:sh|bash)\s+)|(\.\/))?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)(?=\s|$)',
             re.IGNORECASE
         ),
         # Legacy/simple pattern: tunnel SEAT GATEWAY [PORT]
         re.compile(
-            r'tunnel\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)(?:\s+(\d{4,5}))?$',
+            r'tunnel\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)(?:\s+(\d{4,5}))?(?=\s|$)',
             re.IGNORECASE
         ),
     ]
@@ -81,23 +96,25 @@ class MigrationWizard(QDialog):
     # Also handles 'sh /path/to/portForwardRack.sh' format
     # Uses re.IGNORECASE so we don't need to enumerate every casing variant
     # Note: "(?:ward|wad)" matches BOTH "Forward" (correct) AND "Forwad" (typo)
+    # Like SEAT_PATTERNS, we anchor on (?=\s|$) rather than $ so trailing
+    # `&& adb devices` / `; echo ok` / `# comment` don't drop the entry.
     PORTFORWARD_PATTERNS = [
         # rack + headend + user (3 args)
         # Match: portForwardRack.sh RACK HEADEND USER
         re.compile(
-            r'(?:sh\s+)?\S*portfor(?:ward|wad)rack\.sh\s+([a-zA-Z0-9\-\.]+)\s+([a-zA-Z0-9\-\.]+)\s+([a-zA-Z0-9_\-]+)',
+            r'(?:sh\s+)?\S*portfor(?:ward|wad)rack\.sh\s+([a-zA-Z0-9\-\.]+)\s+([a-zA-Z0-9\-\.]+)\s+([a-zA-Z0-9_\-]+)(?=\s|$)',
             re.IGNORECASE
         ),
         # rack + headend (2 args, user defaults to 'user')
         # Match: portForwardRack.sh RACK HEADEND
         re.compile(
-            r'(?:sh\s+)?\S*portfor(?:ward|wad)rack\.sh\s+([a-zA-Z0-9\-\.]+)\s+([a-zA-Z0-9\-\.]+)(?:\s|$)',
+            r'(?:sh\s+)?\S*portfor(?:ward|wad)rack\.sh\s+([a-zA-Z0-9\-\.]+)\s+([a-zA-Z0-9\-\.]+)(?=\s|$)',
             re.IGNORECASE
         ),
         # rack only (1 arg, headend and user default)
         # Match: portForwardRack.sh RACK
         re.compile(
-            r'(?:sh\s+)?\S*portfor(?:ward|wad)rack\.sh\s+([a-zA-Z0-9\-\.]+)(?:\s|$)',
+            r'(?:sh\s+)?\S*portfor(?:ward|wad)rack\.sh\s+([a-zA-Z0-9\-\.]+)(?=\s|$)',
             re.IGNORECASE
         ),
     ]
@@ -157,6 +174,13 @@ class MigrationWizard(QDialog):
 
         # Tab widget for seat vs portforward
         tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabBar::tab {
+                min-width: 130px;
+                padding: 8px 16px;
+                font-size: 11pt;
+            }
+        """)
 
         # Seat connections tab
         seat_widget = QWidget()
@@ -236,17 +260,58 @@ class MigrationWizard(QDialog):
 
     @staticmethod
     def _read_zsh_history(file_path):
-        """Read zsh history file (binary format with embedded timestamps)."""
+        """Read zsh history file (binary format with embedded timestamps).
+
+        Supports both legacy zsh format and extended_history formats:
+          - Legacy ( Prezto/ plain-text): plain one-per-line commands
+          - Legacy: ": <timestamp>:<duration>;command"
+          - Extended (common on modern zsh with EXTENDED_HISTORY/EXTENDED_HISTORY_write):
+            "{<timestamp>}{<duration>};<command>"
+        """
         commands = []
         if not os.path.exists(file_path):
             return commands
         try:
             with open(file_path, 'rb') as f:
                 content = f.read().decode('utf-8', errors='ignore')
-            # Lines look like ": 1234567890:123;command"
-            pattern = r': \d+:\d+;(.+)'
-            matches = re.findall(pattern, content)
-            commands.extend([m.strip() for m in matches if m.strip()])
+
+            # Try plain-text one-per-line format (most common, especially with prezto/oh-my-zsh)
+            # Each line is a complete command, no timestamps
+            plain_lines = content.split('\n')
+            command_lines = []
+            for line in plain_lines:
+                cmd = line.strip()
+                if cmd and not cmd.startswith('#') and not cmd.startswith(':'):
+                    command_lines.append(cmd)
+            # Deduplicate consecutive duplicates while preserving order
+            seen = set()
+            for cmd in command_lines:
+                if cmd not in seen and cmd:
+                    commands.append(cmd)
+                    seen.add(cmd)
+            # Clear seen for the next patterns
+            seen.clear()
+
+            # Zsh extended history format: {timestamp}{elapsed};command
+            # Timestamp is 10 digits (seconds), elapsed is variable length
+            # Example: {1701234567}{45};./seat.sh tunnel woohoo gateway.com
+            ext_pattern = r'\{\d+\}\{[^}]+\};\s*(.*?)(?=\n*\{|\n*\$|$)'
+            matches = re.findall(ext_pattern, content, re.DOTALL)
+            for m in matches:
+                cmd = m.strip()
+                if cmd and not cmd.startswith('#') and cmd not in seen:
+                    commands.append(cmd)
+                    seen.add(cmd)
+
+            # Legacy format: : <ts>:<dur>;command
+            leg_pattern = r': \d+:\d+;(.+)'
+            matches = re.findall(leg_pattern, content)
+            for m in matches:
+                cmd = m.strip()
+                if cmd and not cmd.startswith('#') and cmd not in seen:
+                    commands.append(cmd)
+                    seen.add(cmd)
+
         except Exception:
             pass
         return commands
@@ -323,16 +388,30 @@ class MigrationWizard(QDialog):
 
         Handles full paths (/opt/homebrew/bin/seat.sh), typos, 'sh /path/to/script.sh'
         prefix, and case variations (Seat.sh, seat.sh, SEAT.SH, etc).
+
+        Tries patterns in order; the first match wins. P0 (seat + gateway + optional
+        port) is most specific. P1 (seat-only, gateway defaults) catches invocations
+        that pass only the seat and let the script infer the gateway — those entries
+        would otherwise silently disappear. P2 is the legacy bare `tunnel ...` form.
         """
         entries = []
 
-        # Pattern 0: seat.sh or seat*.sh with optional path/sh prefix
-        # Groups: 1=seat, 2=gateway, 3=port (optional)
+        # Skip commands that are file operations (cp/mv/ln of the script files)
+        cmd_lower = command.strip().lower()
+        if cmd_lower.startswith('cp ') or cmd_lower.startswith('mv ') or cmd_lower.startswith('ln ') or cmd_lower.startswith('install ') or cmd_lower.startswith('chmod '):
+            return entries
+        if 'cp' in command.split()[:2] or 'mv' in command.split()[:2]:
+            return entries
+
+        # Pattern 0: seat.sh with optional path/sh prefix, capturing seat, gateway,
+        # and optional port. Groups: 1=seat, 2=gateway, 3=port (optional).
+        # Note: trailing `;` or `,` may be captured from chained commands like
+        # `...; adb devices` — strip them to avoid corrupted gateway entries.
         match = self.SEAT_PATTERNS[0].search(command)
         if match:
             seat = match.group(1).strip() if match.group(1) else None
-            gateway = match.group(2).strip() if match.group(2) else None
-            port = match.group(3).strip() if match.group(3) else None
+            gateway = match.group(2).strip().rstrip(';,') if match.group(2) else None
+            port = match.group(3).strip().rstrip(';,') if match.group(3) else None
 
             if seat and gateway:
                 gateway_user = gateway.split('@')[0] if '@' in gateway else gateway
@@ -347,12 +426,29 @@ class MigrationWizard(QDialog):
                 })
                 return entries
 
-        # Pattern 1: legacy tunnel pattern (groups: 1=seat, 2=gateway, 3=port)
+        # Pattern 1: seat.sh with seat only (gateway defaulted).
+        # Captures the seat; gateway fields left blank so the user can fill
+        # them in via the dropdown after import. Groups: 1=seat.
         match = self.SEAT_PATTERNS[1].search(command)
         if match:
+            seat = match.group(1).strip() if match.group(1) else None
+            if seat:
+                entries.append({
+                    'seat': seat,
+                    'gateway_user': '',
+                    'gateway_host': '',
+                    'port': None,
+                    'source_command': command.strip()
+                })
+                return entries
+
+        # Pattern 2: legacy tunnel pattern (groups: 1=seat, 2=gateway, 3=port)
+        # Trailing punctuation may be captured from chained commands.
+        match = self.SEAT_PATTERNS[2].search(command)
+        if match:
             seat = match.group(1).strip()
-            gateway = match.group(2).strip()
-            port = match.group(3).strip() if match.group(3) else None
+            gateway = match.group(2).strip().rstrip(';,')
+            port = match.group(3).strip().rstrip(';,') if match.group(3) else None
 
             gateway_user = gateway.split('@')[0] if '@' in gateway else gateway
             gateway_host = gateway.rsplit('@', 1)[-1] if '@' in gateway else gateway
@@ -391,22 +487,35 @@ class MigrationWizard(QDialog):
         """
         entries = []
 
-        # Skip commands that are not actual port-forward starts
-        # (e.g., 'portForwardRack.sh status', 'portForwardRack.sh stop')
-        skip_words = ['status', 'stop', 'history', '--help', '-h', 'purge',
-                      'vim', 'chmod', 'cp ', 'cat ', 'ls ', 'nvim', 'edit',
-                      'start', 'which', 'mv ']
-        # Check if the command ends with a skip word (after the script name)
+        # Skip commands that are file operations (cp/mv/ln of the script files)
+        cmd_lower = command.strip().lower()
+        if cmd_lower.startswith('cp ') or cmd_lower.startswith('mv ') or cmd_lower.startswith('ln ') or cmd_lower.startswith('install ') or cmd_lower.startswith('chmod '):
+            return entries
+        if 'cp' in command.split()[:2] or 'mv' in command.split()[:2]:
+            return entries
+
+        # Skip commands that are not actual port-forward starts.
+        # Subcommands (`status`, `stop`, `history`, `--help`, ...) can appear
+        # in ANY position after the script name — not just first. Previously
+        # only args[0] was inspected, so `./portForwardRack.sh rack1 status`
+        # was being imported as a real entry with headend=status (corrupting
+        # the rack list). Now we scan every arg.
+        skip_words = {'status', 'stop', 'history', '--help', '-h', 'purge',
+                      'vim', 'chmod', 'cp', 'cat', 'ls', 'nvim', 'edit',
+                      'start', 'which', 'mv', 'restart', 'reconnect',
+                      'reload', 'show', 'list', 'help', 'usage', 'version',
+                      '--version', '-v'}
         script_match = re.search(r'(?:sh\s+)?\S*portfor(?:ward|wad)rack\.sh\s+(.*)', command, re.IGNORECASE)
         if script_match:
             args = script_match.group(1).strip().split()
-            if args:
-                first_arg = args[0].lower()
-                # Skip if it's a known skip word
-                if first_arg in skip_words:
+            for raw_arg in args:
+                # Strip trailing punctuation that bash leaves on chained args
+                # (`rack1 status,` / `rack1 status;` / `rack1 status && ...`).
+                arg = raw_arg.rstrip(',;').lower()
+                if arg in skip_words:
                     return entries
                 # Skip if it's a filename (contains .md, .sh, etc.)
-                if '.' in first_arg and len(first_arg.split('.')[-1]) <= 5:
+                if '.' in raw_arg and len(raw_arg.split('.')[-1]) <= 5 and raw_arg.split('.')[-1].isalpha():
                     return entries
 
         # Pattern 0: rack + headend + user (3 args)
@@ -518,7 +627,13 @@ class MigrationWizard(QDialog):
         # Populate seat list
         for entry in self.seat_entries:
             seat = entry['seat']
-            gateway = f"{entry['gateway_user']}@{entry['gateway_host']}" if entry['gateway_user'] != entry['gateway_host'] else entry['gateway_host']
+            # Seats with no gateway captured (P2 fallback) get a clear marker
+            # so the user knows they need to fill in the gateway manually.
+            has_gateway = entry.get('gateway_user') or entry.get('gateway_host')
+            if has_gateway:
+                gateway = f"{entry['gateway_user']}@{entry['gateway_host']}" if entry['gateway_user'] != entry['gateway_host'] else entry['gateway_host']
+            else:
+                gateway = "(gateway unknown — set manually)"
             port = entry['port'] if entry['port'] else "(auto)"
 
             exists = seat in self.existing_seats
@@ -623,6 +738,15 @@ class MigrationWizard(QDialog):
                     for idx, entry in enumerate(selected_seats):
                         if entry['seat'] not in self.existing_seats:
                             ts = base_ts + idx  # Ensure unique timestamp for ordering
+
+                            # Seats captured without a gateway (P2 fallback)
+                            # cannot be used to actually connect — skip them
+                            # rather than write garbage like `seat|55555|@|ts`.
+                            # The user can re-import after picking a gateway
+                            # via the manual seat flow.
+                            if not entry.get('gateway_user') and not entry.get('gateway_host'):
+                                continue
+
                             gateway_full = f"{entry['gateway_user']}@{entry['gateway_host']}"
 
                             # Assign unique port: explicit port, or auto-generate

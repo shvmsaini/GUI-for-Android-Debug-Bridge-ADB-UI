@@ -1239,6 +1239,21 @@ class SeatMixin:
         watcher.timeout.connect(tick)
         watcher.start()
 
+    def refresh_seat_port_lists_async(self):
+        """Timer entry point: run the seat.sh/portforward fetches off the GUI thread, then redraw."""
+        def work():
+            return (self.seat_port_manager.get_devices_from_seat_sh(),
+                    self.seat_port_manager.get_portforward_status())
+
+        def done(result):
+            if result is None:
+                return
+            self._cached_seat_sh_devices, self._cached_pf_status = result
+            # Redraw from the cache we just filled (same path as search filtering)
+            self.refresh_seat_port_lists(refetch=False)
+
+        self._run_in_background('seat_lists', work, done)
+
     def refresh_seat_port_lists(self, refetch=True):
         """Refresh seat and port forward lists.
 
@@ -1689,9 +1704,18 @@ class SeatMixin:
                 self.log("Invalid gateway format", "ERROR")
 
     def check_portforward_alive(self):
-        """Check port forward status and update UI if it changed"""
+        """Check port forward status off the GUI thread; update UI if it changed"""
+        self._run_in_background(
+            'pf_status',
+            self.seat_port_manager.get_portforward_status,
+            self._apply_portforward_status,
+        )
+
+    def _apply_portforward_status(self, pf_status):
+        """GUI thread: compare the fetched port forward status with the last one."""
+        if pf_status is None:
+            return
         try:
-            pf_status = self.seat_port_manager.get_portforward_status()
             current_active = pf_status and pf_status.get('active', False)
             current_rack = pf_status.get('rack', None) if current_active else None
 
@@ -1713,8 +1737,9 @@ class SeatMixin:
                 self.last_pf_active = current_active
                 self.last_active_rack = current_rack
 
-                # Refresh UI to update green highlight
-                self.refresh_seat_port_lists()
+                # Redraw with the status we just fetched (no second script run)
+                self._cached_pf_status = pf_status
+                self.refresh_seat_port_lists(refetch=False)
 
         except Exception as e:
             self.log(f"Error checking port forward status: {e}", "ERROR")

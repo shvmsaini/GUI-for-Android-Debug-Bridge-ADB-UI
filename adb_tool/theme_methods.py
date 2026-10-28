@@ -103,6 +103,40 @@ class ThemeMixin:
         stylesheet += "QTabBar::tab:selected { background-color: " + card_bg + "; } "
         stylesheet += "QScrollArea { background-color: " + card_bg + "; border: 1px solid " + border_color + "; } "
         stylesheet += "QDialog { background-color: " + bg + "; color: " + fg + "; }"
+        stylesheet += "QListWidget::item { min-height: 38px; padding: 4px; }"
+        stylesheet += "QListWidget::item:selected { background: " + accent + "; color: white; }"
+        stylesheet += "QListWidget::item:selected:hover { background: " + accent_hover + "; color: white; }"
+
+        # Scrollbar handle color enhancement - hide arrow buttons
+        scrollbar_handle = '#666666' if not self.dark_mode else '#cccccc'
+        stylesheet += """
+        QScrollBar:vertical { width: 14px; background: """ + bg + """; }
+        QScrollBar:horizontal { height: 14px; background: """ + bg + """; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+        QScrollBar::sub-line:vertical { height: 0px; background: none; subcontrol-position: top; subcontrol-origin: margin; }
+        QScrollBar::add-line:vertical { height: 0px; background: none; subcontrol-position: bottom; subcontrol-origin: margin; }
+        QScrollBar::sub-line:horizontal { width: 0px; background: none; subcontrol-position: left; subcontrol-origin: margin; }
+        QScrollBar::add-line:horizontal { width: 0px; background: none; subcontrol-position: right; subcontrol-origin: margin; }
+        QScrollBar::handle:vertical {
+            background: """ + scrollbar_handle + """;
+            min-height: 30px;
+            border-radius: 6px;
+            margin: 2px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: """ + accent + """;
+        }
+        QScrollBar::handle:horizontal {
+            background: """ + scrollbar_handle + """;
+            min-width: 30px;
+            border-radius: 6px;
+            margin: 2px;
+        }
+        QScrollBar::handle:horizontal:hover {
+            background: """ + accent + """;
+        }
+        """
         stylesheet += "QStatusBar { background-color: " + card_bg + "; color: " + self.colors.get('text_secondary', fg) + "; } "
         stylesheet += "QStatusBar QLabel { color: " + self.colors.get('text_secondary', fg) + "; font-size: 10pt; } "
 

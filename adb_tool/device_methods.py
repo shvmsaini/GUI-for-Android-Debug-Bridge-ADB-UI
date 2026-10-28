@@ -25,90 +25,125 @@ import bundled_scripts
 class DeviceMixin:
     """Mixin class providing device management functionality."""
 
+    def _run_in_background(self, key, work, on_done):
+        """Run work() on a worker thread and call on_done(result) on the GUI thread.
+
+        If a call with the same key is still in flight, the new one is skipped,
+        so a slow adb/seat.sh call can't pile up behind the timer that started it.
+        work() must not touch widgets. If work() raises, it is logged and on_done
+        receives None.
+        """
+        busy = self.__dict__.setdefault('_bg_busy', set())
+        if key in busy:
+            return
+        busy.add(key)
+        self.__dict__.setdefault('_bg_handlers', {})[key] = on_done
+        if '_bg_emitter' not in self.__dict__:
+            self._bg_emitter = _SignalEmitter()
+            self._bg_emitter.call.connect(self._finish_background)
+
+        def runner():
+            try:
+                result = work()
+            except Exception as e:
+                self.log(f"Background task '{key}' failed: {e}", "ERROR")
+                result = None
+            self._bg_emitter.call.emit((key, result))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _finish_background(self, payload):
+        """GUI thread: hand a finished background result to its on_done callback."""
+        key, result = payload
+        self._bg_busy.discard(key)
+        self._bg_handlers.pop(key)(result)
+
     def refresh_devices(self, silent=False):
         """Refresh list of connected devices
+
+        The adb/seat.sh calls run on a worker thread; the widget update runs on
+        the GUI thread in _apply_device_refresh.
 
         Args:
             silent: If True, don't log routine refresh messages (for auto-refresh)
         """
         if not silent:
             self.update_status("Refreshing devices...")
+        self._run_in_background(
+            'devices',
+            lambda: self._gather_device_snapshot(silent),
+            self._apply_device_refresh,
+        )
 
-        # Log that we are starting a refresh
+    def _gather_device_snapshot(self, silent):
+        """Worker thread: run the adb/seat.sh subprocess calls and merge their output.
+
+        Returns a dict for _apply_device_refresh, or None when there is nothing to
+        show. Must not touch widgets.
+        """
         self.log(f"Refreshing devices (silent={silent})", "INFO" if not silent else "DEBUG")
 
-        try:
-            # Check if adb is initialized
-            if not hasattr(self, 'adb') or self.adb is None:
-                self.log("ADB Manager not initialized", "ERROR")
-                return
+        if not hasattr(self, 'adb') or self.adb is None:
+            self.log("ADB Manager not initialized", "ERROR")
+            return None
 
-            # Test ADB connection first
-            test_result = self.adb.run_command('version')
-            if not test_result['success']:
-                error_msg = test_result['stderr'] if test_result['stderr'] else "Unknown error"
-                self.log(f"ADB test failed: {error_msg}", "ERROR")
-                self.log(f"ADB path: {self.adb.adb_path}", "ERROR")
-                self.update_status(f"ADB error: {error_msg[:50]}")
-                self.device_info_label.setText(f"ADB Error: {error_msg[:100]}")
-                self.device_info_label.setStyleSheet(f"color: {self.colors['error']};")
-                return
+        test_result = self.adb.run_command('version')
+        if not test_result['success']:
+            error_msg = test_result['stderr'] if test_result['stderr'] else "Unknown error"
+            self.log(f"ADB test failed: {error_msg}", "ERROR")
+            self.log(f"ADB path: {self.adb.adb_path}", "ERROR")
+            return {'adb_error': error_msg}
 
-            # Check if seat_port_manager is initialized
-            if not hasattr(self, 'seat_port_manager') or self.seat_port_manager is None:
-                self.log("Seat Port Manager not initialized", "ERROR")
-                return
+        if not hasattr(self, 'seat_port_manager') or self.seat_port_manager is None:
+            self.log("Seat Port Manager not initialized", "ERROR")
+            return None
 
-            # Get devices from seat.sh
-            seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
-            seat_device_map = {}  # Map device ID to seat info
-            connected_seats = set()
+        seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+        all_adb_devices = self.adb.get_devices(silent=silent)
 
-            # Build map from seat.sh output
-            for dev_info in seat_sh_devices:
-                seat_device_map[dev_info['device']] = dev_info
-                if dev_info['seat']:  # If seat is not empty
-                    connected_seats.add(dev_info['device'])
+        # Show a device if ADB sees it OR seat.sh reports it connected (ADB may lag).
+        devices_by_id = {d['id']: d for d in all_adb_devices}
+        for sd in seat_sh_devices:
+            dev_id = sd['device']
+            if not dev_id:
+                continue
+            if dev_id not in devices_by_id:
+                devices_by_id[dev_id] = {
+                    'id': dev_id,
+                    'status': sd['status'] if sd['status'] else 'offline',
+                    'model': None,
+                    'product': None
+                }
+            elif sd['status'] == 'device' and devices_by_id[dev_id]['status'] != 'device':
+                # seat.sh says it's online, ADB might be lagging
+                devices_by_id[dev_id]['status'] = 'device'
 
-            # Get all devices from adb
-            all_adb_devices = self.adb.get_devices(silent=silent)
+        all_devices = list(devices_by_id.values())
 
-            # Merge adb devices and seat.sh devices
-            # We want to show a device if it's in ADB OR if it's reported as connected by seat.sh
-            # (the latter helps when ADB hasn't picked it up yet or it's transiently missing from ADB).
+        if not silent:
+            self.log(f"All devices (merged): {all_devices}", "INFO")
+            self.log(f"Seat.sh devices: {seat_sh_devices}", "INFO")
+        else:
+            self.log(f"All devices (merged): {all_devices}", "DEBUG")
+            self.log(f"Seat.sh devices: {seat_sh_devices}", "DEBUG")
 
-            devices_by_id = {d['id']: d for d in all_adb_devices}
+        return {'silent': silent, 'seat_sh_devices': seat_sh_devices, 'all_devices': all_devices}
 
-            for sd in seat_sh_devices:
-                dev_id = sd['device']
-                if not dev_id:
-                    continue
-                if dev_id not in devices_by_id:
-                    # Add seat.sh device to the list even if ADB doesn't see it yet
-                    devices_by_id[dev_id] = {
-                        'id': dev_id,
-                        'status': sd['status'] if sd['status'] else 'offline',
-                        'model': None,
-                        'product': None
-                    }
-                elif sd['status'] == 'device' and devices_by_id[dev_id]['status'] != 'device':
-                    # seat.sh says it's online, ADB might be lagging
-                    devices_by_id[dev_id]['status'] = 'device'
-
-            all_devices = list(devices_by_id.values())
-
-            if not silent:
-                self.log(f"All devices (merged): {all_devices}", "INFO")
-                self.log(f"Seat.sh devices: {seat_sh_devices}", "INFO")
-            else:
-                self.log(f"All devices (merged): {all_devices}", "DEBUG")
-                self.log(f"Seat.sh devices: {seat_sh_devices}", "DEBUG")
-        except Exception as e:
-            self.log(f"Error refreshing devices: {str(e)}", "ERROR")
-            import traceback
-            self.log(traceback.format_exc(), "DEBUG")
-            self.update_status("Error refreshing devices")
+    def _apply_device_refresh(self, snapshot):
+        """GUI thread: apply a snapshot from _gather_device_snapshot to the widgets."""
+        if not snapshot:
             return
+        if 'adb_error' in snapshot:
+            error_msg = snapshot['adb_error']
+            self.update_status(f"ADB error: {error_msg[:50]}")
+            self.device_info_label.setText(f"ADB Error: {error_msg[:100]}")
+            self.device_info_label.setStyleSheet(f"color: {self.colors['error']};")
+            return
+
+        silent = snapshot['silent']
+        seat_sh_devices = snapshot['seat_sh_devices']
+        all_devices = snapshot['all_devices']
+        seat_device_map = {dev_info['device']: dev_info for dev_info in seat_sh_devices}
 
         # Sort devices: connected (with seat) first, then others
         connected_device_list = []

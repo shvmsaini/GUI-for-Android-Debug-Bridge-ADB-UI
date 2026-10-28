@@ -234,7 +234,7 @@ class ScrcpyMixin:
 
         # Auto-refresh seat/port lists every 10 seconds
         self.seat_port_refresh_timer = QTimer()
-        self.seat_port_refresh_timer.timeout.connect(self.refresh_seat_port_lists)
+        self.seat_port_refresh_timer.timeout.connect(self.refresh_seat_port_lists_async)
         self.seat_port_refresh_timer.start(10000)
 
         # Check port forward status every 10 seconds to detect if it died
