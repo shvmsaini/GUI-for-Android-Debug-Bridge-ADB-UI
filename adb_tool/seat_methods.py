@@ -1652,7 +1652,9 @@ class SeatMixin:
             parts = gateway_norm.split('@')
             user = parts[0] if len(parts) == 2 else 'user'
             gateway_host = parts[1] if len(parts) == 2 else gateway_norm
-            password = self.credential_manager.get_password(gateway_host, user)
+            # Per-gateway entry first, fall back to the global gateway key
+            # (all gateways share the same password).
+            password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
             if not password:
                 # Prompt and automatically save since all gateway passwords are the same
                 password = self.credential_manager.prompt_password(
@@ -1741,7 +1743,7 @@ class SeatMixin:
 
         # Get password from Keychain only (no plain text storage)
         # Only prompt if no password is stored and we weren't passed one already
-        password = self.credential_manager.get_password(gateway_host, user)
+        password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
         if not password and not any([device_password, mtc_password]):
             password = self.credential_manager.prompt_password(self, gateway_host, user)
             if not password:
@@ -2212,7 +2214,7 @@ class SeatMixin:
         """GUI-thread handler: re-prompt for the mtc password (the cached one
         was wrong), update the cache, then re-spawn the install worker.
         """
-        mtc_key = "mtc@adb-gui-ui"
+        mtc_key = "mtc_global"
         new_mtc, ok = QInputDialog.getText(
             self, "Wrong MTC Password",
             f"The cached mtc password was rejected by {seat}.\n\n"
@@ -2226,6 +2228,9 @@ class SeatMixin:
         # prompting. (The user said mtc is the same everywhere, so a fresh
         # install on any other seat will pick this up automatically.)
         self.credential_manager.set_password(mtc_key, "mtc", new_mtc)
+        # Mirror to the canonical global mtc key so the rest of the
+        # codebase (which uses mtc_global) sees the updated password.
+        self.credential_manager.set_global_mtc_password(new_mtc)
         self.log("Cached mtc password updated. Retrying install...", "INFO")
         self._install_adb_key_on_seat(
             seat, gateway, adb_key, gateway_password, new_mtc,
@@ -2283,7 +2288,8 @@ class SeatMixin:
         # Get password from Keychain only (no plain text storage)
         # Keychain is keyed by the hostname and user, constructed as user@hostname
         # Since all gateway passwords are the same, prompt if not cached
-        password = self.credential_manager.get_password(gateway_host, user)
+        # (with global fallback so any saved entry unblocks this lookup)
+        password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
         if not password:
             password = self.credential_manager.prompt_password(
                 self, gateway_host, user, auto_save=True
@@ -2745,8 +2751,10 @@ class SeatMixin:
             seat_combo.blockSignals(False)
             search_btn.setEnabled(False)
 
-            # Try to get a cached password; if not, prompt once and cache.
-            gw_password = self.credential_manager.get_password(gateway_host, gateway_user)
+            # Try to get a cached password (per-gateway, with global
+            # fallback). If neither exists, prompt once and cache both
+            # so subsequent gateways don't prompt either.
+            gw_password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, gateway_user)
             if not gw_password:
                 gw_password, ok = QInputDialog.getText(
                     dialog, "Gateway Password",
@@ -2759,6 +2767,9 @@ class SeatMixin:
                     return
                 try:
                     self.credential_manager.set_password(gateway_host, gateway_user, gw_password)
+                    # Mirror to the global gateway key so other gateways
+                    # don't re-prompt next time.
+                    self.credential_manager.set_global_gateway_password(gw_password)
                 except Exception:
                     pass
 
@@ -2871,7 +2882,7 @@ class SeatMixin:
             # it after first prompt so subsequent connects to the same (or any
             # other) gateway don't ask again; all gateways share the same
             # password per the user's preference.
-            gateway_password = self.credential_manager.get_password(gw_host, gw_user)
+            gateway_password = self.credential_manager.get_gateway_password_with_fallback(gw_host, gw_user)
             if not gateway_password:
                 gateway_password, ok = QInputDialog.getText(
                     dialog, "Gateway Password",
@@ -2881,6 +2892,9 @@ class SeatMixin:
                 if not ok or not gateway_password:
                     return
                 self.credential_manager.set_password(gw_host, gw_user, gateway_password)
+                # Mirror to the global gateway key so any future gateway
+                # (different hostname) doesn't re-prompt.
+                self.credential_manager.set_global_gateway_password(gateway_password)
 
             mtc_password = None
             if install_adb_key:
@@ -2890,8 +2904,8 @@ class SeatMixin:
                 # same password twice). The mtc password is the same across ALL
                 # seats and gateways, so we cache it under one canonical key
                 # and only re-prompt if the install fails with auth error.
-                mtc_key = "mtc@adb-gui-ui"
-                mtc_password = self.credential_manager.get_password(mtc_key, "mtc")
+                mtc_key = "mtc_global"
+                mtc_password = self.credential_manager.get_mtc_password_with_fallback()
                 if not mtc_password:
                     mtc_password, ok = QInputDialog.getText(
                         dialog, "MTC Password",
@@ -2904,6 +2918,8 @@ class SeatMixin:
                     # Save so future installs don't ask again — the user
                     # said the mtc password is the same everywhere.
                     self.credential_manager.set_password(mtc_key, "mtc", mtc_password)
+                    # Mirror to the canonical global mtc key too.
+                    self.credential_manager.set_global_mtc_password(mtc_password)
 
             # Use the existing connect_seat method. device_password is the
             # gateway SSH password; mtc_password covers both the seat's SSH
@@ -2979,9 +2995,11 @@ class SeatMixin:
             gateway = f"{user}@{rack}"
 
             # Auto-set the password in credential manager for this gateway
-            # Since gateway passwords are the same, we prompt if not already cached
+            # Since gateway passwords are the same, we prompt if not already
+            # cached. Falls back to the global gateway key so a previous
+            # save on a different rack unlocks this one too.
             rack_host = rack.split('@')[-1]  # Get just the hostname part
-            password = self.credential_manager.get_password(rack_host, user)
+            password = self.credential_manager.get_gateway_password_with_fallback(rack_host, user)
             if not password:
                 # Prompt and auto-save
                 password, ok = QInputDialog.getText(
@@ -2992,8 +3010,9 @@ class SeatMixin:
                 )
                 if not ok or not password:
                     return
-                # Set in credential manager
+                # Set in credential manager (per-host + global mirror)
                 self.credential_manager.set_password(rack_host, user, password)
+                self.credential_manager.set_global_gateway_password(password)
 
             # Use the existing connect_portforward method
             self.connect_portforward(gateway, partition, user)

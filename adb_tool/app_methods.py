@@ -93,9 +93,9 @@ class AppMixin:
         # If gateway requested, ensure mtc password is available
         mtc_password = None
         if gateway_checkbox.isChecked():
-            # Try to get cached mtc password
+            # Try to get cached mtc password (global fallback)
             if hasattr(self, 'credential_manager'):
-                mtc_password = self.credential_manager.get_password("mtc_global", "mtc")
+                mtc_password = self.credential_manager.get_mtc_password_with_fallback()
 
             # If not cached, prompt user
             if not mtc_password:
@@ -325,9 +325,9 @@ class AppMixin:
         self.log(f"Gateway: Copying {apk_name} → {seat_name}:{remote_path}", "INFO")
         self.update_status(f"Gateway: Copying via SCP...")
 
-        # Get mtc password - try cache or use provided
+        # Get mtc password - try cache (global fallback) or use provided
         if not mtc_password and hasattr(self, 'credential_manager'):
-            mtc_password = self.credential_manager.get_password("mtc_global", "mtc")
+            mtc_password = self.credential_manager.get_mtc_password_with_fallback()
 
         if not mtc_password:
             self.log("No mtc password - falling back to adb push", "WARNING")
@@ -348,7 +348,9 @@ class AppMixin:
         try:
             from .credentials import CredentialManager
             creds = CredentialManager()
-            gw_pw = creds.get_password(gateway_host, gateway_user)
+            # Per-gateway entry, then global gateway fallback — any
+            # previously saved gateway password unblocks this lookup.
+            gw_pw = creds.get_gateway_password_with_fallback(gateway_host, gateway_user)
             if not gw_pw:
                 # We can't prompt for the password here — we're on the
                 # install worker thread, and constructing a QInputDialog

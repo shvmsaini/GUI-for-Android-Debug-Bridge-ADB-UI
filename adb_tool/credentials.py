@@ -169,6 +169,53 @@ class CredentialManager:
             pass
         return None
 
+    # Reserved Keychain account names. Per-gateway passwords are keyed as
+    # "user@<gateway>"; these well-known accounts hold shared passwords
+    # that work across all gateways/users.
+    GLOBAL_GATEWAY_ACCOUNT = "user@gateway_global"
+    GLOBAL_MTC_ACCOUNT = "mtc@mtc_global"
+
+    def get_global_gateway_password(self):
+        """Retrieve the shared gateway password (used for any gateway)."""
+        return self.get_password("gateway_global", "user")
+
+    def set_global_gateway_password(self, password):
+        """Store the shared gateway password."""
+        # Also save it under the canonical account name.
+        return self.set_password("gateway_global", "user", password)
+
+    def get_global_mtc_password(self):
+        """Retrieve the shared mtc password (used for any seat)."""
+        return self.get_password("mtc_global", "mtc")
+
+    def set_global_mtc_password(self, password):
+        """Store the shared mtc password."""
+        return self.set_password("mtc_global", "mtc", password)
+
+    def get_gateway_password_with_fallback(self, gateway, user):
+        """Look up a gateway password, falling back to the global one.
+
+        Order:
+          1. Per-host entry  (``user@gateway``) — kept for parity with old
+             data and explicit per-host overrides.
+          2. Global gateway entry (``user@gateway_global``) — one shared
+             password works for every gateway.
+
+        Returns the password, or ``None`` if neither exists.
+        """
+        pw = self.get_password(gateway, user)
+        if pw:
+            return pw
+        return self.get_global_gateway_password()
+
+    def get_mtc_password_with_fallback(self):
+        """Look up an mtc password via the global mtc account.
+
+        Used by seat-root and gateway file explorers where all seats
+        share the same mtc password.
+        """
+        return self.get_global_mtc_password()
+
     def set_password(self, gateway, user, password):
         """Store password in credential manager and track in index."""
         # Ensure index is synced before we add a new entry
@@ -273,6 +320,13 @@ class CredentialManager:
             # Auto-save or offer to save password
             if auto_save:
                 self.set_password(gateway, user, password)
+                # Mirror to the global gateway key — all gateways share
+                # the same password, so a successful save here should
+                # unblock every future gateway lookup too.
+                try:
+                    self.set_global_gateway_password(password)
+                except Exception:
+                    pass
             else:
                 reply = QMessageBox.question(
                     parent,
@@ -282,5 +336,10 @@ class CredentialManager:
                 )
                 if reply == QMessageBox.StandardButton.Yes:
                     self.set_password(gateway, user, password)
+                    # Mirror to the global key for the same reason.
+                    try:
+                        self.set_global_gateway_password(password)
+                    except Exception:
+                        pass
             return password
         return None

@@ -459,8 +459,10 @@ class GatewayMixin:
 
         user, host = text.split('@', 1)
 
-        # Look up password (already saved per the user's preference)
-        password = self.credential_manager.get_password(host, user)
+        # Look up password (already saved per the user's preference).
+        # Per-host entry first, fall back to the global gateway key —
+        # all gateways share the same password.
+        password = self.credential_manager.get_gateway_password_with_fallback(host, user)
         if not password:
             password = self.credential_manager.prompt_password(self, host, user)
             if not password:
@@ -1177,7 +1179,7 @@ class GatewayMixin:
             # Get the mtc password — needed for SCP from gateway to seat.
             # The mtc password is cached globally (same across all seats).
             creds = CredentialManager()
-            mtc_password = creds.get_password("mtc_global", "mtc")
+            mtc_password = creds.get_mtc_password_with_fallback()
             if not mtc_password:
                 mtc_password, ok = QInputDialog.getText(
                     explorer, "MTC Password",
@@ -1186,7 +1188,8 @@ class GatewayMixin:
                 )
                 if not ok or not mtc_password:
                     return
-                creds.set_password("mtc_global", "mtc", mtc_password)
+                # Cache globally so we never ask again for any seat.
+                creds.set_global_mtc_password(mtc_password)
 
             self.log(f"Gateway: copying {raw_name} to seat {seat_host}:{dest_path} via SCP on gateway", "INFO")
             self.update_status(f"Copying to {seat_host}…")

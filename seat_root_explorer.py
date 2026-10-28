@@ -1172,14 +1172,16 @@ def prompt_and_open_seat_root(parent):
 
     # Credentials from Keychain
     creds = CredentialManager()
-    gw_pw = creds.get_password(gateway_host, gateway_user)
+    # All gateways share one password, so try the per-host entry first
+    # then fall back to the global gateway key.
+    gw_pw = creds.get_gateway_password_with_fallback(gateway_host, gateway_user)
     if not gw_pw:
         gw_pw = creds.prompt_password(parent, gateway_host, gateway_user)
         if not gw_pw:
             return
 
-    # mtc password is global (same across all seats)
-    mtc_pw = creds.get_password("mtc_global", "mtc")
+    # mtc password is global (same across all seats) — same fallback story.
+    mtc_pw = creds.get_mtc_password_with_fallback()
     if not mtc_pw:
         mtc_pw, ok2 = QInputDialog.getText(parent, "mtc Password",
                                             f"Enter the mtc password (used for all seats):",
@@ -1187,6 +1189,11 @@ def prompt_and_open_seat_root(parent):
         mtc_pw = mtc_pw if ok2 else None
         if not mtc_pw:
             return
+        # Cache globally so we never ask again for any seat.
+        try:
+            creds.set_global_mtc_password(mtc_pw)
+        except Exception:
+            pass
 
     parent.update_status(f"Connecting to {seat} as root…")
     open_seat_root_window(parent, seat, gateway_host, gateway_user, gw_pw, seat, mtc_pw, parent.colors)
