@@ -2700,21 +2700,62 @@ class SeatMixin:
             client.connect(gateway_host, **connect_kwargs)
 
             stdin, stdout, stderr = client.exec_command('arp -a', timeout=8)
-            # Read with timeout to prevent hanging forever
-            import select
+            # Read stdout with a hard total budget, using Channel.recv_ready()
+            # instead of select.select([channel],...) — the latter is fragile on
+            # macOS where paramiko.Channel.fileno() can race with the channel
+            # lifecycle, leaving the worker thread blocked until the channel
+            # timeout fires (which makes the dialog look "stuck on Loading").
+            ch = stdout.channel
+            ch.settimeout(2)  # per-recv bound; combined with the total budget below
             chunks = []
             start = time.time()
-            while True:
-                if time.time() - start > 5:
-                    break  # 5 second total timeout
-                ready, _, _ = select.select([stdout.channel], [], [], 0.5)
-                if ready:
-                    chunk = stdout.read(4096).decode('utf-8', 'replace')
-                    if not chunk:
+            MAX_BUDGET = 5.0  # seconds; hard ceiling for the whole read
+            while time.time() - start < MAX_BUDGET:
+                if ch.recv_ready():
+                    try:
+                        chunk = ch.recv(4096)
+                    except socket.timeout:
                         break
+                    if not chunk:
+                        break  # EOF
                     chunks.append(chunk)
-            out = ''.join(chunks)
-            err = stderr.read().decode('utf-8', 'replace')
+                    continue
+                # No data ready right now. If the remote command has exited
+                # and the channel is at EOF, recv_ready() stays False and
+                # channel.exit_status_ready() becomes True — drain once more
+                # then break.
+                if ch.exit_status_ready():
+                    # Final drain — anything still buffered.
+                    while ch.recv_ready():
+                        tail = ch.recv(4096)
+                        if not tail:
+                            break
+                        chunks.append(tail)
+                    break
+                # Brief sleep so we don't busy-loop; total budget still
+                # bounded above.
+                time.sleep(0.05)
+            out = b''.join(chunks).decode('utf-8', 'replace') if chunks else ''
+
+            # Bound stderr too — channel timeout above caps each read; if
+            # the remote never closes stderr we'll bail after this loop
+            # rather than blocking forever.
+            err_chunks = []
+            estart = time.time()
+            while time.time() - estart < 2.0:
+                try:
+                    if stderr.channel.recv_ready():
+                        d = stderr.channel.recv_stderr(4096)
+                        if not d:
+                            break
+                        err_chunks.append(d)
+                        continue
+                    if stderr.channel.exit_status_ready():
+                        break
+                except socket.timeout:
+                    break
+                time.sleep(0.05)
+            err = b''.join(err_chunks).decode('utf-8', 'replace') if err_chunks else ''
 
             if err:
                 self.log(f"Gateway arp -a error: {err}", "DEBUG")
@@ -2733,7 +2774,8 @@ class SeatMixin:
                     arp_entries[name] = ip
 
         except Exception as e:
-            self.log(f"SSH arp discovery failed: {e}", "DEBUG")
+            error_msg = f"Remote arp failed: {e}"
+            self.log(error_msg, "DEBUG")
         finally:
             try:
                 if client is not None:
@@ -2751,6 +2793,73 @@ class SeatMixin:
             except Exception:
                 pass
 
+        return arp_entries
+
+    def _ssh_run_arp_via_gateway_explorer(self, gateway_user, gateway_host, password):
+        """SSH into the gateway and run `arp -a` using the SAME approach as
+        the Gateway Explorer (which the user confirmed works).
+
+        Uses `_ssh_connect` from GatewayMixin (paramiko.ProxyCommand from
+        ~/.ssh/config), opens a session, runs `arp -a`, parses output.
+        Returns dict {name: ip}.
+        """
+        arp_entries = {}
+        client = None
+        try:
+            # Mirror open_gateway_explorer() exactly:
+            client, _err = self._ssh_connect(gateway_host, gateway_user, password)
+            if client is None:
+                # _ssh_connect already returned a descriptive error string.
+                self.log(f"Seat scan SSH connect failed: {_err}", "DEBUG")
+                return arp_entries
+            # Run arp -a with a bounded timeout (channel + total budget).
+            import time
+            stdin, stdout, stderr = client.exec_command('arp -a', timeout=10)
+            ch = stdout.channel
+            ch.settimeout(2)
+            chunks = []
+            start = time.time()
+            while time.time() - start < 5.0:
+                if ch.recv_ready():
+                    try:
+                        d = ch.recv(4096)
+                    except Exception:
+                        break
+                    if not d:
+                        break
+                    chunks.append(d)
+                    continue
+                if ch.exit_status_ready():
+                    while ch.recv_ready():
+                        d = ch.recv(4096)
+                        if not d:
+                            break
+                        chunks.append(d)
+                    break
+                time.sleep(0.05)
+            out = b''.join(chunks).decode('utf-8', 'replace') if chunks else ''
+
+            # Parse arp output the same way _read_arp_table() does.
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                name = line.split(None, 1)[0]
+                ip = None
+                if '(' in line and ')' in line:
+                    inside = line.split('(', 1)[1].split(')', 1)[0].strip()
+                    if _is_dotted_quad(inside):
+                        ip = inside
+                if ip and name:
+                    arp_entries[name] = ip
+        except Exception as e:
+            self.log(f"Seat scan: SSH arp failed: {e}", "DEBUG")
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
         return arp_entries
 
     def _show_add_seat_dialog(self):
@@ -2872,6 +2981,14 @@ class SeatMixin:
         hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
         layout.addWidget(hint)
 
+        # Cross-thread emitter for the seat-scan worker. Must be created
+        # here (GUI thread, with the dialog as parent) so its `call` signal
+        # marshals to the GUI thread as a queued connection when the
+        # worker emits it. QTimer.singleShot from a worker thread is
+        # silently dropped on PyQt6, so we use this instead.
+        scan_emitter = _SignalEmitter(dialog)
+        scan_emitter.moveToThread(dialog.thread())
+
         # Password input field removed - no longer needed
         def show_password_prompt(show):
             pass  # No-op for compatibility
@@ -2890,6 +3007,12 @@ class SeatMixin:
             if current_text and current_text not in suggestions:
                 seat_combo.addItem(current_text)
             seat_combo.setCurrentText(current_text or (suggestions[0] if suggestions else ""))
+            # CRITICAL: editable combo's lineEdit can retain old text after
+            # clear(). Explicitly reset it so the user actually sees the new
+            # state (otherwise they see "⏳ Loading…" forever because the
+            # lineEdit is still showing that text from the placeholder item).
+            if not suggestions and not current_text:
+                seat_combo.setEditText("")
             seat_combo.blockSignals(False)
 
         # Session cache: gateway_host -> list of seat IPs
@@ -2968,51 +3091,71 @@ class SeatMixin:
                     pass
 
             def do_scan():
-                """Run remote arp first, fall back to local arp on failure."""
+                """Run remote arp first, fall back to local arp on failure.
+
+                Runs synchronously on the GUI thread. The dialog blocks for
+                ~8s during the scan. Mirrors the gateway explorer approach
+                (uses _ssh_connect from GatewayMixin) but stays on the GUI
+                thread to avoid PyQt6 cross-thread marshaling bugs.
+                """
                 suggestions = []
                 source = "none"
+                error_msg = None
                 try:
-                    remote = self._ssh_run_arp_on_gateway(
+                    remote = self._ssh_run_arp_via_gateway_explorer(
                         gateway_user, gateway_host, gw_password
                     )
                     if remote:
-                        # Sort by IP for stable ordering; use "name (ip)" so the
-                        # user can see which seat each IP belongs to.
+                        # Return only the IP address (what we need for seat connection).
+                        # arp -a output: "hostname (ip)" — extract just the IP.
                         def _ip_key(entry):
                             try:
                                 return tuple(int(p) for p in entry[1].split('.'))
                             except Exception:
                                 return (0, 0, 0, 0)
-                        for name, ip in sorted(remote.items(), key=_ip_key):
-                            suggestions.append(f"{name} ({ip})" if name and name != '?' else ip)
+                        for ip in sorted(remote.values(), key=lambda x: (
+                            tuple(int(p) for p in x.split('.')) if _is_dotted_quad(x) else (0,0,0,0)
+                        )):
+                            suggestions.append(ip)
                         source = "gateway"
                     else:
                         self.log("Remote arp returned no entries; falling back to local", "DEBUG")
                 except Exception as e:
-                    self.log(f"Remote arp failed: {e}", "DEBUG")
+                    error_msg = f"Remote arp failed: {e}"
+                    self.log(error_msg, "DEBUG")
 
                 if not suggestions:
                     try:
                         local = self._read_arp_table()
-                        for name, ip in local.items():
-                            if ip:
-                                suggestions.append(f"{name} ({ip})" if name and name != '?' else ip)
+                        for ip in sorted(local.values(), key=lambda x: (
+                            tuple(int(p) for p in x.split('.')) if _is_dotted_quad(x) else (0,0,0,0)
+                        )):
+                            if ip and _is_dotted_quad(ip):
+                                suggestions.append(ip)
                         if suggestions:
                             source = "local"
                     except Exception:
                         pass
 
-                def apply():
-                    if gateway_host not in seat_cache:
-                        seat_cache[gateway_host] = suggestions
-                    update_seat_combo(suggestions)
-                    search_btn.setEnabled(True)
-                    if source == "none":
+                # Apply result directly (GUI thread)
+                if gateway_host not in seat_cache:
+                    seat_cache[gateway_host] = suggestions
+                update_seat_combo(suggestions)
+                search_btn.setEnabled(True)
+                if source == "none":
+                    if error_msg:
+                        self.log(f"Seat scan: {error_msg}", "WARNING")
+                        hint.setText(
+                            f"⚠ Seat scan failed: {error_msg}\n"
+                            "   Check VPN / gateway connectivity, then click 🔍 again."
+                        )
+                        hint.setStyleSheet(f"color: {self.colors.get('error', '#cc4444')}; font-size: 9pt;")
+                    else:
                         self.log("Seat scan: no entries found", "DEBUG")
+                        hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
 
-                QTimer.singleShot(0, apply)
-
-            threading.Thread(target=do_scan, daemon=True).start()
+            # NO THREADING. Run synchronously now.
+            do_scan()
 
         search_btn.clicked.connect(on_search_clicked)
 
