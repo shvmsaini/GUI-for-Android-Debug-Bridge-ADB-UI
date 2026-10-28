@@ -20,6 +20,7 @@ from .adb_manager import ADBManager
 from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
+from .safe_dialog import safe_info, safe_warning, safe_critical
 import bundled_scripts
 
 # Optional: embedded scrcpy mirror (lazy-imported so the app still runs
@@ -271,19 +272,22 @@ class ScrcpyMixin:
         else:
             # Switch to screen mirror
             if self.mirror_video is None:
-                QMessageBox.warning(
+                # Defer + safe dialog (avoids Qt 6.11/macOS 26
+                # QTextEngine::validate() NULL-deref in QMessageBox)
+                QTimer.singleShot(0, lambda: safe_warning(
                     self, "Feature Unavailable",
-                    "The screen mirror module (scrcpy_mirror.py) could not be imported.\n\n"
-                    "Make sure the file exists and dependencies are installed.")
+                    "scrcpy_mirror.py could not be imported — make sure the file exists and dependencies are installed."))
                 return
             if not self.current_device:
-                QMessageBox.warning(self, "No Device",
-                                    "Please select a device first")
+                safe_warning(self, "No Device", "Please select a device first")
                 return
             if _check_embedded_mirror is not None:
                 ok, msg = _check_embedded_mirror()
                 if not ok:
-                    QMessageBox.information(self, "Install Dependencies", msg)
+                    QTimer.singleShot(0, lambda: safe_info(
+                        self, "Install Dependencies",
+                        "Missing: py-scrcpy-sdk / opencv-python-headless / imageio. "
+                        "Install: pip install py-scrcpy-sdk opencv-python-headless imageio"))
                     return
 
             self._hide_all_log_panels(except_widget=self.mirror_video)
@@ -323,21 +327,25 @@ class ScrcpyMixin:
             device_id = self.current_device
 
         if not device_id:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
+            safe_warning(self, "No Device", "Please select a device first")
             return
 
         if ScrcpyMirrorWindow is None:
-            QMessageBox.warning(
+            # Defer + safe dialog (see requirements.txt pin comment for
+            # the Qt 6.11/macOS 26 QTextEngine crash rationale).
+            QTimer.singleShot(0, lambda: safe_warning(
                 self, "Feature Unavailable",
-                "The scrcpy mirror module (scrcpy_mirror.py) could not be imported.\n\n"
-                "Make sure the file exists and dependencies are installed.")
+                "scrcpy_mirror.py could not be imported — make sure the file exists and dependencies are installed."))
             return
 
         # Check dependencies and show install instructions if missing
         if _check_embedded_mirror is not None:
             ok, msg = _check_embedded_mirror()
             if not ok:
-                QMessageBox.information(self, "Install Dependencies", msg)
+                QTimer.singleShot(0, lambda: safe_info(
+                    self, "Install Dependencies",
+                    "Missing: py-scrcpy-sdk / opencv-python-headless / imageio. "
+                    "Install: pip install py-scrcpy-sdk opencv-python-headless imageio"))
                 return
 
         adb_path = getattr(self.adb, 'adb_path', 'adb')
@@ -381,10 +389,12 @@ class ScrcpyMixin:
 
         # All retries failed — surface the last error to the user.
         self.log(f"Failed to open mirror window after 3 attempts: {last_exc}", "ERROR")
-        QMessageBox.critical(
+        # Defer + safe dialog (Qt 6.11/macOS 26 QTextEngine crash —
+        # see safe_dialog.py for the full rationale).
+        QTimer.singleShot(0, lambda: safe_critical(
             self, "Mirror Error",
-            f"Failed to open mirror window after 3 attempts.\n\n{last_exc}"
-        )
+            f"Failed to open mirror window after 3 attempts: {last_exc}"
+        ))
 
     def _scrcpy_via_seat(self, seat):
         """Open mirror window for a seat. Connects the seat first if needed."""
@@ -784,7 +794,7 @@ class ScrcpyMixin:
         """
         if device_id is None:
             if not self.current_device:
-                QMessageBox.warning(self, "No Device", "Please select a device first")
+                safe_warning(self, "No Device", "Please select a device first")
                 return
             device_id = self.current_device
 
@@ -803,18 +813,11 @@ class ScrcpyMixin:
         scrcpy_path = self.find_scrcpy()
         if not scrcpy_path:
             msg = (
-                "scrcpy was not found on your system.\n\n"
-                "On macOS (Homebrew):\n"
-                "  brew install scrcpy\n\n"
-                "Or select the scrcpy executable manually."
+                "scrcpy was not found on your system. "
+                "Install with 'brew install scrcpy' (macOS) or pick the executable manually."
             )
-            reply = QMessageBox.question(
-                self,
-                "scrcpy not found",
-                msg,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
+            reply = safe_question(self, "scrcpy not found", msg)
+            if reply:
                 picked, _ = QFileDialog.getOpenFileName(
                     self,
                     "Select scrcpy executable",
@@ -943,7 +946,10 @@ class ScrcpyMixin:
                     err = (stderr + stdout).strip() or "scrcpy exited immediately."
                     self.log(f"scrcpy failed to start: {err}", "ERROR")
                     QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"scrcpy failed to start:\n\n{err}\n\nMake sure the device is connected and scrcpy is installed."))
+                    # Safe dialog (avoids Qt 6.11 QMessageBox crash).
+                    QTimer.singleShot(0, lambda: safe_critical(
+                        self, "scrcpy Error",
+                        f"scrcpy failed to start: {err}. Make sure the device is connected and scrcpy is installed."))
                     return
 
                 # Running fine
@@ -954,7 +960,9 @@ class ScrcpyMixin:
                 error_msg = str(e)
                 self.log(f"Failed to launch scrcpy: {error_msg}", "ERROR")
                 QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
-                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "scrcpy Error", f"Failed to launch scrcpy:\n\n{error_msg}"))
+                QTimer.singleShot(0, lambda: safe_critical(
+                    self, "scrcpy Error",
+                    f"Failed to launch scrcpy: {error_msg}"))
 
         threading.Thread(target=do_launch, daemon=True).start()
 

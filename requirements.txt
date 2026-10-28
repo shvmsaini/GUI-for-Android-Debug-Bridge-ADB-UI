@@ -4,7 +4,12 @@
 # - PyQt6 for modern GUI
 # - ADB (Android Debug Bridge) installed on your system
 
-PyQt6>=6.6.0
+PyQt6>=6.6.0; sys_platform != 'darwin'
+# Qt 6.11 on macOS 26+ has a QTextEngine::validate() NULL-deref crash
+# inside QMessageBox exec() (observed in production crash report
+# AAC507EF-...; Qt bug QTBUG-128437 family). Pin Qt 6.7 on macOS —
+# it's the last branch without that regression.
+PyQt6==6.7.1; sys_platform == 'darwin'
 
 # SSH/SFTP for Gateway Manager (browse files on connected seat gateways)
 paramiko>=3.0.0
