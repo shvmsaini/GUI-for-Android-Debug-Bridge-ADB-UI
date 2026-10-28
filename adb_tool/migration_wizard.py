@@ -71,8 +71,15 @@ class MigrationWizard(QDialog):
         # Match: sh /path/to/seat.sh tunnel SEAT GATEWAY [PORT]
         # Match: bash /path/to/seat.sh tunnel SEAT GATEWAY [PORT]
         # Trailing `&&`, `;`, `# comment` are all allowed after the optional port.
+        #
+        # The leading optional prefix group MUST stay non-capturing on both
+        # branches (`(?:sh|bash)\s+` and `\.\/`) — wrapping it in `(?:...|...)?`
+        # without a capture on the `|` alternative doesn't take; if either
+        # branch is a `(...)` group, the entire outer group becomes capturing
+        # and consumes group 1, shifting seat/gateway/port by one. The result
+        # was `./` being parsed as the seat name. Both branches use `(?:...)`.
         re.compile(
-            r'(?:(?:\S*(?:sh|bash)\s+)|(\.\/))?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)(?:\s+(\d{4,5}))?(?=\s|$)',
+            r'(?:(?:\S*(?:sh|bash)\s+)|\.\/)?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)\s+([^\s]+?)(?:\s+(\d{4,5}))?(?=\s|$)',
             re.IGNORECASE
         ),
         # Seat-only (gateway defaults). Some setups pass only the seat and let
@@ -80,7 +87,7 @@ class MigrationWizard(QDialog):
         # silently disappear from the wizard. Tries to match before P1 so that
         # the more specific P0 (seat + gateway) wins when both apply.
         re.compile(
-            r'(?:(?:\S*(?:sh|bash)\s+)|(\.\/))?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)(?=\s|$)',
+            r'(?:(?:\S*(?:sh|bash)\s+)|\.\/)?\S*seat\.sh\s+(?:tunnel|auto-connect|ac)\s+([a-zA-Z0-9\-\.]+)(?=\s|$)',
             re.IGNORECASE
         ),
         # Legacy/simple pattern: tunnel SEAT GATEWAY [PORT]
@@ -525,6 +532,7 @@ class MigrationWizard(QDialog):
                 'rack': match.group(1).strip(),
                 'headend': match.group(2).strip(),
                 'user': match.group(3).strip() if match.group(3) else 'user',
+                'headend_captured': True,
                 'source_command': command.strip()
             })
             return entries
@@ -536,17 +544,21 @@ class MigrationWizard(QDialog):
                 'rack': match.group(1).strip(),
                 'headend': match.group(2).strip(),
                 'user': 'user',
+                'headend_captured': True,
                 'source_command': command.strip()
             })
             return entries
 
-        # Pattern 2: rack only (1 arg, headend and user default)
+        # Pattern 2: rack only (1 arg, headend and user default).
+        # Marked `headend_captured=False` so the scan step can drop it —
+        # the headend is a guess, not a real value the user supplied.
         match = self.PORTFORWARD_PATTERNS[2].search(command)
         if match:
             entries.append({
                 'rack': match.group(1).strip(),
                 'headend': '172.17.4.4',
                 'user': 'user',
+                'headend_captured': False,
                 'source_command': command.strip()
             })
             return entries
@@ -599,6 +611,30 @@ class MigrationWizard(QDialog):
                 all_seat.extend(self._parse_seat_commands(cmd))
                 all_portforward.extend(self._parse_portforward_commands(cmd))
 
+            # Drop seat entries that are missing a gateway (Pattern 1 capture):
+            # they can't be used to actually connect, and silently passing
+            # them downstream corrupts the dropdown with empty `user@` rows.
+            # The user can re-import after picking a gateway via the manual
+            # seat flow, where gateway is required.
+            all_seat = [
+                e for e in all_seat
+                if e.get('gateway_host') or e.get('gateway_user')
+            ]
+
+            # Drop portforward entries that only captured a rack (Pattern 2
+            # fallback) — we defaulted headend to "172.17.4.4" for them, which
+            # is a guess, not a real value the user actually used. Importing
+            # those would pollute the rack list with phantom entries pointing
+            # at a headend the user never connected to.
+            all_portforward = [
+                e for e in all_portforward
+                # Pattern 2 entries have no explicit headend capture; we
+                # tag them via the absence of `headend_captured` (set in
+                # the parser). Everything else (Patterns 0 and 1) supplied
+                # a real headend from the command line.
+                if e.get('headend_captured', True)
+            ]
+
             # Deduplicate
             unique_seats = {}
             for entry in all_seat:
@@ -608,7 +644,7 @@ class MigrationWizard(QDialog):
 
             unique_racks = {}
             for entry in all_portforward:
-                key = (entry['rack'], entry.get('user', ''))
+                key = (entry['rack'], entry.get('user', ''), entry.get('headend', ''))
                 if key not in unique_racks:
                     unique_racks[key] = entry
 

@@ -381,8 +381,10 @@ class GatewayMixin:
         gateways = _gather_all_gateways(self.seat_port_manager, getattr(self, '_cached_seat_sh_devices', None))
 
         if not gateways:
-            QMessageBox.warning(self, "No Gateways", "No gateway history found.")
-            return
+            # Defined behavior after first clean-up sprint: we now allow
+            # typing/custom gateways even with no history, so don't return here.
+            # Let them type a gateway and connect.
+            pass  # gateways list remains empty; combo will be empty but editable.
 
         # Default to current device's seat gateway
         default_host = None

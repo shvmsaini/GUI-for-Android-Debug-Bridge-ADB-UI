@@ -1491,8 +1491,36 @@ class SeatMixin:
             play_btn.setToolTip("Open mirror window")
             play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
 
+            # Remove-from-history button (✕).  Same compact styling as the
+            # play button so the row stays uniform; red on hover to signal
+            # destructive action without a separate confirmation (we *do*
+            # confirm in disconnect_seat above, but removing a stale history
+            # entry is low-risk — the bundled script will simply re-add it
+            # on the next successful connect if the user really wanted it).
+            remove_btn = QPushButton("✕")
+            remove_btn.setMaximumWidth(28)
+            remove_btn.setMinimumWidth(28)
+            remove_btn.setMaximumHeight(50)
+            remove_btn.setMinimumHeight(50)
+            remove_btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+            remove_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            remove_btn.setToolTip(
+                f"Remove {entry['seat']} from seat history\n"
+                f"(gateway: {entry['gateway']})"
+            )
+            remove_btn.setStyleSheet(
+                "QPushButton { border: none; padding: 0px; margin: 0px; }"
+                " QPushButton:hover { background-color: #c0392b; color: white; }"
+            )
+            # Capture entry in default-arg trick to avoid late-binding bugs
+            # in the lambda (same pattern used for the click handlers above).
+            remove_btn.clicked.connect(
+                lambda checked=False, e=entry: self._on_remove_seat_history_clicked(e)
+            )
+
             container_layout.addWidget(btn, 1)  # Button takes available space
             container_layout.addWidget(play_btn, 0)  # Play button stays fixed
+            container_layout.addWidget(remove_btn, 0)  # Remove button stays fixed
             container_layout.setContentsMargins(0, 0, 0, 0)
             container_layout.setSpacing(0)
 
@@ -1576,7 +1604,15 @@ class SeatMixin:
                 text = f"{gateway}"
                 btn_connected = is_connected
 
-            # Main button (no play button for port forward - uses full available width)
+            # Wrap the portforward button in a container so we can append a
+            # ✕ remove button alongside it (mirrors the seat row layout).
+            pf_container = QWidget()
+            pf_container.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
+            pf_layout = QHBoxLayout(pf_container)
+            pf_layout.setContentsMargins(0, 0, 0, 0)
+            pf_layout.setSpacing(0)
+
+            # Main button (uses full available width — no play button for port forward)
             btn = QPushButton(text)
             btn.setMinimumHeight(50)
             btn.setMaximumHeight(50)
@@ -1630,8 +1666,31 @@ class SeatMixin:
                     tooltip_text += f"\n\nFull gateway: {entry['gateway']}"
                 btn.setToolTip(tooltip_text)
 
-            # Add button directly to layout (no container, no play button)
-            self.portforward_list_layout.addWidget(btn)
+            # Remove-from-history button for port forward.  Same ✕ styling
+            # as the seat row so the panels feel consistent.
+            pf_remove_btn = QPushButton("✕")
+            pf_remove_btn.setMaximumWidth(28)
+            pf_remove_btn.setMinimumWidth(28)
+            pf_remove_btn.setMaximumHeight(50)
+            pf_remove_btn.setMinimumHeight(50)
+            pf_remove_btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+            pf_remove_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            pf_remove_btn.setToolTip(
+                f"Remove {entry['seat']} ({entry['gateway']}) from port-forward history"
+            )
+            pf_remove_btn.setStyleSheet(
+                "QPushButton { border: none; padding: 0px; margin: 0px; }"
+                " QPushButton:hover { background-color: #c0392b; color: white; }"
+            )
+            pf_remove_btn.clicked.connect(
+                lambda checked=False, e=entry: self._on_remove_portforward_history_clicked(e)
+            )
+
+            pf_layout.addWidget(btn, 1)        # main button fills available width
+            pf_layout.addWidget(pf_remove_btn, 0)  # remove button stays fixed
+
+            # Add container to layout (was: directly the button)
+            self.portforward_list_layout.addWidget(pf_container)
 
     def _on_seat_clicked(self, entry):
         """Handle seat button click"""
@@ -1654,6 +1713,19 @@ class SeatMixin:
         is_connected = is_internally_connected or is_externally_connected
 
         if is_connected:
+            # Confirm before tearing down a seat tunnel. Disconnect kills the
+            # ssh -L tunnel and any open mirror window; accidental clicks on
+            # the green "connected" button were a real annoyance.
+            reply = QMessageBox.question(
+                self,
+                "Disconnect seat?",
+                f"Disconnect from seat '{seat}'?\n\n"
+                f"This will tear down the tunnel and stop any open mirror window.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,  # default = No; safer
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
             # Disconnect
             self.disconnect_seat(entry['seat'])
         else:
@@ -1691,6 +1763,20 @@ class SeatMixin:
         is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
 
         if is_connected:
+            # Confirm before tearing down a port-forward. Same rationale as
+            # the seat disconnect confirm: accidental clicks on the green
+            # "active rack" button killed forwarding for everyone else
+            # using that gateway.
+            reply = QMessageBox.question(
+                self,
+                "Stop port forward?",
+                f"Stop the active port forward for '{entry['gateway']}'?\n\n"
+                f"This tears down the ssh tunnels for every port on this rack.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,  # default = No; safer
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
             # Disconnect
             self.disconnect_portforward()
         else:
@@ -1702,6 +1788,89 @@ class SeatMixin:
                 self.connect_portforward(entry['gateway'], 'cs1', user_part)
             else:
                 self.log("Invalid gateway format", "ERROR")
+
+    def _on_remove_seat_history_clicked(self, entry):
+        """Handle the ✕ button on a seat history row.
+
+        Removes the entry from the on-disk history file and rebuilds the
+        list.  Called from the GUI thread so the QMessageBox.question() and
+        the post-delete refresh are both safe.
+        """
+        if not entry:
+            return
+        seat = entry.get('seat', '')
+        gateway = entry.get('gateway', '')
+        port = entry.get('port', '')
+        if not seat or not gateway:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Remove seat from history?",
+            f"Remove '{seat}' (port {port or 'auto'}) via {gateway} from seat history?\n\n"
+            f"This only removes the entry from the list — it does not disconnect anything.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        removed = self.seat_port_manager.remove_history_entry(
+            entry_type='seat',
+            seat=seat, port=port, gateway=gateway,
+        )
+        if removed:
+            self.log(f"Removed seat history entry: {seat} ({gateway})", "DEBUG")
+            # Re-render with cached data so the ✕ click feels instant.
+            # (Don't re-run external scripts; nothing on disk changed for them.)
+            self.refresh_seat_port_lists(refetch=False)
+        else:
+            QMessageBox.information(
+                self,
+                "Nothing removed",
+                f"Could not find '{seat}' in seat history — it may have been removed already.",
+            )
+
+    def _on_remove_portforward_history_clicked(self, entry):
+        """Handle the ✕ button on a port-forward history row.
+
+        Removes the entry from the on-disk history file and rebuilds the
+        list.  Same shape as _on_remove_seat_history_clicked but matches
+        the portforward file's column layout.
+        """
+        if not entry:
+            return
+        # For portforwards, `seat` holds the rack and `gateway` holds
+        # `user@rack` (load_history rewrites the surface format).
+        rack = entry.get('seat', '')
+        user_at_rack = entry.get('gateway', '')
+        if not rack or not user_at_rack:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Remove port forward from history?",
+            f"Remove rack '{rack}' ({user_at_rack}) from port-forward history?\n\n"
+            f"This only removes the entry from the list — it does not stop anything.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        removed = self.seat_port_manager.remove_history_entry(
+            entry_type='portforward',
+            seat=rack, port='', gateway=user_at_rack,
+        )
+        if removed:
+            self.log(f"Removed portforward history entry: {rack}", "DEBUG")
+            self.refresh_seat_port_lists(refetch=False)
+        else:
+            QMessageBox.information(
+                self,
+                "Nothing removed",
+                f"Could not find '{rack}' in port-forward history — it may have been removed already.",
+            )
 
     def check_portforward_alive(self):
         """Check port forward status off the GUI thread; update UI if it changed"""

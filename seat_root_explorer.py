@@ -1151,12 +1151,11 @@ def prompt_and_open_seat_root(parent):
     labels, default_label, default_gateway = _gather_paired_entries(parent)
 
     if not labels:
-        QMessageBox.information(
-            parent, "No Seat History",
-            "No previous seat connections found.\n\n"
-            "Use 'Connect to new seat' first to attach a seat."
-        )
-        return
+        # Defined behavior after first clean-up sprint: we now allow typing
+        # a new seat and gateway even without previous connections. Keep the
+        # combobox empty but editable, just like the main 'connect to new
+        # seat' dialog.
+        pass  # labels remains empty; combo will be empty but still editable.
 
     seat, gateway = _ask_seat_and_gateway(
         parent, labels, default_label, default_gateway

@@ -123,6 +123,82 @@ class SeatPortManager:
         """Check that *script_path* supports the commands we need."""
         return self._validate_script(script_path, self._PORTFORWARD_REQUIRED_COMMANDS)
 
+    def purge_history(self, entry_types=('seat', 'portforward')):
+        """Clear all on-disk connection history via the bundled scripts.
+
+        Delegates to each script's ``history purge --yes`` subcommand rather
+        than truncating the file ourselves — the scripts also tear down any
+        active tunnels (seat.sh runs ``adbDisconnect all``; portforwardRack.sh
+        exits its SSH ControlMaster and removes the state file). That
+        keeps the dropdown state and live state in sync.
+
+        Args:
+            entry_types: iterable of which files to purge. Default purges
+                both. Each script handles its own confirmation prompts when
+                ``--yes`` is passed (which it always is here — the GUI shows
+                its own confirmation dialog before calling this).
+
+        Returns:
+            Dict ``{entry_type: (ok, message)}`` mapping each requested
+            type to its outcome. ``ok=True`` means the script exited 0;
+            ``message`` is the script's stdout/stderr (trimmed).
+
+        The purge runs sequentially in the *current* thread — caller is
+        expected to invoke this from a background thread if the GUI should
+        stay responsive.  Each script does subprocess.run with a 30s
+        timeout.
+        """
+        results = {}
+        for entry_type in entry_types:
+            try:
+                if entry_type == 'seat':
+                    script_path = self._get_seat_script_path()
+                elif entry_type == 'portforward':
+                    script_path = self._get_portforward_script_path()
+                else:
+                    results[entry_type] = (False, f'unknown entry_type: {entry_type}')
+                    continue
+
+                if not script_path or not os.path.exists(script_path):
+                    results[entry_type] = (False, f'{entry_type} script not found')
+                    if self.log_callback:
+                        self.log_callback(
+                            f"{entry_type} script not found; cannot purge history",
+                            "WARNING"
+                        )
+                    continue
+
+                # ``history purge --yes`` skips the script's own interactive
+                # confirm — the GUI already asked the user.
+                cmd = [script_path, 'history', 'purge', '--yes']
+                env = self._get_script_env()
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30, env=env,
+                )
+                output = ((proc.stdout or '') + (proc.stderr or '')).strip()
+                ok = proc.returncode == 0
+                results[entry_type] = (ok, output)
+                if self.log_callback:
+                    level = "INFO" if ok else "ERROR"
+                    self.log_callback(
+                        f"{entry_type} history purge "
+                        f"{'succeeded' if ok else 'failed'}: {output}",
+                        level,
+                    )
+            except subprocess.TimeoutExpired:
+                results[entry_type] = (False, 'timed out after 30s')
+                if self.log_callback:
+                    self.log_callback(
+                        f"{entry_type} history purge timed out", "ERROR",
+                    )
+            except Exception as e:
+                results[entry_type] = (False, str(e))
+                if self.log_callback:
+                    self.log_callback(
+                        f"{entry_type} history purge error: {e}", "ERROR",
+                    )
+        return results
+
     @staticmethod
     def _validate_script(script_path, required_commands):
         if not script_path or not os.path.exists(script_path):
@@ -254,6 +330,100 @@ class SeatPortManager:
                 "append_history is a no-op: bundled scripts own history now",
                 "WARNING"
             )
+
+    def remove_history_entry(self, entry_type, seat, port='', gateway=''):
+        """Remove a single history entry from the on-disk history file.
+
+        The GUI needs a way to forget entries the user no longer wants
+        (e.g. stale seats from a previous employer, typo'd racks). The
+        bundled scripts own the file, so we just rewrite it minus the
+        matching line — the script will append fresh entries on the next
+        connect.
+
+        Matching rules (must hit ALL supplied fields):
+          - seat:        exact match on field 0 (seat IP/name or rack)
+          - port:        exact match on field 1 (seats only; portforwards pass '')
+          - gateway:     exact match on field 2. For seats, this is the full
+                          ``user@gateway`` string. For portforwards, this is
+                          the ``user@rack`` form that ``load_history`` surfaces.
+
+        The file is rewritten atomically (write-temp + os.replace) so a crash
+        mid-rewrite can't leave a half-written history that ``load_history``
+        would refuse to parse.
+        """
+        history_file = self.seat_history_file if entry_type == 'seat' else self.portforward_history_file
+        if not os.path.exists(history_file):
+            return False
+
+        kept = []
+        removed = False
+        try:
+            with open(history_file, 'r') as f:
+                lines = f.readlines()
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    kept.append(line)
+                    continue
+                parts = stripped.split('|')
+                if len(parts) != 4:
+                    # Pass through malformed lines untouched — never silently
+                    # delete something we don't understand.
+                    kept.append(line)
+                    continue
+                # For portforwards, `load_history` rewrites gateway to
+                # "user@rack" in memory, but on disk field 2 is just `user`.
+                # So when matching against the GUI's `gateway` arg (the
+                # user@rack form), compare against `user@parts[0]` instead
+                # of parts[2].
+                if entry_type == 'portforward':
+                    disk_gateway = f"{parts[2]}@{parts[0]}"
+                else:
+                    disk_gateway = parts[2]
+
+                matches = (
+                    parts[0] == seat
+                    and parts[1] == (port if entry_type == 'seat' else parts[1])
+                    and disk_gateway == gateway
+                )
+                if matches and not removed:
+                    removed = True
+                    continue
+                kept.append(line)
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"Error reading {entry_type} history: {e}", "ERROR")
+            return False
+
+        if not removed:
+            return False
+
+        try:
+            # Atomic rewrite: temp file in same dir, then os.replace.
+            # os.replace is atomic on POSIX and Windows within a filesystem.
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix='.adb-history-', suffix='.tmp',
+                dir=os.path.dirname(history_file) or '.',
+            )
+            try:
+                with os.fdopen(tmp_fd, 'w') as f:
+                    f.writelines(kept)
+                os.replace(tmp_path, history_file)
+            except Exception:
+                # Best-effort cleanup if the rename failed.
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"Error rewriting {entry_type} history: {e}", "ERROR")
+            return False
+
+        if self.log_callback:
+            self.log_callback(f"Removed {entry_type} history entry: {seat}", "DEBUG")
+        return True
 
     def is_seat_connected(self, seat):
         """Check if a seat is currently connected"""

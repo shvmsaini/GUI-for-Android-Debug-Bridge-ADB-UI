@@ -255,6 +255,18 @@ class SettingsDialog(QDialog):
         import_history_btn.clicked.connect(self._import_connection_history)
         history_layout.addWidget(import_history_btn)
 
+        # Purge row — import + purge share the connection-history group.
+        # We keep them as separate full-width buttons rather than a single
+        # row so neither gets visually squeezed on narrow settings dialogs.
+        purge_history_btn = QPushButton("🗑️ Purge All Connection History")
+        purge_history_btn.setToolTip(
+            "Clear all saved seat and port-forward history.\n\n"
+            "Runs `seat.sh history purge --yes` and `portforwardRack.sh history purge --yes`.\n"
+            "Live tunnels (both ADB-side and SSH) are also torn down."
+        )
+        purge_history_btn.clicked.connect(self._purge_connection_history)
+        history_layout.addWidget(purge_history_btn)
+
         content_layout.addWidget(history_group)
 
         # Buttons
@@ -291,6 +303,121 @@ class SettingsDialog(QDialog):
             # Wizard accepted - connection history was imported
             # Parent should refresh its seat/port lists
             pass
+
+    def _purge_connection_history(self):
+        """Clear all seat + portforward history via the bundled scripts.
+
+        Confirms with the user (the scripts would prompt again without
+        ``--yes``, but we want a single GUI-side confirmation rather than
+        two terminal prompts). Runs the purges on a background thread so
+        the dialog stays responsive, then refreshes the parent app's
+        seat/portforward dropdowns when complete.
+        """
+        # Count entries so the confirm message is concrete — "purge 14
+        # entries" lands harder than "purge some entries".
+        seat_count = 0
+        pf_count = 0
+        if self.parent is not None and hasattr(self.parent, 'seat_port_manager'):
+            spm = self.parent.seat_port_manager
+            try:
+                seat_count = len(spm.load_history('seat'))
+            except Exception:
+                pass
+            try:
+                pf_count = len(spm.load_history('portforward'))
+            except Exception:
+                pass
+
+        if seat_count == 0 and pf_count == 0:
+            reply = QMessageBox.question(
+                self,
+                "Purge Connection History",
+                "Both seat and port-forward history files are already empty.\n\n"
+                "Run the purge anyway? (Will still tear down any active tunnels.)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+        else:
+            reply = QMessageBox.question(
+                self,
+                "Purge Connection History",
+                f"This will DELETE all saved connection history:\n\n"
+                f"  • {seat_count} seat connection(s)\n"
+                f"  • {pf_count} port-forward(s)\n\n"
+                f"Live tunnels (ADB and SSH) will also be torn down.\n"
+                f"Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Disable the button so the user can't double-click during the
+        # background purge. Re-enable when done.
+        sender_btn = self.sender()
+        if isinstance(sender_btn, QPushButton):
+            sender_btn.setEnabled(False)
+            original_text = sender_btn.text()
+            sender_btn.setText("🗑️ Purging…")
+
+        def do_purge():
+            spm = None
+            if self.parent is not None and hasattr(self.parent, 'seat_port_manager'):
+                spm = self.parent.seat_port_manager
+
+            def finish(ok_seat, ok_pf, msgs):
+                # Refresh dropdowns regardless of success — at worst they're
+                # empty (which is what the user wants).
+                if self.parent is not None and hasattr(self.parent, 'refresh_seat_port_lists'):
+                    try:
+                        self.parent.refresh_seat_port_lists(refetch=False)
+                    except Exception:
+                        pass
+
+                if isinstance(sender_btn, QPushButton):
+                    sender_btn.setEnabled(True)
+                    sender_btn.setText(original_text)
+
+                # Build a summary the user can act on. If both scripts
+                # succeeded, show a simple confirmation; otherwise show
+                # which one failed and what it said.
+                if ok_seat and ok_pf:
+                    QMessageBox.information(
+                        self,
+                        "History Purged",
+                        "✅ All seat and port-forward history cleared.",
+                    )
+                else:
+                    details = "\n".join(
+                        f"  • {label}: {'OK' if ok else 'FAILED'} — {msg}"
+                        for label, ok, msg in msgs
+                    )
+                    QMessageBox.warning(
+                        self,
+                        "Purge Incomplete",
+                        f"One or more purges failed:\n\n{details}",
+                    )
+
+            if spm is None:
+                # No seat_port_manager — bail without touching anything.
+                QTimer.singleShot(0, lambda: finish(False, False, [
+                    ("seat", False, "no seat_port_manager on parent"),
+                    ("portforward", False, "no seat_port_manager on parent"),
+                ]))
+                return
+
+            results = spm.purge_history(entry_types=('seat', 'portforward'))
+            ok_seat, msg_seat = results.get('seat', (False, 'not run'))
+            ok_pf, msg_pf = results.get('portforward', (False, 'not run'))
+            QTimer.singleShot(0, lambda: finish(
+                ok_seat, ok_pf,
+                [
+                    ("seat", ok_seat, msg_seat or '(no output)'),
+                    ("portforward", ok_pf, msg_pf or '(no output)'),
+                ],
+            ))
+
+        threading.Thread(target=do_purge, daemon=True).start()
 
     def clear_stored_passwords(self):
         reply = QMessageBox.question(
