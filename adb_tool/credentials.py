@@ -328,13 +328,19 @@ class CredentialManager:
                 except Exception:
                     pass
             else:
-                reply = QMessageBox.question(
-                    parent,
-                    "Save Password",
-                    "Save password to credential manager?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply == QMessageBox.StandardButton.Yes:
+                # QMessageBox.question makes one button the platform
+                # default — on macOS that's "No", so pressing Return
+                # discarded the password instead of saving. Build the
+                # dialog manually so Yes is unambiguously the default.
+                save_box = QMessageBox(parent)
+                save_box.setIcon(QMessageBox.Icon.Question)
+                save_box.setWindowTitle("Save Password")
+                save_box.setText("Save password to credential manager?")
+                yes_btn = save_box.addButton("Yes", QMessageBox.ButtonRole.YesRole)
+                no_btn = save_box.addButton("No", QMessageBox.ButtonRole.NoRole)
+                save_box.setDefaultButton(yes_btn)
+                save_box.exec()
+                if save_box.clickedButton() is yes_btn:
                     self.set_password(gateway, user, password)
                     # Mirror to the global key for the same reason.
                     try:

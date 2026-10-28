@@ -8,7 +8,7 @@ import tempfile
 import faulthandler
 
 # Application version - single source of truth. Bump on release.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # Debug mode - Uses temporary directory for all data
 # Everything is isolated and deleted when session ends
