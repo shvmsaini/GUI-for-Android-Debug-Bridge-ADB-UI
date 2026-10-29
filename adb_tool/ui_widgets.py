@@ -40,7 +40,7 @@ _UICaller = _SignalEmitter
 
 
 # Bundled seat.sh / portforwardRack.sh
-import bundled_scripts
+from . import bundled_scripts
 
 
 class DeviceFileTableWidget(QTableWidget):

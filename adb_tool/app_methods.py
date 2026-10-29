@@ -23,7 +23,7 @@ from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
 from .seat_methods import _SeatJumpHost, _SeatSshError, _SeatAuthError
-import bundled_scripts
+from . import bundled_scripts
 
 
 class AppMixin:

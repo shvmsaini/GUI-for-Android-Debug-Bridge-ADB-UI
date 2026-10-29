@@ -33,7 +33,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor
 # Optional: embedded scrcpy mirror (lazy-imported so the app still runs
 # if py_scrcpy_sdk isn't installed).
 try:
-    from scrcpy_mirror import (
+    from adb_tool.scrcpy_mirror import (
         ScrcpyMirrorWindow,
         VideoDisplayWidget as _VideoDisplayWidget,
         _FrameSignal as _MirrorFrameSignal,
@@ -46,7 +46,7 @@ except ImportError:
     _check_embedded_mirror = None
 
 # Bundled seat.sh / portforwardRack.sh — deployed to ~/.cache/adb-gui-ui/scripts/
-import bundled_scripts
+from adb_tool import bundled_scripts
 
 # Import from our modular package (adb_tool/)
 # This avoids duplicating code - the actual implementations are in adb_tool/ modules
@@ -2843,7 +2843,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
     def _open_seat_root_explorer(self):
         """Open the seat root explorer dialog."""
         try:
-            from seat_root_explorer import prompt_and_open_seat_root
+            from adb_tool.seat_root_explorer import prompt_and_open_seat_root
             prompt_and_open_seat_root(self)
         except ImportError:
             QMessageBox.warning(

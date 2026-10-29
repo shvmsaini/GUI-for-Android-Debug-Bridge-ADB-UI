@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Optional
 from subprocess import TimeoutExpired
 
-import bundled_scripts
+from . import bundled_scripts
 from .constants import ADB_SEAT_PORTS_FILE, PORTFORWARD_RACKS_FILE
 
 # Platform-specific imports
@@ -33,7 +33,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStanda
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QDrag, QPixmap
 
 # Bundled seat.sh / portforwardRack.sh
-import bundled_scripts
+from . import bundled_scripts
 
 
 class SeatPortManager:

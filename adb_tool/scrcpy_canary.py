@@ -59,7 +59,7 @@ def _setup_faulthandler():
     crash dir, so a SIGSEGV here is diagnosable after the fact.
     """
     try:
-        from adb_tool.constants import _crash_log_dir
+        from .constants import _crash_log_dir
         crash_dir = _crash_log_dir
     except Exception:
         crash_dir = os.path.join(os.path.expanduser("~"), ".adb_gui_crashes")

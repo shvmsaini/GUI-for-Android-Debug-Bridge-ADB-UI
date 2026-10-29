@@ -21,12 +21,12 @@ from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
 from .safe_dialog import safe_info, safe_warning, safe_critical
-import bundled_scripts
+from . import bundled_scripts
 
 # Optional: embedded scrcpy mirror (lazy-imported so the app still runs
 # if py_scrcpy_sdk isn't installed).
 try:
-    from scrcpy_mirror import (
+    from .scrcpy_mirror import (
         ScrcpyMirrorWindow,
         VideoDisplayWidget as _VideoDisplayWidget,
         _FrameSignal as _MirrorFrameSignal,

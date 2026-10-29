@@ -32,7 +32,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QObject, QStanda
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QDrag, QPixmap
 
 # Bundled seat.sh / portforwardRack.sh
-import bundled_scripts
+from . import bundled_scripts
 
 
 class MigrationWizard(QDialog):
