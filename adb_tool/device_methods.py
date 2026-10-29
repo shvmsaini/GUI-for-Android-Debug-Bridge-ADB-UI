@@ -46,9 +46,17 @@ class DeviceMixin:
             try:
                 result = work()
             except Exception as e:
-                self.log(f"Background task '{key}' failed: {e}", "ERROR")
+                try:
+                    self.log(f"Background task '{key}' failed: {e}", "ERROR")
+                except Exception:
+                    pass
                 result = None
-            self._bg_emitter.call.emit((key, result))
+            try:
+                if hasattr(self, '_bg_emitter') and self._bg_emitter is not None:
+                    self._bg_emitter.call.emit((key, result))
+            except (RuntimeError, AttributeError):
+                # The C++ QObject has been deleted during window/app shutdown
+                pass
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -56,7 +64,12 @@ class DeviceMixin:
         """GUI thread: hand a finished background result to its on_done callback."""
         key, result = payload
         self._bg_busy.discard(key)
-        self._bg_handlers.pop(key)(result)
+        handler = self._bg_handlers.pop(key, None)
+        if handler:
+            try:
+                handler(result)
+            except RuntimeError:
+                pass
 
     def refresh_devices(self, silent=False):
         """Refresh list of connected devices

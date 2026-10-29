@@ -221,4 +221,10 @@ class _UICaller(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.call.connect(lambda fn: fn())
+        self.call.connect(self._safe_dispatch)
+
+    def _safe_dispatch(self, fn):
+        try:
+            fn()
+        except RuntimeError:
+            pass

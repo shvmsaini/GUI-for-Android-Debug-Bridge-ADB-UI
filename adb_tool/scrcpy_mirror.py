@@ -754,9 +754,15 @@ class ScrcpyMirrorWindow(QMainWindow):
         except Exception:
             pass
         if hasattr(self, 'signal') and hasattr(self.signal, 'call'):
-            self.signal.call.emit(fn)
+            try:
+                self.signal.call.emit(fn)
+            except (RuntimeError, AttributeError):
+                pass
         else:
-            QTimer.singleShot(0, fn)
+            try:
+                QTimer.singleShot(0, fn)
+            except (RuntimeError, AttributeError):
+                pass
 
     # ──────────────────────────────────────────────────────────────────
     #  APK install (drag-and-drop)

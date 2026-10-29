@@ -76,12 +76,18 @@ class LoggingMixin:
                 self.log(f"Error in UI callback: {e}", "DEBUG")
             return
         if hasattr(self, '_ui_caller') and self._ui_caller is not None:
-            self._ui_caller.call.emit(fn)
+            try:
+                self._ui_caller.call.emit(fn)
+            except (RuntimeError, AttributeError):
+                pass
         else:
             # Fallback for very early startup before _ui_caller exists
             # (no mixin has set it up yet). QTimer.singleShot here is
             # called from the GUI thread (the constructor), so it's safe.
-            QTimer.singleShot(0, fn)
+            try:
+                QTimer.singleShot(0, fn)
+            except (RuntimeError, AttributeError):
+                pass
 
     def clear_logcat(self):
         """Clear logcat output text"""
