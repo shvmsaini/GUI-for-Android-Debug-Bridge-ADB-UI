@@ -122,6 +122,21 @@ class SettingsDialog(QDialog):
             seat_info.setWordWrap(True)
             seat_layout.addWidget(seat_info)
 
+            # Vysor Mode / Aggressive Takeover checkbox
+            self.vysor_takeover_cb = QCheckBox("⚡ Aggressive Seat Takeover (Vysor Mode)")
+            self.vysor_takeover_cb.setChecked(self.current_settings.get('vysor_takeover_enabled', True))
+            self.vysor_takeover_cb.setToolTip(
+                "When enabled, connecting to a seat that is offline or occupied by another remote user\n"
+                "will automatically restart adbd on the seat device to sever competing connections\n"
+                "and grant you exclusive access."
+            )
+            seat_layout.addWidget(self.vysor_takeover_cb)
+
+            vysor_info = QLabel("Automatically disconnect other sessions if a seat appears occupied/offline.")
+            vysor_info.setStyleSheet("color: #888; font-size: 8.5pt;")
+            vysor_info.setWordWrap(True)
+            seat_layout.addWidget(vysor_info)
+
             content_layout.addWidget(seat_group)
 
             # Port Forward Script section
@@ -398,14 +413,19 @@ class SettingsDialog(QDialog):
                         f"One or more purges failed:\n\n{details}",
                     )
 
+            parent = self.parent() if callable(getattr(self, 'parent', None)) else getattr(self, 'parent', None)
             if spm is None:
                 # No seat_port_manager — bail without touching anything.
                 # Marshal to GUI thread — PyQt6 silently drops
                 # QTimer.singleShot() from worker threads. The SettingsDialog
                 # doesn't have its own _ui_caller, but its parent (ADBGUI) does.
-                parent = self.parent
-                if hasattr(parent, '_ui_caller') and parent._ui_caller is not None:
+                if parent is not None and hasattr(parent, '_ui_caller') and parent._ui_caller is not None:
                     parent._ui_caller.call.emit(lambda: finish(False, False, [
+                        ("seat", False, "no seat_port_manager on parent"),
+                        ("portforward", False, "no seat_port_manager on parent"),
+                    ]))
+                elif parent is not None and hasattr(parent, 'run_on_main_thread'):
+                    parent.run_on_main_thread(lambda: finish(False, False, [
                         ("seat", False, "no seat_port_manager on parent"),
                         ("portforward", False, "no seat_port_manager on parent"),
                     ]))
@@ -419,8 +439,16 @@ class SettingsDialog(QDialog):
             results = spm.purge_history(entry_types=('seat', 'portforward'))
             ok_seat, msg_seat = results.get('seat', (False, 'not run'))
             ok_pf, msg_pf = results.get('portforward', (False, 'not run'))
-            if hasattr(parent, '_ui_caller') and parent._ui_caller is not None:
+            if parent is not None and hasattr(parent, '_ui_caller') and parent._ui_caller is not None:
                 parent._ui_caller.call.emit(lambda: finish(
+                    ok_seat, ok_pf,
+                    [
+                        ("seat", ok_seat, msg_seat or '(no output)'),
+                        ("portforward", ok_pf, msg_pf or '(no output)'),
+                    ],
+                ))
+            elif parent is not None and hasattr(parent, 'run_on_main_thread'):
+                parent.run_on_main_thread(lambda: finish(
                     ok_seat, ok_pf,
                     [
                         ("seat", ok_seat, msg_seat or '(no output)'),
@@ -858,6 +886,8 @@ class SettingsDialog(QDialog):
             # Update parent's settings
             self.parent.settings['adb_path'] = self.adb_path_edit.text()
             self.parent.settings['template_commands'] = self.template_commands
+            if hasattr(self, 'vysor_takeover_cb'):
+                self.parent.settings['vysor_takeover_enabled'] = self.vysor_takeover_cb.isChecked()
             self.parent.save_settings()
 
             # Reload ADB if path changed

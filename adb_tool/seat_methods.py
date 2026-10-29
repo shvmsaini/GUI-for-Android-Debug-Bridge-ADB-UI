@@ -1194,6 +1194,7 @@ class SeatMixin:
         # success against the wrong one.
         seat_device_id = f"localhost:{port}"
         elapsed = {'secs': 0}
+        takeover_state = {'attempted': False}
 
         def tick():
             elapsed['secs'] += interval
@@ -1206,35 +1207,45 @@ class SeatMixin:
             devices = self.adb.get_devices(silent=True)
             # Log what we're polling against
             self.log(f"Device watcher: waiting for {seat_device_id} ({elapsed['secs']}/{max_wait}s)...", "INFO")
-            seat_device_online = any(
-                d.get('id') == seat_device_id and d.get('status') == 'device'
-                for d in devices
-            )
+            seat_dev_obj = next((d for d in devices if d.get('id') == seat_device_id), None)
+            seat_status = seat_dev_obj.get('status') if seat_dev_obj else None
 
-            if seat_device_online:
+            if seat_status == 'device':
                 watcher.stop()
                 self.log(f"Seat device online — {seat} ready to use", "INFO")
                 self.update_status(f"Connected to {seat} — device ready")
                 # Force a refresh so the UI reflects the new status.
-                QTimer.singleShot(0, lambda: self.refresh_devices(silent=False))
+                self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
                 return
+
+            # Vysor mode: if device is showing 'offline' (another remote user has an active adbd session),
+            # immediately execute takeover without waiting.
+            if seat_status == 'offline' and not takeover_state['attempted']:
+                takeover_state['attempted'] = True
+                self.log(
+                    f"Seat {seat} ({seat_device_id}) is offline (occupied by competing connection). "
+                    "Vysor Mode: executing instant takeover to disconnect other sessions...",
+                    "INFO"
+                )
+                self.update_status(f"⚡ Taking over {seat} (disconnecting other sessions)...")
+                self.takeover_seat(seat, silent=True)
 
             if elapsed['secs'] >= max_wait:
                 watcher.stop()
                 self.log(
                     f"Seat {seat} tunnel is up but device ({seat_device_id}) "
-                    f"is still offline after {max_wait}s. Check the phone "
-                    f"for an 'Allow USB debugging?' prompt and tap Allow.",
+                    f"is still {seat_status or 'offline'} after {max_wait}s. Check the phone "
+                    f"for an 'Allow USB debugging?' prompt or click ⚡ to Take Over.",
                     "WARNING"
                 )
                 self.update_status(
-                    f"Connected to {seat} — waiting for phone authorization"
+                    f"Connected to {seat} — waiting for authorization or takeover"
                 )
                 return
 
             # Still waiting — refresh the UI on each tick so the device list
             # updates as the phone finishes authorizing.
-            QTimer.singleShot(0, lambda: self.refresh_devices(silent=True))
+            self.run_on_main_thread(lambda: self.refresh_devices(silent=True))
 
         watcher.timeout.connect(tick)
         watcher.start()
@@ -2426,6 +2437,154 @@ class SeatMixin:
         self._install_adb_key_on_seat(
             seat, gateway, adb_key, gateway_password, new_mtc,
         )
+
+    def takeover_seat(self, seat, gateway=None, silent=True, on_ready=None):
+        """Forcefully take over a seat from another user or competing connection (Vysor mode).
+
+        Fast Path:
+          1. Kicks local ADB transport and reconnects (under 300ms).
+        Full Path (if occupied by remote TCP socket):
+          2. Connects to seat host via SSH and triggers `setprop ctl.restart adbd`.
+             This severs the competing user's TCP connection instantly.
+          3. Reconnects local ADB port and notifies `on_ready`.
+        """
+        # Resolve gateway if not explicitly supplied
+        if not gateway:
+            gateway = self.seat_port_manager.connected_seats.get(seat)
+            if not gateway:
+                for entry in self.seat_port_manager.load_history('seat'):
+                    if entry.get('seat') == seat:
+                        gateway = entry.get('gateway')
+                        break
+            if not gateway:
+                for dev in (self.seat_port_manager.get_devices_from_seat_sh() or []):
+                    if dev.get('seat') == seat:
+                        gateway = dev.get('gateway')
+                        break
+
+        # Find port for this seat
+        port = None
+        for entry in self.seat_port_manager.load_history('seat'):
+            if entry.get('seat') == seat:
+                port = entry.get('port')
+                break
+        if not port:
+            for dev in (self.seat_port_manager.get_devices_from_seat_sh() or []):
+                if dev.get('seat') == seat:
+                    port = dev.get('port')
+                    break
+        if not port:
+            port = getattr(self, '_pending_seat_port', '5555') or '5555'
+
+        seat_dev = f"localhost:{port}"
+
+        def do_takeover():
+            # ── Fast path: immediate local ADB transport kick (<300ms) ──────────
+            self.log(f"⚡ Fast takeover: kicking ADB transport for {seat_dev}...", "DEBUG")
+            try:
+                self.adb.run_command(f"-s {seat_dev} reconnect offline")
+                self.adb.run_command(f"disconnect {seat_dev}")
+                self.adb.run_command(f"connect {seat_dev}")
+                time.sleep(0.3)
+                devs = self.adb.get_devices(silent=True)
+                if any(d.get('id') == seat_dev and d.get('status') == 'device' for d in devs):
+                    self.log(f"⚡ Fast takeover succeeded for {seat} ({seat_dev})!", "INFO")
+                    self.update_status(f"Connected to {seat} — device online")
+                    self.run_on_main_thread(lambda: self.refresh_devices())
+                    if on_ready:
+                        self.run_on_main_thread(lambda: on_ready(seat_dev))
+                    return
+            except Exception as e:
+                self.log(f"Fast takeover attempt: {e}", "DEBUG")
+
+            # ── Full path: remote adbd reset via seat SSH ───────────────────────
+            if paramiko is None:
+                self.log("paramiko not installed — cannot run remote adbd reset.", "WARNING")
+                return
+
+            if not gateway:
+                self.log(f"Cannot take over seat {seat}: gateway not found", "ERROR")
+                return
+
+            gateway_norm = gateway.strip()
+            if '@' not in gateway_norm:
+                gateway_norm = f'user@{gateway_norm}'
+            parts = gateway_norm.split('@')
+            user = parts[0] if len(parts) == 2 else 'user'
+            gateway_host = parts[1] if len(parts) == 2 else gateway_norm
+
+            gateway_password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
+            mtc_password = (
+                self.credential_manager.get_global_mtc_password()
+                or self.credential_manager.get_password("mtc_global", "mtc")
+                or gateway_password
+            )
+
+            if not gateway_password or not mtc_password:
+                if silent:
+                    self.log(f"Cannot auto-takeover seat {seat}: missing passwords in Keychain.", "WARNING")
+                    return
+                if not gateway_password:
+                    gateway_password = self.credential_manager.prompt_password(self, gateway_host, user)
+                if not mtc_password:
+                    mtc_password = self.credential_manager.prompt_password(self, "mtc_global", "mtc")
+                if not gateway_password or not mtc_password:
+                    self.log("Takeover aborted: missing credentials.", "ERROR")
+                    return
+
+            self.log(f"⚡ Vysor Mode: Resetting adbd on {seat} via {gateway_norm} to sever competing sessions...", "INFO")
+            self.update_status(f"⚡ Resetting adbd on {seat}...")
+
+            jump = None
+            sh = None
+            try:
+                jump = _SeatJumpHost(gateway_norm, gateway_password, log=self.log)
+                sh = _seat_root_shell_via_mtc(jump, seat, mtc_password, log=self.log)
+                out, code = sh.run("setprop ctl.restart adbd", timeout=8)
+                self.log(f"⚡ adbd restarted on {seat} (exit code: {code})", "INFO")
+            except Exception as e:
+                self.log(f"Takeover SSH command failed: {e}", "ERROR")
+                return
+            finally:
+                if sh:
+                    try:
+                        sh.send_line("exit\n")
+                        time.sleep(0.1)
+                        sh.send_line("exit\n")
+                    except Exception:
+                        pass
+                    try:
+                        sh.close()
+                    except Exception:
+                        pass
+                if jump:
+                    try:
+                        jump.close()
+                    except Exception:
+                        pass
+
+            # Step 2: Reconnect ADB transport to localhost:<port>
+            time.sleep(2.5)
+            try:
+                self.adb.run_command(f"disconnect {seat_dev}")
+                time.sleep(0.5)
+                self.adb.run_command(f"connect {seat_dev}")
+            except Exception as e:
+                self.log(f"Reconnect after takeover failed: {e}", "WARNING")
+
+            self.log(f"✅ Seat {seat} acquired! Previous connection dropped.", "INFO")
+            self.update_status(f"Seat {seat} acquired (exclusive connection active)")
+
+            self.run_on_main_thread(lambda: self.refresh_devices())
+            self.run_on_main_thread(self.refresh_seat_port_lists)
+            if on_ready:
+                self.run_on_main_thread(lambda: on_ready(seat_dev))
+            else:
+                self.run_on_main_thread(
+                    lambda s=seat, p=port: self._start_seat_device_watcher(s, port=p)
+                )
+
+        threading.Thread(target=do_takeover, daemon=True).start()
 
     def disconnect_seat(self, seat):
         """Disconnect from a seat"""

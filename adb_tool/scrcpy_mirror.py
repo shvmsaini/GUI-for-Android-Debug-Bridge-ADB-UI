@@ -123,6 +123,7 @@ class _FrameSignal(QObject):
     error_retry = pyqtSignal(str)      # error message (shows Retry/Close dialog)
     auto_retry = pyqtSignal(str)       # transient error: silently restart client
     disconnected = pyqtSignal(str)     # error message on clean disconnect
+    call = pyqtSignal(object)          # arbitrary callable to run on the Qt main thread
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -717,12 +718,28 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.signal.error_retry.connect(lambda msg: self._on_error(msg, auto_close_ms=None))
         self.signal.auto_retry.connect(self._on_auto_retry)
         self.signal.disconnected.connect(self._on_disconnect)
+        self.signal.call.connect(lambda fn: fn())
 
         # ── start streaming ─────────────────────────────────────────
         # Start the client as soon as the event loop is ready (next tick).
         # The previous 100ms delay wasn't doing anything useful and just
         # added startup latency on top of the ~5s scrcpy handshake.
         QTimer.singleShot(0, self._start_client)
+
+    def run_on_main_thread(self, fn):
+        """Thread-safe marshaling of callbacks to the Qt main thread."""
+        try:
+            from PyQt6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app and app.thread() == threading.current_thread():
+                fn()
+                return
+        except Exception:
+            pass
+        if hasattr(self, 'signal') and hasattr(self.signal, 'call'):
+            self.signal.call.emit(fn)
+        else:
+            QTimer.singleShot(0, fn)
 
     # ──────────────────────────────────────────────────────────────────
     #  APK install (drag-and-drop)
@@ -1406,7 +1423,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                 # status bar text — that's what makes this reliable on
                 # emulators whose screen is static (scrcpy only emits
                 # a frame when the screen has changed).
-                QTimer.singleShot(0, self._start_frame_watchdog)
+                self.run_on_main_thread(self._start_frame_watchdog)
 
                 # Listen for frames in this thread. The callback emits
                 # each frame to the Qt main thread via signal.
@@ -1925,7 +1942,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or "screencap failed"
-                    QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                    self.run_on_main_thread(lambda: self._on_screenshot_done(
                         ok=False, dest_path=dest_path, filename=filename,
                         error=err, skipped_pull=False,
                     ))
@@ -1939,7 +1956,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                 )
                 if result.returncode != 0:
                     err = result.stderr.strip() or "pull failed"
-                    QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                    self.run_on_main_thread(lambda: self._on_screenshot_done(
                         ok=False, dest_path=dest_path, filename=filename,
                         error=err, skipped_pull=True,
                     ))
@@ -1952,17 +1969,17 @@ class ScrcpyMirrorWindow(QMainWindow):
                 except Exception:
                     pass  # cleanup is non-fatal
 
-                QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                self.run_on_main_thread(lambda: self._on_screenshot_done(
                     ok=True, dest_path=dest_path, filename=filename,
                     error=None, skipped_pull=False,
                 ))
             except subprocess.TimeoutExpired as e:
-                QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                self.run_on_main_thread(lambda: self._on_screenshot_done(
                     ok=False, dest_path=dest_path, filename=filename,
                     error=f"adb timed out after {e.timeout}s", skipped_pull=True,
                 ))
             except Exception as e:
-                QTimer.singleShot(0, lambda: self._on_screenshot_done(
+                self.run_on_main_thread(lambda: self._on_screenshot_done(
                     ok=False, dest_path=dest_path, filename=filename,
                     error=str(e), skipped_pull=False,
                 ))

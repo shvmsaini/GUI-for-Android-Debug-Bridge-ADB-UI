@@ -259,7 +259,10 @@ class AppMixin:
 
                     # Update progress bar
                     if hasattr(self, 'progress_bar'):
-                        QTimer.singleShot(0, lambda i=idx: self._update_progress(i))
+                        if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                            self._ui_caller.call.emit(lambda i=idx: self._update_progress(i))
+                        elif hasattr(self, 'run_on_main_thread'):
+                            self.run_on_main_thread(lambda i=idx: self._update_progress(i))
 
                     if use_gateway and self._is_seat_device(self.current_device):
                         # Gateway deployment for seat devices
@@ -303,7 +306,12 @@ class AppMixin:
             self._install_batch_package = detected_pkg
             self.log(f"Detected package: {detected_pkg}", "INFO")
             self.log("Scheduling completion popup to GUI thread", "INFO")
-            QTimer.singleShot(0, self._finalize_install_completion)
+            if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                self._ui_caller.call.emit(self._finalize_install_completion)
+            elif hasattr(self, 'run_on_main_thread'):
+                self.run_on_main_thread(self._finalize_install_completion)
+            else:
+                QTimer.singleShot(0, self._finalize_install_completion)
 
         threading.Thread(target=do_install, daemon=True).start()
 
@@ -1758,7 +1766,12 @@ class AppMixin:
                     
                     self.log(f"Found {len(apps)} installed apps ({len(disabled_apps)} disabled)")
                     self.update_status(f"Found {len(apps)} apps")
-                    QTimer.singleShot(0, lambda: self.refresh_app_list_window(app_window, sorted(apps), search_entry, listbox))
+                    if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                        self._ui_caller.call.emit(lambda: self.refresh_app_list_window(app_window, sorted(apps), search_entry, listbox))
+                    elif hasattr(self, 'run_on_main_thread'):
+                        self.run_on_main_thread(lambda: self.refresh_app_list_window(app_window, sorted(apps), search_entry, listbox))
+                    else:
+                        QTimer.singleShot(0, lambda: self.refresh_app_list_window(app_window, sorted(apps), search_entry, listbox))
                 else:
                     self.log(f"Error: {result['stderr']}", "ERROR")
                     self.update_status("Failed to refresh apps")

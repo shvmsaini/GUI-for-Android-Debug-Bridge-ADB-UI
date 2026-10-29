@@ -538,6 +538,39 @@ class ScrcpyMixin:
                     "Install: pip install py-scrcpy-sdk opencv-python-headless imageio"))
                 return
 
+        # Check if device is offline: if so, take over connection by default
+        devices = self.adb.get_devices(silent=True)
+        dev_info = next((d for d in devices if d['id'] == device_id), None)
+        if dev_info and dev_info.get('status') == 'offline':
+            seat_name = seat_context
+            if not seat_name and hasattr(self, 'seat_port_manager'):
+                for sd in (self.seat_port_manager.get_devices_from_seat_sh() or []):
+                    if sd.get('device') == device_id or f"localhost:{sd.get('port')}" == device_id:
+                        seat_name = sd.get('seat')
+                        break
+            if seat_name and hasattr(self, 'takeover_seat'):
+                self.log(f"Device {device_id} is offline. Auto-taking over seat {seat_name} for screen mirror...", "INFO")
+                self.update_status(f"⚡ Taking over {seat_name} for screen mirror...")
+                self.takeover_seat(
+                    seat_name,
+                    silent=True,
+                    on_ready=lambda did: self._open_mirror_window(
+                        device_id=did, bitrate=bitrate, max_fps=max_fps,
+                        max_size=max_size, seat_context=seat_context
+                    )
+                )
+                return
+            else:
+                self.adb.run_command(f"-s {device_id} reconnect offline")
+                self.adb.run_command(f"disconnect {device_id}")
+                self.adb.run_command(f"connect {device_id}")
+
+        # Kill any prior mirror server on the device so this mirror session seizes control cleanly
+        try:
+            self.adb.run_command(f"-s {device_id} shell 'pkill -f app_process.*scrcpy 2>/dev/null || true'")
+        except Exception:
+            pass
+
         # Canary probe — run py_scrcpy_sdk in a short-lived subprocess
         # before we commit to building a real mirror window. If the SDK
         # SIGSEGVs (FFmpeg init, libavdevice.dylib duplicate-class on
@@ -714,6 +747,21 @@ class ScrcpyMixin:
                         break
 
             if device_id:
+                dev_obj = next((d for d in devices if d['id'] == device_id), None)
+                if dev_obj and dev_obj.get('status') == 'offline':
+                    self.log(f"Seat {seat} ({device_id}) is offline. Default takeover on mirror engaged...", "INFO")
+                    self.update_status(f"⚡ Taking over {seat} for screen mirror...")
+                    if hasattr(self, 'takeover_seat'):
+                        self.takeover_seat(
+                            seat,
+                            silent=True,
+                            on_ready=lambda did: self._open_mirror_window(
+                                device_id=did, bitrate=1_000_000,
+                                max_fps=24, max_size=800, seat_context=seat
+                            )
+                        )
+                        return
+
                 self.log(f"Opening mirror window for device {device_id} (seat: {seat})")
                 self._open_mirror_window(device_id=device_id, bitrate=1_000_000,
                                          max_fps=24, max_size=800,

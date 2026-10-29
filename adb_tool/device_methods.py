@@ -354,7 +354,7 @@ class DeviceMixin:
                     'button_label': button_label,
                     'display_str': display_str,
                     'tooltip': (
-                        f"🟡 Seat device not yet authorized.\nCheck the phone for an 'Allow USB debugging?' prompt.\nStatus: {status}"
+                        f"🟡 Seat device offline or occupied by another user.\nClick ⚡ to Take Over (disconnect others & restart adbd).\nStatus: {status}"
                         if status == 'offline' and seat_name else f"Status: {status}"
                     )
                 })
@@ -709,16 +709,18 @@ class DeviceMixin:
 
     def show_device_info(self):
         """Show detailed device information"""
+        from .safe_dialog import safe_warning, safe_multiline_dialog
         if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
+            safe_warning(self, "No Device", "Please select a device first")
             return
         
         info = self.adb.get_device_info(self.current_device)
         info_text = "\n".join([f"{k}: {v}" for k, v in info.items()])
-        QMessageBox.information(self, "Device Information", info_text)
+        safe_multiline_dialog(self, "Device Information", info_text)
 
     def test_adb(self):
         """Test ADB connection and show detailed output"""
+        from .safe_dialog import safe_info, safe_critical
         self.log("Testing ADB connection...", "INFO")
         self.update_status("Testing ADB...")
         
@@ -741,25 +743,17 @@ class DeviceMixin:
         # Show summary
         if version_result['success']:
             self.update_status("ADB is working correctly")
-            QMessageBox.information(
+            safe_info(
                 self,
                 "ADB Test",
-                f"ADB Path: {self.adb.adb_path}\n\n"
-                f"Version: {'✓ Working' if version_result['success'] else '✗ Failed'}\n"
-                f"Devices: {'✓ Working' if devices_result['success'] else '✗ Failed'}\n\n"
-                f"Check the output log for details."
+                f"ADB Path: {self.adb.adb_path} — Version: {'✓ Working' if version_result['success'] else '✗ Failed'}, Devices: {'✓ Working' if devices_result['success'] else '✗ Failed'}"
             )
         else:
             self.update_status("ADB test failed - check output log")
-            QMessageBox.critical(
+            safe_critical(
                 self,
                 "ADB Test Failed",
-                f"ADB Path: {self.adb.adb_path}\n\n"
-                f"Error: {version_result['stderr'] or 'Unknown error'}\n\n"
-                f"Please check:\n"
-                f"1. ADB path is correct\n"
-                f"2. ADB executable exists\n"
-                f"3. Check output log for details"
+                f"ADB test failed: {version_result['stderr'] or 'Check ADB path'}"
             )
 
     def prompt_for_adb_path(self):

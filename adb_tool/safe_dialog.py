@@ -19,7 +19,8 @@ crash on Qt 6.11/macOS 26.
 import sys
 
 from PyQt6.QtWidgets import (
-    QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QDialogButtonBox
+    QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QDialogButtonBox,
+    QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFontMetrics, QFont
@@ -151,6 +152,32 @@ def safe_question(parent, title, message):
     dlg.exec()
     role = dlg.chosen_role()
     return role == QDialogButtonBox.StandardButton.Yes
+
+
+def safe_multiline_dialog(parent, title, text, width=550, height=380):
+    """Show detailed multi-line text in a read-only scrollable editor safely without QMessageBox."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(str(title))
+    dlg.setModal(True)
+    dlg.resize(width, height)
+    layout = QVBoxLayout(dlg)
+    layout.setContentsMargins(12, 12, 12, 12)
+    layout.setSpacing(10)
+
+    edit = QPlainTextEdit(dlg)
+    edit.setPlainText(str(text))
+    edit.setReadOnly(True)
+    layout.addWidget(edit)
+
+    btn_row = QHBoxLayout()
+    btn_row.addStretch(1)
+    ok_btn = QPushButton("OK", dlg)
+    ok_btn.setMinimumWidth(80)
+    ok_btn.clicked.connect(dlg.accept)
+    btn_row.addWidget(ok_btn)
+    layout.addLayout(btn_row)
+
+    dlg.exec()
 
 
 def _show_deferred(dialog_fn, parent, title, message, delay_ms=0):
