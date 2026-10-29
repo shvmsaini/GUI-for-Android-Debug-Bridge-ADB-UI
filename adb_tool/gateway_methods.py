@@ -488,19 +488,21 @@ class GatewayMixin:
                 # connection attempt.
                 err = f"unexpected error during SSH connect: {e}"
                 self.log(f"Gateway Manager: {err}", "ERROR")
-                QTimer.singleShot(0, lambda: (
+                # Marshal to GUI thread — PyQt6 silently drops
+                # QTimer.singleShot() from worker threads.
+                self.run_on_main_thread(lambda: (
                     self.update_status("Connection failed"),
-                    QMessageBox.critical(self, "Connection Failed",
-                                         f"Could not connect to {host}:\n\n{err}")
+                    self.show_error("Connection Failed",
+                                    f"Could not connect to {host}: {err}")
                 ))
                 return
             if client is None:
                 err = sftp_or_err
                 self.log(f"Gateway Manager: {err}", "ERROR")
-                QTimer.singleShot(0, lambda: (
+                self.run_on_main_thread(lambda: (
                     self.update_status("Connection failed"),
-                    QMessageBox.critical(self, "Connection Failed",
-                                         f"Could not connect to {host}:\n\n{err}")
+                    self.show_error("Connection Failed",
+                                    f"Could not connect to {host}: {err}")
                 ))
                 return
 
@@ -513,10 +515,10 @@ class GatewayMixin:
                     pass
                 err = "SSH connected but SFTP subsystem could not be opened"
                 self.log(f"Gateway Manager: {err}", "ERROR")
-                QTimer.singleShot(0, lambda: (
+                self.run_on_main_thread(lambda: (
                     self.update_status("Connection failed"),
-                    QMessageBox.critical(self, "Connection Failed",
-                                         f"Could not open SFTP on {host}:\n\n{err}")
+                    self.show_error("Connection Failed",
+                                    f"Could not open SFTP on {host}: {err}")
                 ))
                 return
 
@@ -525,9 +527,10 @@ class GatewayMixin:
             # Keep args on self so the closure can't be GC'd before the timer fires.
             self._pending_gateway_explorer_args = (host, user, client, sftp_or_err)
             self.log(f"Gateway Manager: posting _show_gateway_explorer to GUI thread", "DEBUG")
-            # Use a bound method, not a lambda. QTimer.singleShot from a
-            # background thread is more reliable with a method reference.
-            QTimer.singleShot(0, self._open_gateway_explorer_from_pending)
+            # Marshal to GUI thread — PyQt6 silently drops
+            # QTimer.singleShot() from worker threads. Use a bound method
+            # for clean trampoline semantics.
+            self.run_on_main_thread(self._open_gateway_explorer_from_pending)
             self.log(f"Gateway Manager: posted", "DEBUG")
 
         threading.Thread(target=do_connect, daemon=True).start()

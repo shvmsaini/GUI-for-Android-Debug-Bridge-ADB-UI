@@ -403,10 +403,11 @@ class FileMixin:
                     ui.call.emit(refresh_listing)
 
                 ui.call.emit(lambda: self.update_status("Upload complete"))
-                ui.call.emit(lambda: QMessageBox.information(
+                from .safe_dialog import safe_info
+                ui.call.emit(lambda: safe_info(
                     self,
                     "Upload complete",
-                    f"Uploaded: {ok}\nFailed: {failed}\n\nDestination:\n{dest_dir}"
+                    f"Uploaded: {ok}. Failed: {failed}. Destination: {dest_dir}"
                 ))
 
             threading.Thread(target=do_upload, daemon=True).start()
@@ -492,11 +493,12 @@ class FileMixin:
                         err = res.get("stderr") or res.get("stdout") or "Unknown error"
                         self.log(f"Download failed for {rp}: {err}", "ERROR")
 
-                QTimer.singleShot(0, lambda: self.update_status("Download complete"))
-                ui.call.emit(lambda: QMessageBox.information(
+                ui.call.emit(lambda: self.update_status("Download complete"))
+                from .safe_dialog import safe_info
+                ui.call.emit(lambda: safe_info(
                     self,
                     "Download complete",
-                    f"Downloaded: {ok}\nFailed: {failed}\n\nDestination:\n{dest}"
+                    f"Downloaded: {ok}. Failed: {failed}. Destination: {dest}"
                 ))
 
             threading.Thread(target=do_pull, daemon=True).start()
@@ -544,7 +546,8 @@ class FileMixin:
 
                 ui.call.emit(refresh_listing)
                 ui.call.emit(lambda: self.update_status("Delete complete"))
-                ui.call.emit(lambda: QMessageBox.information(self, "Delete complete", f"Deleted: {ok}\nFailed: {failed}"))
+                from .safe_dialog import safe_info
+                ui.call.emit(lambda: safe_info(self, "Delete complete", f"Deleted: {ok}. Failed: {failed}"))
 
             threading.Thread(target=do_delete, daemon=True).start()
 
@@ -567,7 +570,8 @@ class FileMixin:
                     err = res.get("stderr") or res.get("stdout") or "Unknown error"
                     self.log(f"mkdir failed: {err}", "ERROR")
                     ui.call.emit(lambda: self.update_status("Failed to create folder"))
-                    ui.call.emit(lambda: QMessageBox.critical(self, "Error", f"Failed to create folder:\n\n{err}"))
+                    from .safe_dialog import safe_critical
+                    ui.call.emit(lambda: safe_critical(self, "Error", f"Failed to create folder: {err}"))
 
             threading.Thread(target=do_mkdir, daemon=True).start()
 
@@ -609,7 +613,8 @@ class FileMixin:
                     err = res.get("stderr") or res.get("stdout") or "Unknown error"
                     self.log(f"Rename failed: {err}", "ERROR")
                     ui.call.emit(lambda: self.update_status("Failed to rename"))
-                    ui.call.emit(lambda: QMessageBox.critical(self, "Error", f"Failed to rename:\n\n{err}"))
+                    from .safe_dialog import safe_critical
+                    ui.call.emit(lambda: safe_critical(self, "Error", f"Failed to rename: {err}"))
 
             threading.Thread(target=do_rename, daemon=True).start()
 
@@ -669,12 +674,20 @@ class FileMixin:
                         errors.append(f"{os.path.basename(apk_path)}: {e}")
 
                 def final_done():
+                    # Use safe_dialog (avoids Qt 6.11 QMessageBox crash) and
+                    # truncate multi-line errors to one short line.
+                    from .safe_dialog import safe_info, safe_warning, safe_critical
                     if successes and not errors:
-                        QMessageBox.information(self, "Install Complete", f"Successfully installed {len(successes)} APK(s).")
+                        safe_info(self, "Install Complete",
+                                  f"Successfully installed {len(successes)} APK(s).")
                     elif errors and successes:
-                        QMessageBox.warning(self, "Partial Install", f"Installed {len(successes)} APK(s), but failed on {len(errors)}:\n\n" + "• " + "\n• ".join(errors))
+                        first_err = errors[0] if errors else ""
+                        safe_warning(self, "Partial Install",
+                                    f"Installed {len(successes)} APK(s), but {len(errors)} failed: {first_err[:200]}")
                     elif errors:
-                        QMessageBox.critical(self, "Install Failed", "All installations failed:\n\n" + "• " + "\n• ".join(errors))
+                        first_err = errors[0] if errors else ""
+                        safe_critical(self, "Install Failed",
+                                      f"All installations failed: {first_err[:200]}")
                     self.update_status("Installation complete")
                 ui.call.emit(final_done)
 

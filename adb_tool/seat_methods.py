@@ -2133,8 +2133,11 @@ class SeatMixin:
                     else:
                         self.log(f"Connected to seat {seat} (defaulting to port {actual_port})", "INFO")
                     self.update_status(f"Connected to {seat}")
-                    QTimer.singleShot(0, self.refresh_seat_port_lists)
-                    QTimer.singleShot(500, self.refresh_devices)  # Refresh devices after seat connection
+                    # Marshal to GUI thread — PyQt6 silently drops
+                    # QTimer.singleShot() from worker threads (see
+                    # pyqt6-singleshot-worker-thread-dropped.md).
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                    self.run_on_main_thread(lambda: self.refresh_devices())
 
                     # Watch for the seat's device to finish the adb-key
                     # authorization handshake. After a fresh seat connect, the
@@ -2155,8 +2158,12 @@ class SeatMixin:
                     # forbids creating QObjects with a GUI-thread parent from
                     # a background thread. do_connect runs in a worker
                     # thread, so we must defer watcher creation to the GUI
-                    # thread via QTimer.singleShot(0, ...).
-                    QTimer.singleShot(0, lambda s=seat, p=actual_port: self._start_seat_device_watcher(s, port=p))
+                    # thread. QTimer.singleShot from a worker thread is
+                    # silently dropped on PyQt6, so we use the _ui_caller
+                    # emitter (run_on_main_thread) instead.
+                    self.run_on_main_thread(
+                        lambda s=seat, p=actual_port: self._start_seat_device_watcher(s, port=p)
+                    )
                     self.log(f"Seat connection flow complete for {seat} on port {actual_port}; watcher will start on GUI thread", "INFO")
                 else:
                     error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
@@ -2174,26 +2181,23 @@ class SeatMixin:
                         pass
                     self.seat_port_manager.kill_seat_tunnel(seat, gateway)
                     self.seat_port_manager.mark_seat_disconnected(seat)
-                    QTimer.singleShot(0, self.refresh_seat_port_lists)
-                    # Show dialog to user about the failure
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                    # Show dialog to user about the failure — must run on
+                    # the GUI thread (QMessageBox/safe_critical can't open
+                    # modal dialogs from worker threads).
                     def show_error():
-                        msg = QMessageBox(self)
-                        msg.setIcon(QMessageBox.Icon.Critical)
-                        msg.setWindowTitle("Seat Connection Failed")
-                        msg.setText(f"Failed to connect to seat {seat}")
-                        msg.setInformativeText(error)
-                        msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Retry)
-                        msg.button(QMessageBox.StandardButton.Retry).setText("Retry")
-                        msg.setDefaultButton(QMessageBox.StandardButton.Retry)
-                        result = msg.exec()
-                        if result == QMessageBox.StandardButton.Retry:
-                            # Retry the connection
+                        from .safe_dialog import safe_question
+                        retry = safe_question(
+                            self, "Seat Connection Failed",
+                            f"Failed to connect to seat {seat}: {error}. Retry?"
+                        )
+                        if retry:
                             self.connect_seat(seat, gateway,
                                             install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                             adb_key=getattr(self, '_pending_adb_key', None),
                                             device_password=getattr(self, '_pending_device_password', None),
                                             mtc_password=getattr(self, '_pending_mtc_password', None))
-                    QTimer.singleShot(0, show_error)
+                    self.run_on_main_thread(show_error)
             except TimeoutExpired as te:
                 # Command timed out - show specific message and disconnect
                 error = f"Connection timed out after {te.timeout} seconds. The seat.sh command is taking too long. Check your network connection or credentials."
@@ -2209,25 +2213,20 @@ class SeatMixin:
                                    capture_output=True, text=True, timeout=15, env=env)
                 except Exception:
                     pass
-                QTimer.singleShot(0, self.refresh_seat_port_lists)
+                self.run_on_main_thread(self.refresh_seat_port_lists)
                 def show_timeout_error():
-                    msg = QMessageBox(self)
-                    msg.setIcon(QMessageBox.Icon.Warning)
-                    msg.setWindowTitle("Seat Connection Timeout")
-                    msg.setText(f"Connection to seat {seat} timed out")
-                    msg.setInformativeText(error)
-                    msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Retry)
-                    msg.button(QMessageBox.StandardButton.Retry).setText("Retry")
-                    msg.setDefaultButton(QMessageBox.StandardButton.Retry)
-                    result = msg.exec()
-                    if result == QMessageBox.StandardButton.Retry:
-                        # Retry the connection
+                    from .safe_dialog import safe_question
+                    retry = safe_question(
+                        self, "Seat Connection Timeout",
+                        f"Connection to seat {seat} timed out: {error}. Retry?"
+                    )
+                    if retry:
                         self.connect_seat(seat, gateway,
                                         install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                         adb_key=getattr(self, '_pending_adb_key', None),
                                         device_password=getattr(self, '_pending_device_password', None),
                                         mtc_password=getattr(self, '_pending_mtc_password', None))
-                QTimer.singleShot(0, show_timeout_error)
+                self.run_on_main_thread(show_timeout_error)
             except Exception as e:
                 self.log(f"Error connecting to seat: {str(e)}", "ERROR")
                 self.log("Not installing ADB key (exception)", "ERROR")
@@ -2241,24 +2240,20 @@ class SeatMixin:
                                    capture_output=True, text=True, timeout=15, env=env)
                 except Exception:
                     pass
-                QTimer.singleShot(0, self.refresh_seat_port_lists)
+                self.run_on_main_thread(self.refresh_seat_port_lists)
                 def show_error():
-                    msg = QMessageBox(self)
-                    msg.setIcon(QMessageBox.Icon.Critical)
-                    msg.setWindowTitle("Seat Connection Error")
-                    msg.setText(f"Error connecting to seat {seat}")
-                    msg.setInformativeText(str(e))
-                    msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Retry)
-                    msg.button(QMessageBox.StandardButton.Retry).setText("Retry")
-                    result = msg.exec()
-                    if result == QMessageBox.StandardButton.Retry:
-                        # Retry the connection
+                    from .safe_dialog import safe_question
+                    retry = safe_question(
+                        self, "Seat Connection Error",
+                        f"Error connecting to seat {seat}: {e}. Retry?"
+                    )
+                    if retry:
                         self.connect_seat(seat, gateway,
                                         install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                         adb_key=getattr(self, '_pending_adb_key', None),
                                         device_password=getattr(self, '_pending_device_password', None),
                                         mtc_password=getattr(self, '_pending_mtc_password', None))
-                QTimer.singleShot(0, show_error)
+                self.run_on_main_thread(show_error)
 
         threading.Thread(target=do_connect, daemon=True).start()
 
@@ -2327,8 +2322,9 @@ class SeatMixin:
                          f"out={out.strip()!r}", "DEBUG")
                 # After appending the key, reconnect on the host side so the
                 # adb client re-handshakes with the freshly-restarted adbd.
-                QTimer.singleShot(
-                    0,
+                # Marshal to GUI thread — PyQt6 silently drops
+                # QTimer.singleShot() from worker threads.
+                self.run_on_main_thread(
                     lambda: self._reconnect_seat_device_after_install(seat_dev),
                 )
             except _SeatAuthError as e:
@@ -2336,8 +2332,7 @@ class SeatMixin:
                 # the GUI thread, update the cache, and retry once.
                 self.log(f"Failed to install ADB key: {e}", "ERROR")
                 self.log("Cached mtc password may be wrong — prompting again.", "INFO")
-                QTimer.singleShot(
-                    0,
+                self.run_on_main_thread(
                     lambda: self._retry_install_adb_key_with_new_mtc_password(
                         seat, gateway, adb_key, gateway_password, seat_dev
                     ),
@@ -2399,7 +2394,9 @@ class SeatMixin:
                 self.adb.run_command(f"connect {seat_dev}")
             except Exception as e:
                 self.log(f"Reconnect {seat_dev} failed: {e}", "WARNING")
-            QTimer.singleShot(500, self.refresh_devices)
+            # Marshal to GUI thread — PyQt6 silently drops
+            # QTimer.singleShot() from worker threads.
+            self.run_on_main_thread(lambda: self.refresh_devices())
 
         threading.Thread(target=do_reconnect, daemon=True).start()
 
@@ -2455,8 +2452,10 @@ class SeatMixin:
                     self.seat_port_manager.mark_seat_disconnected(seat)
                     self.log(f"Disconnected from seat {seat}", "INFO")
                     self.update_status(f"Disconnected from {seat}")
-                    QTimer.singleShot(0, self.refresh_seat_port_lists)
-                    QTimer.singleShot(500, self.refresh_devices)  # Refresh devices after seat disconnection
+                    # Marshal to GUI thread — PyQt6 silently drops
+                    # QTimer.singleShot() from worker threads.
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                    self.run_on_main_thread(lambda: self.refresh_devices())
                 else:
                     error = result.stderr or result.stdout or "Unknown error"
                     self.log(f"Failed to disconnect: {error}", "ERROR")
@@ -2580,7 +2579,7 @@ class SeatMixin:
                     # internally on successful start. We just read it back.
                     self.log(f"Port forward connected for {gateway}", "INFO")
                     self.update_status(f"Port forward connected")
-                    QTimer.singleShot(0, self.refresh_seat_port_lists)
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
                 else:
                     error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
                     self.log(f"Failed to set up port forward: {error}", "ERROR")
@@ -2626,7 +2625,7 @@ class SeatMixin:
                     self.seat_port_manager.mark_portforward_disconnected()
                     self.log("Port forward stopped", "INFO")
                     self.update_status("Port forward stopped")
-                    QTimer.singleShot(0, self.refresh_seat_port_lists)
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
                 else:
                     error = result.stderr or result.stdout or "Unknown error"
                     self.log(f"Failed to stop port forward: {error}", "ERROR")

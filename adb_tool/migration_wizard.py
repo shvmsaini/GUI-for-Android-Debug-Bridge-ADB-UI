@@ -33,6 +33,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QTextCursor, QD
 
 # Bundled seat.sh / portforwardRack.sh
 from . import bundled_scripts
+from .ui_widgets import _UICaller
 
 
 class MigrationWizard(QDialog):
@@ -146,6 +147,12 @@ class MigrationWizard(QDialog):
             'bg': '#ffffff', 'fg': '#000000', 'card_bg': '#f5f5f5',
             'border': '#e1e1e1', 'accent': '#0078d4', 'accent_hover': '#106ebe'
         }
+
+        # Cross-thread marshaling emitter for _run_scan (worker thread).
+        # QTimer.singleShot from worker threads is silently dropped on PyQt6
+        # (see pyqt6-singleshot-worker-thread-dropped.md), so we use a
+        # dedicated _UICaller parented to this dialog.
+        self._ui_caller = _UICaller(self)
 
         self.setWindowTitle("🚀 Import Connection History")
         self.setModal(True)
@@ -601,7 +608,10 @@ class MigrationWizard(QDialog):
             self._load_existing_entries()
             commands = self._scan_all_histories()
 
-            QTimer.singleShot(0, lambda: self.status_label.setText(
+            # Marshal to GUI thread — PyQt6 silently drops
+            # QTimer.singleShot() from worker threads. Use the _ui_caller
+            # emitter parented to this dialog (GUI thread).
+            self._ui_caller.call.emit(lambda: self.status_label.setText(
                 f"📊 Scanned {len(commands)} commands from shell history..."
             ))
 
@@ -651,9 +661,12 @@ class MigrationWizard(QDialog):
             self.seat_entries = list(unique_seats.values())
             self.portforward_entries = list(unique_racks.values())
 
-            QTimer.singleShot(0, self._populate_lists)
+            # Marshal to GUI thread — see comment above.
+            self._ui_caller.call.emit(self._populate_lists)
         except Exception as e:
-            QTimer.singleShot(0, lambda: self.status_label.setText(f"❌ Scan failed: {e}"))
+            self._ui_caller.call.emit(
+                lambda: self.status_label.setText(f"❌ Scan failed: {e}")
+            )
 
     def _populate_lists(self):
         """Populate the list widgets with found entries."""

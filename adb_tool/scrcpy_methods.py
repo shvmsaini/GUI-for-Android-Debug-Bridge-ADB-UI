@@ -40,7 +40,7 @@ except ImportError:
 
 
 def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
-                       timeout=0.8):
+                       timeout=2.0):
     """Run scrcpy_canary.py as a subprocess to probe py_scrcpy_sdk.
 
     Returns ``(ok, exit_code_or_signal, detail)``:
@@ -175,7 +175,7 @@ def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
 def _show_canary_failure_dialog(parent, device_id):
     """Show Retry / Open Native / Close when the canary died.
 
-    Uses a plain QDialog (not QMessageBox.exec()) so we sidestep the
+    Uses a plain QDialog without multi-line wrapping QLabels so we sidestep the
     Qt 6.11/macOS 26 QTextEngine::validate() NULL-deref that bites
     QMessageBox inside button slots. See safe_dialog.py for the same
     pattern. Three buttons — user can always escape.
@@ -191,20 +191,21 @@ def _show_canary_failure_dialog(parent, device_id):
     dlg.setMinimumWidth(420)
 
     layout = QVBoxLayout(dlg)
-    layout.setContentsMargins(16, 12, 16, 12)
-    layout.setSpacing(10)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(8)
 
-    msg = QLabel(
-        "The embedded mirror crashed during initialization in a probe "
-        "subprocess. The main app is fine — only the probe died.\n\n"
-        "This is a known intermittent issue with py-scrcpy-sdk on macOS "
-        "(native library conflict). Try Open Native scrcpy for a "
-        "different code path, or Retry to launch the embedded mirror "
-        "again.",
-        dlg,
-    )
-    msg.setWordWrap(True)
-    layout.addWidget(msg)
+    title_lbl = QLabel("⚠️ Mirror Initialization Issue", dlg)
+    title_lbl.setStyleSheet("font-weight: bold; font-size: 11pt;")
+    title_lbl.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(title_lbl)
+
+    msg1 = QLabel("The embedded mirror probe did not complete successfully.", dlg)
+    msg1.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(msg1)
+
+    msg2 = QLabel("You can retry the mirror or launch standalone native scrcpy.", dlg)
+    msg2.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(msg2)
 
     btns = QDialogButtonBox(dlg)
     retry_btn = btns.addButton("Retry", QDialogButtonBox.ButtonRole.AcceptRole)
@@ -243,27 +244,12 @@ class ScrcpyMixin:
     """Mixin class providing scrcpy screen mirroring functionality."""
 
     def _preload_mirror_native_libs(self):
-        """Import py_scrcpy_sdk / PyAV / numpy in a background thread.
-
-        Decouples the slow native-library initialization from both
-        GUI startup and the user's click on the mirror button.  After
-        this completes, subsequent mirror opens don't re-trigger the
-        slow import (Python's module cache makes re-imports no-ops).
+        """Finish delayed initialization (colors, settings, and UI setup).
+        
+        Native py_scrcpy_sdk/PyAV libraries are intentionally not loaded on
+        background threads to prevent duplicate-class crashes and FFmpeg init
+        races on macOS. They load safely on-demand when mirroring starts.
         """
-        def _do_import():
-            try:
-                import py_scrcpy_sdk  # noqa: F401
-                import av  # noqa: F401
-                import numpy  # noqa: F401
-            except Exception:
-                pass
-
-        # If the libs are already loaded (e.g. from a previous mirror
-        # window), the import is a no-op and completes immediately.
-        # Otherwise the daemon thread runs the heavy import off the
-        # main thread, so the GUI stays responsive.
-        threading.Thread(target=_do_import, daemon=True).start()
-
         # Color schemes
         self.light_colors = {
             'bg': '#f5f5f5',
@@ -344,21 +330,25 @@ class ScrcpyMixin:
                 self.save_settings()
             else:
                 # Auto-detection failed – prompt user to select ADB path
-                QMessageBox.information(
+                # Use safe_dialog (avoids Qt 6.11 QMessageBox crash on
+                # multi-line text).
+                from .safe_dialog import safe_info
+                safe_info(
                     self,
                     "ADB Path Required",
-                    "Please select the ADB executable to continue.\n\n"
+                    "Please select the ADB executable to continue. "
                     "This is typically located in the 'platform-tools' folder of your Android SDK."
                 )
-                
+
                 # Prompt user to select ADB folder or executable
                 adb_path = self.prompt_for_adb_path()
                 if not adb_path:
                     # User cancelled - use fallback
-                    QMessageBox.warning(
+                    from .safe_dialog import safe_warning
+                    safe_warning(
                         self,
                         "ADB Path Required",
-                        "ADB path is required. The application will use 'adb' from PATH as fallback.\n\n"
+                        "ADB path is required. The application will use 'adb' from PATH as fallback. "
                         "You can set the ADB path later using the 'ADB Path' button."
                     )
                     saved_adb_path = 'adb'  # Fallback
@@ -562,7 +552,7 @@ class ScrcpyMixin:
             bitrate=bitrate,
             max_fps=max_fps,
             max_size=max_size,
-            timeout=0.8,  # 0.6 s instead of 2.5 s — still catches init crashes
+            timeout=2.0,  # 2.0 s allows seat tunnels / network connections time to respond
         )
         if not canary_ok:
             self.log(
@@ -611,52 +601,66 @@ class ScrcpyMixin:
         )
 
     def _open_mirror_window_impl(self, device_id, adb_path, bitrate,
-                                 max_size, max_fps, seat_context):
+                                 max_size, max_fps, seat_context, _attempt=0):
         """Deferred body of ``_open_mirror_window``.
 
         Runs on the next event-loop tick so the originating button-slot
         has fully returned before any Qt window construction. PyAV/numpy
         native init and ``ScrcpyClient.start()`` retries are kept here;
         see ``_open_mirror_window`` for the rationale.
-        """
-        # py_scrcpy_sdk's native libraries (PyAV/FFmpeg, numpy C core) can
-        # intermittently SIGSEGV during initialization on macOS. Retry a
-        # few times — most attempts succeed.
-        last_exc = None
-        for attempt in range(3):
-            try:
-                win = ScrcpyMirrorWindow(
-                    device_id=device_id,
-                    adb_path=adb_path,
-                    bitrate=bitrate,
-                    max_size=max_size,
-                    max_fps=max_fps,
-                    screenshot_path=self.settings.get('screenshot_path', ''),
-                    seat_info=seat_context,
-                    on_fallback_native=lambda did: self.scrcpy_device(device_id=did),
-                    log_callback=self.log,
-                )
-                win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-                win.show()
-                self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate}")
-                return
-            except Exception as e:
-                last_exc = e
-                self.log(
-                    f"Mirror window attempt {attempt + 1}/3 failed: {e}",
-                    "WARNING"
-                )
-                import time as _t
-                _t.sleep(0.5)
 
-        # All retries failed — surface the last error to the user.
-        self.log(f"Failed to open mirror window after 3 attempts: {last_exc}", "ERROR")
-        # Defer + safe dialog (Qt 6.11/macOS 26 QTextEngine crash —
-        # see safe_dialog.py for the full rationale).
-        QTimer.singleShot(0, lambda: safe_critical(
-            self, "Mirror Error",
-            f"Failed to open mirror window after 3 attempts: {last_exc}"
-        ))
+        Each attempt is deferred via QTimer so we never block the event loop
+        with time.sleep() during the retry wait (500 ms between attempts).
+        """
+        max_attempts = 3
+        try:
+            win = ScrcpyMirrorWindow(
+                device_id=device_id,
+                adb_path=adb_path,
+                bitrate=bitrate,
+                max_size=max_size,
+                max_fps=max_fps,
+                screenshot_path=self.settings.get('screenshot_path', ''),
+                seat_info=seat_context,
+                on_fallback_native=lambda did: self.scrcpy_device(device_id=did),
+                log_callback=self.log,
+            )
+            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            win.show()
+            if not hasattr(self, '_active_mirror_windows'):
+                self._active_mirror_windows = {}
+            self._active_mirror_windows[device_id] = win
+            win.destroyed.connect(lambda _, did=device_id: getattr(self, '_active_mirror_windows', {}).pop(did, None))
+            self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate})")
+        except Exception as e:
+            next_attempt = _attempt + 1
+            self.log(
+                f"Mirror window attempt {next_attempt}/{max_attempts} failed: {e}",
+                "WARNING"
+            )
+            if next_attempt < max_attempts:
+                # Retry after 500 ms — use QTimer so the event loop stays responsive
+                QTimer.singleShot(
+                    500,
+                    lambda: self._open_mirror_window_impl(
+                        device_id=device_id,
+                        adb_path=adb_path,
+                        bitrate=bitrate,
+                        max_size=max_size,
+                        max_fps=max_fps,
+                        seat_context=seat_context,
+                        _attempt=next_attempt,
+                    ),
+                )
+            else:
+                # All retries failed — surface the last error to the user.
+                self.log(f"Failed to open mirror window after {max_attempts} attempts: {e}", "ERROR")
+                # Defer + safe dialog (Qt 6.11/macOS 26 QTextEngine crash —
+                # see safe_dialog.py for the full rationale).
+                QTimer.singleShot(0, lambda err=e: safe_critical(
+                    self, "Mirror Error",
+                    f"Failed to open mirror window after {max_attempts} attempts: {err}"
+                ))
 
     def _scrcpy_via_seat(self, seat):
         """Open mirror window for a seat. Connects the seat first if needed."""
@@ -682,73 +686,53 @@ class ScrcpyMixin:
         # Already connected, open mirror window directly
         self._open_mirror_for_seat(seat)
 
-    def _open_mirror_for_seat(self, seat):
+    def _open_mirror_for_seat(self, seat, attempt=0, max_attempts=5):
         """Find the device for a seat and open the mirror window.
 
-        Runs on the main thread so it's safe to create Qt widgets / NSWindow.
-        Retries device lookup a few times to wait for the device to appear
-        in adb's device list after the seat connection is established.
+        Runs asynchronously on the main thread via QTimer retries to avoid
+        blocking the UI thread with sleep() loops.
         """
-        self.log(f"Opening mirror window for seat {seat}...")
+        self.log(f"Opening mirror window for seat {seat} (attempt {attempt + 1}/{max_attempts})...")
 
-        # Retry loop: the device might not show up in adb devices immediately
-        # after the seat connection is established. Try a few times with small delays.
-        last_error = None
-        for attempt in range(5):
-            try:
-                # Get current devices
-                devices = self.adb.get_devices()
-                device_id = None
+        try:
+            # Get current devices
+            devices = self.adb.get_devices(silent=True)
+            device_id = None
 
-                # Fallback 1: try to match by name/IP
+            # Fallback 1: try to match by name/IP
+            for device in devices:
+                if device['id'] == seat or seat in device['id']:
+                    device_id = device['id']
+                    break
+
+            # Fallback 2: look for localhost connections (most common for seats)
+            if not device_id:
                 for device in devices:
-                    if device['id'] == seat or seat in device['id']:
+                    if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
                         device_id = device['id']
+                        self.log(f"Using localhost device for seat {seat}: {device_id}")
                         break
 
-                # Fallback 2: look for localhost connections (most common for seats)
-                if not device_id:
-                    for device in devices:
-                        if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
-                            device_id = device['id']
-                            self.log(f"Using localhost device for seat {seat}: {device_id}")
-                            break
+            if device_id:
+                self.log(f"Opening mirror window for device {device_id} (seat: {seat})")
+                self._open_mirror_window(device_id=device_id, bitrate=1_000_000,
+                                         max_fps=24, max_size=800,
+                                         seat_context=seat)
+                return
 
-                if device_id:
-                    self.log(f"Opening mirror window for device {device_id} (seat: {seat})")
-                    # Seat/remote link — bandwidth-sensitive: 1 Mbps / 24 fps
-                    # / max-size 800. The 800 long-edge is the biggest
-                    # single latency lever we have on slow seats; it cuts
-                    # bytes-per-frame by ~40% vs the local default of 1024.
-                    self._open_mirror_window(device_id=device_id, bitrate=1_000_000,
-                                             max_fps=24, max_size=800,
-                                             seat_context=seat)
-                    return
-                else:
-                    # Device not found yet - wait and retry
-                    avail = [d['id'] for d in devices]
-                    last_error = f"No device found for seat {seat}. Available: {avail}"
-                    if attempt < 4:
-                        # Wait a bit before retrying (except on last attempt)
-                        import time as _t
-                        _t.sleep(0.5)
-                    continue
-
-            except Exception as e:
-                last_error = str(e)
-                self.log(f"Error opening mirror window (attempt {attempt + 1}/5): {e}", "WARNING")
-                if attempt < 4:
-                    import time as _t
-                    _t.sleep(0.5)
-                continue
-
-        # All retries failed
-        if last_error:
-            self.log(f"Failed to open mirror after 5 attempts: {last_error}", "ERROR")
-            self.update_status("Failed to open mirror")
-        else:
-            self.log(f"Failed to open mirror for seat {seat}", "ERROR")
-            self.update_status("Failed to open mirror")
+            if attempt < max_attempts - 1:
+                # Retry asynchronously after 500ms without freezing the UI
+                QTimer.singleShot(500, lambda: self._open_mirror_for_seat(seat, attempt + 1, max_attempts))
+            else:
+                avail = [d['id'] for d in devices]
+                self.log(f"No device found for seat {seat} after {max_attempts} attempts. Available: {avail}", "ERROR")
+                self.update_status("Failed to open mirror")
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                QTimer.singleShot(500, lambda: self._open_mirror_for_seat(seat, attempt + 1, max_attempts))
+            else:
+                self.log(f"Error opening mirror window for seat {seat}: {e}", "ERROR")
+                self.update_status("Failed to open mirror")
 
     def _launch_scrcpy_for_device(self, device_id):
         """Open mirror window for a specific device (local — uses defaults)."""
@@ -1236,7 +1220,10 @@ class ScrcpyMixin:
                 import threading as _threading
                 def _watch():
                     p.wait()
-                    QTimer.singleShot(0, _on_exit)
+                    # Marshal to GUI thread — PyQt6 silently drops
+                    # QTimer.singleShot() from worker threads (see
+                    # pyqt6-singleshot-worker-thread-dropped.md).
+                    self.run_on_main_thread(_on_exit)
                 _threading.Thread(target=_watch, daemon=True).start()
             except Exception:
                 pass
@@ -1257,24 +1244,41 @@ class ScrcpyMixin:
                     stdout = (p.stdout.read() if p.stdout else '') or ''
                     err = (stderr + stdout).strip() or "scrcpy exited immediately."
                     self.log(f"scrcpy failed to start: {err}", "ERROR")
-                    QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
-                    # Safe dialog (avoids Qt 6.11 QMessageBox crash).
-                    QTimer.singleShot(0, lambda: safe_critical(
-                        self, "scrcpy Error",
-                        f"scrcpy failed to start: {err}. Make sure the device is connected and scrcpy is installed."))
+                    # Marshal to GUI thread — PyQt6 silently drops
+                    # QTimer.singleShot() from worker threads (see
+                    # pyqt6-singleshot-worker-thread-dropped.md). Using
+                    # run_on_main_thread() (which uses _ui_caller.call.emit)
+                    # also avoids opening a modal QDialog from a worker
+                    # thread, which would deadlock/segfault.
+                    self.run_on_main_thread(
+                        lambda: self.update_status("Failed to launch scrcpy")
+                    )
+                    self.run_on_main_thread(
+                        lambda e=err: safe_critical(
+                            self, "scrcpy Error",
+                            f"scrcpy failed to start: {e}. Make sure the device is connected and scrcpy is installed."
+                        )
+                    )
                     return
 
                 # Running fine
                 register_proc(p)
-                QTimer.singleShot(0, lambda: self.update_status("scrcpy running"))
+                self.run_on_main_thread(
+                    lambda: self.update_status("scrcpy running")
+                )
                 self._focus_scrcpy_window()
             except Exception as e:
                 error_msg = str(e)
                 self.log(f"Failed to launch scrcpy: {error_msg}", "ERROR")
-                QTimer.singleShot(0, lambda: self.update_status("Failed to launch scrcpy"))
-                QTimer.singleShot(0, lambda: safe_critical(
-                    self, "scrcpy Error",
-                    f"Failed to launch scrcpy: {error_msg}"))
+                self.run_on_main_thread(
+                    lambda: self.update_status("Failed to launch scrcpy")
+                )
+                self.run_on_main_thread(
+                    lambda em=error_msg: safe_critical(
+                        self, "scrcpy Error",
+                        f"Failed to launch scrcpy: {em}"
+                    )
+                )
 
         threading.Thread(target=do_launch, daemon=True).start()
 

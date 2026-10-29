@@ -40,11 +40,48 @@ class LoggingMixin:
         """
         if level == "DEBUG" and not getattr(self, "_debug_logging", False):
             return
+
+        # Thread safety: if called from a background thread, marshal to main thread
+        app = QApplication.instance()
+        if app and QThread.currentThread() != app.thread():
+            if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                self._ui_caller.call.emit(lambda: self.log(message, level))
+            return
+
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.output_text.append(f"[{timestamp}] [{level}] {message}")
-        # Auto-scroll to bottom
-        scrollbar = self.output_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if hasattr(self, 'output_text') and self.output_text is not None:
+            self.output_text.append(f"[{timestamp}] [{level}] {message}")
+            # Auto-scroll to bottom
+            scrollbar = self.output_text.verticalScrollBar()
+            if scrollbar:
+                scrollbar.setValue(scrollbar.maximum())
+
+    def run_on_main_thread(self, fn):
+        """Run ``fn`` on the Qt main GUI thread, from any thread.
+
+        Use this instead of ``QTimer.singleShot(0, fn)`` from a worker thread:
+        the latter is silently dropped on PyQt6 (see
+        ``pyqt6-singleshot-worker-thread-dropped.md``). If already on the
+        GUI thread, the callable runs inline.
+
+        Marshals via ``self._ui_caller`` (a ``_UICaller`` QObject parented
+        to ``self``), which uses Qt's queued-connection signal mechanism
+        to deliver the call to the GUI thread.
+        """
+        app = QApplication.instance()
+        if app and QThread.currentThread() == app.thread():
+            try:
+                fn()
+            except Exception as e:
+                self.log(f"Error in UI callback: {e}", "DEBUG")
+            return
+        if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+            self._ui_caller.call.emit(fn)
+        else:
+            # Fallback for very early startup before _ui_caller exists
+            # (no mixin has set it up yet). QTimer.singleShot here is
+            # called from the GUI thread (the constructor), so it's safe.
+            QTimer.singleShot(0, fn)
 
     def clear_logcat(self):
         """Clear logcat output text"""

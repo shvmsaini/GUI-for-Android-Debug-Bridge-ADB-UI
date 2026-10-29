@@ -400,22 +400,41 @@ class SettingsDialog(QDialog):
 
             if spm is None:
                 # No seat_port_manager — bail without touching anything.
-                QTimer.singleShot(0, lambda: finish(False, False, [
-                    ("seat", False, "no seat_port_manager on parent"),
-                    ("portforward", False, "no seat_port_manager on parent"),
-                ]))
+                # Marshal to GUI thread — PyQt6 silently drops
+                # QTimer.singleShot() from worker threads. The SettingsDialog
+                # doesn't have its own _ui_caller, but its parent (ADBGUI) does.
+                parent = self.parent
+                if hasattr(parent, '_ui_caller') and parent._ui_caller is not None:
+                    parent._ui_caller.call.emit(lambda: finish(False, False, [
+                        ("seat", False, "no seat_port_manager on parent"),
+                        ("portforward", False, "no seat_port_manager on parent"),
+                    ]))
+                else:
+                    QTimer.singleShot(0, lambda: finish(False, False, [
+                        ("seat", False, "no seat_port_manager on parent"),
+                        ("portforward", False, "no seat_port_manager on parent"),
+                    ]))
                 return
 
             results = spm.purge_history(entry_types=('seat', 'portforward'))
             ok_seat, msg_seat = results.get('seat', (False, 'not run'))
             ok_pf, msg_pf = results.get('portforward', (False, 'not run'))
-            QTimer.singleShot(0, lambda: finish(
-                ok_seat, ok_pf,
-                [
-                    ("seat", ok_seat, msg_seat or '(no output)'),
-                    ("portforward", ok_pf, msg_pf or '(no output)'),
-                ],
-            ))
+            if hasattr(parent, '_ui_caller') and parent._ui_caller is not None:
+                parent._ui_caller.call.emit(lambda: finish(
+                    ok_seat, ok_pf,
+                    [
+                        ("seat", ok_seat, msg_seat or '(no output)'),
+                        ("portforward", ok_pf, msg_pf or '(no output)'),
+                    ],
+                ))
+            else:
+                QTimer.singleShot(0, lambda: finish(
+                    ok_seat, ok_pf,
+                    [
+                        ("seat", ok_seat, msg_seat or '(no output)'),
+                        ("portforward", ok_pf, msg_pf or '(no output)'),
+                    ],
+                ))
 
         threading.Thread(target=do_purge, daemon=True).start()
 

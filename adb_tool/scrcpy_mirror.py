@@ -23,6 +23,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QProcess, QFileInfo
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QCursor, QShortcut
 
+try:
+    from .safe_dialog import safe_info, safe_warning, safe_critical
+except ImportError:
+    # Fallback if running standalone
+    def safe_info(parent, title, msg): QMessageBox.information(parent, title, msg)
+    def safe_warning(parent, title, msg): QMessageBox.warning(parent, title, msg)
+    def safe_critical(parent, title, msg): QMessageBox.critical(parent, title, msg)
+
 
 # ──────────────────────────────────────────────────────────────────────
 #  cv2 stub — prevent dylib conflict with PyAV
@@ -1291,7 +1299,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             # QMessageBox anyway in case Qt re-introduces the text-
             # engine race in a future version.
             try:
-                QMessageBox.warning(self, "Dependencies Missing", msg or "scrcpy dependencies missing")
+                safe_warning(self, "Dependencies Missing", msg or "scrcpy dependencies missing")
             except RuntimeError:
                 pass
             try:
@@ -1707,32 +1715,42 @@ class ScrcpyMirrorWindow(QMainWindow):
     def _show_error_with_retry(self, error_msg):
         """Show the error in a modal dialog with Retry / Native / Close buttons.
 
-        Used when the watchdog fired because no frames arrived — the
-        underlying cause is often transient (device asleep, static
-        screen) and a fresh retry usually succeeds.  If the embedded
-        mirror keeps failing, the user can fall back to the native
-        scrcpy binary for the same device.
+        Avoids QMessageBox on Qt 6.11/macOS 26 to prevent QTextEngine NULL-deref.
         """
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QDialogButtonBox
         try:
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setWindowTitle("Mirror Error")
-            box.setText(error_msg)
-            # Standard Retry / Close buttons.
-            retry_btn = box.addButton(
-                "Retry", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
-            # Optional "Open Native scrcpy" button — only shown when
-            # the parent provided a fallback callback.
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Mirror Error")
+            dlg.setModal(True)
+            layout = QVBoxLayout(dlg)
+            layout.setContentsMargins(16, 14, 16, 14)
+            layout.setSpacing(8)
+
+            first_line = error_msg.splitlines()[0] if error_msg else "An error occurred with the mirror."
+            if len(first_line) > 120:
+                first_line = first_line[:117] + "…"
+            lbl = QLabel(f"⚠️ {first_line}", dlg)
+            lbl.setTextFormat(Qt.TextFormat.PlainText)
+            layout.addWidget(lbl)
+
+            hint = QLabel("The device may be locked or taking longer to stream frames.", dlg)
+            hint.setTextFormat(Qt.TextFormat.PlainText)
+            layout.addWidget(hint)
+
+            btns = QDialogButtonBox(dlg)
+            retry_btn = btns.addButton("Retry", QDialogButtonBox.ButtonRole.AcceptRole)
+            close_btn = btns.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
             native_btn = None
             if self._on_fallback_native is not None:
-                native_btn = box.addButton(
-                    "Open Native scrcpy", QMessageBox.ButtonRole.ActionRole)
-            box.setDefaultButton(retry_btn)
-            box.exec()
-            if native_btn is not None and box.clickedButton() is native_btn:
-                # Close the embedded mirror first, then launch the
-                # native scrcpy binary for the same device.
+                native_btn = btns.addButton("Open Native scrcpy", QDialogButtonBox.ButtonRole.ActionRole)
+
+            retry_btn.clicked.connect(lambda: dlg.done(1))
+            close_btn.clicked.connect(lambda: dlg.done(0))
+            if native_btn is not None:
+                native_btn.clicked.connect(lambda: dlg.done(2))
+
+            code = dlg.exec()
+            if code == 2 and native_btn is not None:
                 self._closing = True
                 self._stop_frame_watchdog()
                 if self._client is not None:
@@ -1746,8 +1764,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                 except Exception:
                     pass
                 self.close()
-            elif box.clickedButton() is retry_btn:
-                # Restart the client — Apply-style restart.
+            elif code == 1:
                 self._apply_settings()
             else:
                 self.close()
@@ -1980,7 +1997,7 @@ class ScrcpyMirrorWindow(QMainWindow):
             except RuntimeError:
                 pass
             try:
-                QMessageBox.warning(
+                safe_warning(
                     self, "Screenshot Failed",
                     f"Failed to take screenshot:\n{error}",
                 )
@@ -1993,7 +2010,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         except RuntimeError:
             pass
         try:
-            QMessageBox.information(
+            safe_info(
                 self, "Screenshot Saved",
                 f"Screenshot saved to:\n{dest_path}",
             )

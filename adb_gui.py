@@ -87,6 +87,10 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
     def __init__(self):
         super().__init__()
 
+        # Thread-safe UI caller (used to marshal UI updates from background threads)
+        self._ui_caller = _UICaller(self)
+        self._active_mirror_windows = {}
+
         # Window title with debug indicator (ALWAYS show if DEBUG_MODE)
         title = f"ADB Tool v{APP_VERSION}"
         if DEBUG_MODE:
@@ -99,18 +103,26 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         self.setGeometry(100, 100, 1800, 1000)
         self.setMinimumSize(1450, 800)
 
-        # Pre-import py_scrcpy_sdk and its native deps (PyAV/FFmpeg,
-        # numpy C core) ~500ms after the GUI becomes visible.  Doing
-        # this in a background thread keeps the GUI responsive while
-        # warming up the native libs before the user clicks the mirror
-        # button — which avoids the ~10s delay on first mirror open.
-        # If a SIGSEGV occurs during this background import, it'll
-        # happen off the click path, and the retry logic in
-        # _open_mirror_window handles subsequent failures.
+        # Defer UI setup and initialization ~500ms after window becomes visible.
         QTimer.singleShot(500, self._preload_mirror_native_libs)
 
         # Show migration wizard on first startup (after UI is built)
         QTimer.singleShot(800, self._maybe_show_migration_wizard)
+
+    def show_info(self, title, message):
+        """Thread-safe and crash-safe info dialog."""
+        from adb_tool.safe_dialog import safe_info
+        self.run_on_main_thread(lambda: safe_info(self, title, message))
+
+    def show_warning(self, title, message):
+        """Thread-safe and crash-safe warning dialog."""
+        from adb_tool.safe_dialog import safe_warning
+        self.run_on_main_thread(lambda: safe_warning(self, title, message))
+
+    def show_error(self, title, message):
+        """Thread-safe and crash-safe error dialog."""
+        from adb_tool.safe_dialog import safe_critical
+        self.run_on_main_thread(lambda: safe_critical(self, title, message))
 
     def _maybe_show_migration_wizard(self):
         """Show the history migration wizard on first startup.
@@ -1116,9 +1128,15 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
 
     def update_status(self, message):
         """Update status bar - truncate long messages to keep bar height fixed"""
+        app = QApplication.instance()
+        if app and QThread.currentThread() != app.thread():
+            if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                self._ui_caller.call.emit(lambda: self.update_status(message))
+            return
         if message and len(message) > 120:
             message = message[:117] + "..."
-        self.status_bar.setText(message)
+        if hasattr(self, 'status_bar') and self.status_bar is not None:
+            self.status_bar.setText(message)
     
     def update_adb_path_display(self):
         """Update ADB path display label"""
@@ -1271,9 +1289,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
             if not result['success']:
                 error_msg = result.get('stderr') or "Unknown error"
                 self.log(f"Error getting APK path: {error_msg}", "ERROR")
-                QTimer.singleShot(0, lambda: QMessageBox.critical(
-                    self, "Error", f"Failed to get APK path:\n{error_msg}"
-                ))
+                self.show_error("Error", f"Failed to get APK path:\n{error_msg}")
                 return
 
             # Parse APK paths (format: package:/data/app/.../base.apk)
@@ -1283,9 +1299,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
 
             if not apk_paths:
                 self.log("Could not find APK path", "ERROR")
-                QTimer.singleShot(0, lambda: QMessageBox.critical(
-                    self, "Error", "Could not find APK path on device"
-                ))
+                self.show_error("Error", "Could not find APK path on device")
                 return
 
             # Find the base APK (usually the first one or contains "base" in the name)
@@ -1314,14 +1328,13 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
                 size_mb = file_size / (1024 * 1024)
                 self.log(f"Base APK extracted successfully ({size_mb:.2f} MB)")
                 self.update_status("APK extracted")
-                QTimer.singleShot(0, lambda: QMessageBox.information(
-                    self,
+                self.show_info(
                     "Success",
                     f"Base APK extracted successfully!\n\n"
                     f"Package: {package_name}\n"
                     f"Size: {size_mb:.2f} MB\n"
                     f"Saved to:\n{local_apk}"
-                ))
+                )
             else:
                 error_msg = result.get('stderr') or result.get('stdout') or "Unknown error"
                 self.log(f"Error pulling APK: {error_msg}", "ERROR")
@@ -1332,9 +1345,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
                         os.remove(local_apk)
                     except:
                         pass
-                QTimer.singleShot(0, lambda: QMessageBox.critical(
-                    self, "Error", f"Failed to pull APK:\n{error_msg}"
-                ))
+                self.show_error("Error", f"Failed to pull APK:\n{error_msg}")
 
         threading.Thread(target=do_extract, daemon=True).start()
     
@@ -1381,23 +1392,22 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
                     if result['success']:
                         self.log(f"Screenshot saved successfully: {dest_path}")
                         self.update_status("Screenshot saved")
-                        # Use QTimer.singleShot to safely call QMessageBox from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Screenshot saved to:\n{dest_path}"))
+                        self.show_info("Success", f"Screenshot saved to: {dest_path}")
                     else:
                         error_msg = result.get('stderr', 'Unknown error')
                         self.log(f"Error pulling screenshot: {error_msg}", "ERROR")
                         self.update_status("Failed to save screenshot")
-                        QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Error", f"Failed to save screenshot:\n{error_msg}"))
+                        self.show_warning("Error", f"Failed to save screenshot: {error_msg}")
                 else:
                     error_msg = result.get('stderr', 'Unknown error')
                     self.log(f"Error taking screenshot: {error_msg}", "ERROR")
                     self.update_status("Failed to take screenshot")
-                    QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Error", f"Failed to take screenshot:\n{error_msg}"))
+                    self.show_warning("Error", f"Failed to take screenshot: {error_msg}")
             except Exception as e:
                 error_msg = str(e)
                 self.log(f"Exception in screenshot: {error_msg}", "ERROR")
                 self.update_status("Screenshot failed")
-                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"An error occurred:\n{error_msg}"))
+                self.show_error("Error", f"An error occurred: {error_msg}")
 
         threading.Thread(target=do_screenshot, daemon=True).start()
 
@@ -2153,8 +2163,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
                         result_msg += f"... and {len(failed_packages) - 5} more\n"
                 
                 self.update_status("DeGoogle completed")
-                # Thread-safe messagebox - use QTimer to call from main thread
-                QTimer.singleShot(0, lambda: QMessageBox.information(self, "DeGoogle Complete", result_msg))
+                self.show_info("DeGoogle Complete", result_msg)
             
             threading.Thread(target=process_degoogle, daemon=True).start()
         
@@ -2443,7 +2452,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
                             result_msg += f"... and {len(failed_packages) - 5} more\n"
                     
                     self.update_status("DeGoogle completed")
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "DeGoogle Complete", result_msg))
+                    self.show_info("DeGoogle Complete", result_msg)
                 
                 threading.Thread(target=process_degoogle, daemon=True).start()
             
@@ -2807,8 +2816,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
                     result_msg += f"Failed: {len(failed)} packages\n"
                 
                 self.update_status("Restore completed")
-                # Thread-safe messagebox - use QTimer to call from main thread
-                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Restore Complete", result_msg))
+                self.show_info("Restore Complete", result_msg)
             
             threading.Thread(target=do_restore_work, daemon=True).start()
         
@@ -2846,18 +2854,20 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
             from adb_tool.seat_root_explorer import prompt_and_open_seat_root
             prompt_and_open_seat_root(self)
         except ImportError:
-            QMessageBox.warning(
+            from adb_tool.safe_dialog import safe_warning
+            safe_warning(
                 self,
                 "Not Available",
-                "Seat Root Explorer requires the seat_root_explorer.py module.\n"
+                "Seat Root Explorer requires the seat_root_explorer.py module. "
                 "Please ensure it is in the application directory."
             )
         except Exception as e:
             self.log(f"Seat Root Explorer failed: {e}", "ERROR")
-            QMessageBox.critical(
+            from adb_tool.safe_dialog import safe_critical
+            safe_critical(
                 self,
                 "Error",
-                f"Failed to open Seat Root Explorer:\n{e}"
+                f"Failed to open Seat Root Explorer: {e}"
             )
 
 

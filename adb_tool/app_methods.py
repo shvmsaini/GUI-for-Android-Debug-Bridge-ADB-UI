@@ -23,11 +23,30 @@ from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
 from .seat_methods import _SeatJumpHost, _SeatSshError, _SeatAuthError
+from .safe_dialog import safe_info, safe_warning, safe_critical
 from . import bundled_scripts
 
 
 class AppMixin:
     """Mixin class providing app management functionality."""
+
+    def _safe_notify_info(self, title, message):
+        if hasattr(self, 'show_info'):
+            self.show_info(title, message)
+        else:
+            safe_info(self, title, message)
+
+    def _safe_notify_warning(self, title, message):
+        if hasattr(self, 'show_warning'):
+            self.show_warning(title, message)
+        else:
+            safe_warning(self, title, message)
+
+    def _safe_notify_error(self, title, message):
+        if hasattr(self, 'show_error'):
+            self.show_error(title, message)
+        else:
+            safe_critical(self, title, message)
 
     def install_apk(self):
         """Install APK file"""
@@ -796,14 +815,12 @@ class AppMixin:
                 if 'Success' in output or 'success' in output.lower():
                     self.log("App uninstalled successfully")
                     self.update_status("App uninstalled successfully")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", "App uninstalled successfully"))
+                    self._safe_notify_info("Success", "App uninstalled successfully")
                 else:
                     # Sometimes ADB returns success but stdout has info
                     self.log(f"Uninstall result: {output}")
                     self.update_status("Uninstall completed")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Uninstall completed:\n{output}"))
+                    self._safe_notify_info("Success", f"Uninstall completed: {output}")
             else:
                 # Get error from stderr or stdout
                 error_msg = result['stderr'] if result['stderr'] else result['stdout']
@@ -824,7 +841,7 @@ class AppMixin:
                         output = result_cmd['stdout'].strip() if result_cmd['stdout'] else ''
                         self.log("Split APK uninstalled successfully using cmd package")
                         self.update_status("Split APK uninstalled successfully")
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Split APK uninstalled successfully!\n\nUsed 'cmd package uninstall-if-empty' to properly handle split APK packages."))
+                        self._safe_notify_info("Success", "Split APK uninstalled successfully via cmd package")
                         return
                     else:
                         error_msg_cmd = result_cmd['stderr'] if result_cmd['stderr'] else result_cmd['stdout']
@@ -844,7 +861,7 @@ class AppMixin:
                                 output = result_base['stdout'].strip() if result_base['stdout'] else ''
                                 self.log("Base package uninstalled successfully")
                                 self.update_status("Split APK uninstalled successfully")
-                                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Split APK uninstalled successfully!\n\nTried uninstalling base package '{base_package}' which worked."))
+                                self._safe_notify_info("Success", f"Split APK base package '{base_package}' uninstalled successfully")
                                 return
                             else:
                                 self.log(f"Base package uninstall also failed: {result_base['stderr'] or result_base['stdout']}", "WARNING")
@@ -858,13 +875,11 @@ class AppMixin:
                     if 'Success' in output or 'success' in output.lower() or output == '':
                         self.log("App uninstalled for current user successfully")
                         self.update_status("App uninstalled for current user")
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App uninstalled for current user successfully!\n\nNote: System apps are only removed for your user account, not from the device."))
+                        self._safe_notify_info("Success", "App uninstalled for current user successfully (system apps are only removed for your user account)")
                     else:
                         self.log(f"Uninstall result: {output}")
                         self.update_status("Uninstall completed")
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Uninstall completed:\n{output}"))
+                        self._safe_notify_info("Success", f"Uninstall completed: {output}")
                 else:
                     # Both methods failed
                     error_msg_user = result_user['stderr'] if result_user['stderr'] else result_user['stdout']
@@ -877,12 +892,11 @@ class AppMixin:
 
                     # Provide helpful message
                     if 'DELETE_FAILED_INTERNAL_ERROR' in error_msg or 'system app' in error_msg.lower() or 'package is a system package' in error_msg.lower():
-                        help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}\n\nTried both regular and user uninstall methods.\nYou can try disabling it instead (use 'Disable Selected')."
+                        help_text = f"Failed to uninstall {package_name}: {error_msg}. You can try disabling it instead."
                     else:
-                        help_text = f"Failed to uninstall {package_name}:\n\n{error_msg}"
+                        help_text = f"Failed to uninstall {package_name}: {error_msg}"
 
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", help_text))
+                    self._safe_notify_error("Error", help_text)
         
         threading.Thread(target=do_uninstall, daemon=True).start()
 
@@ -992,7 +1006,7 @@ class AppMixin:
                 if error_msg and error_msg.strip() and error_msg.strip() != '':
                     self.log(f"Error listing apps: {error_msg}", "ERROR")
                 self.update_status("Failed to list apps")
-                QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Error", f"Failed to list installed apps:\n{error_msg}"))
+                self._safe_notify_warning("Error", f"Failed to list installed apps: {error_msg}")
         
         threading.Thread(target=do_list, daemon=True).start()
 
@@ -1033,9 +1047,7 @@ class AppMixin:
             if not result['success']:
                 error_msg = result.get('stderr') or "Unknown error"
                 self.log(f"Error getting APK path: {error_msg}", "ERROR")
-                QTimer.singleShot(0, lambda: QMessageBox.critical(
-                    self, "Error", f"Failed to get APK path:\n{error_msg}"
-                ))
+                self._safe_notify_error("Error", f"Failed to get APK path:\n{error_msg}")
                 return
 
             # Parse APK paths (format: package:/data/app/.../base.apk)
@@ -1045,9 +1057,7 @@ class AppMixin:
 
             if not apk_paths:
                 self.log("Could not find APK path", "ERROR")
-                QTimer.singleShot(0, lambda: QMessageBox.critical(
-                    self, "Error", "Could not find APK path on device"
-                ))
+                self._safe_notify_error("Error", "Could not find APK path on device")
                 return
 
             # Find the base APK (usually the first one or contains "base" in the name)
@@ -1076,14 +1086,13 @@ class AppMixin:
                 size_mb = file_size / (1024 * 1024)
                 self.log(f"Base APK extracted successfully ({size_mb:.2f} MB)")
                 self.update_status("APK extracted")
-                QTimer.singleShot(0, lambda: QMessageBox.information(
-                    self,
+                self._safe_notify_info(
                     "Success",
                     f"Base APK extracted successfully!\n\n"
                     f"Package: {package_name}\n"
                     f"Size: {size_mb:.2f} MB\n"
                     f"Saved to:\n{local_apk}"
-                ))
+                )
             else:
                 error_msg = result.get('stderr') or result.get('stdout') or "Unknown error"
                 self.log(f"Error pulling APK: {error_msg}", "ERROR")
@@ -1094,9 +1103,7 @@ class AppMixin:
                         os.remove(local_apk)
                     except:
                         pass
-                QTimer.singleShot(0, lambda: QMessageBox.critical(
-                    self, "Error", f"Failed to pull APK:\n{error_msg}"
-                ))
+                self._safe_notify_error("Error", f"Failed to pull APK:\n{error_msg}")
 
         threading.Thread(target=do_extract, daemon=True).start()
 
@@ -1150,45 +1157,50 @@ class AppMixin:
         
         def update_list():
             """Update listbox based on search and filter"""
-            search_term = search_entry.text().lower()
-            filter_disabled = filter_checkbox.isChecked()
-            listbox.clear()
-            
-            for app in app_window.original_apps:
-                # Get app label (use package name as fallback)
-                app_label = app_window.app_labels.get(app, app)
+            try:
+                if not app_window.isVisible():
+                    return
+                search_term = search_entry.text().lower()
+                filter_disabled = filter_checkbox.isChecked()
+                listbox.clear()
                 
-                # If label is same as package, just show package name (avoid "package (package)")
-                if app_label == app:
-                    display_label = app
-                else:
-                    display_label = f"{app_label} ({app})"
-                
-                # Check if app is disabled
-                is_disabled = app_window.app_status.get(app, False)
-                
-                # Get app version
-                app_version = app_window.app_versions.get(app, '')
-                
-                # Apply disabled filter
-                if filter_disabled and not is_disabled:
-                    continue
-                
-                # Check if search term matches app name, package name, or version
-                matches = False
-                if not search_term:
-                    matches = True
-                elif search_term in app_label.lower() or search_term in app.lower() or search_term in app_version.lower():
-                    matches = True
-                
-                if matches:
-                    display_name = display_label
-                    # Add version if available
-                    if app_version:
-                        display_name += f" v{app_version}"
-                    if is_disabled:
-                        display_name += " [DISABLED]"
-                    listbox.addItem(display_name)
+                for app in app_window.original_apps:
+                    # Get app label (use package name as fallback)
+                    app_label = app_window.app_labels.get(app, app)
+                    
+                    # If label is same as package, just show package name (avoid "package (package)")
+                    if app_label == app:
+                        display_label = app
+                    else:
+                        display_label = f"{app_label} ({app})"
+                    
+                    # Check if app is disabled
+                    is_disabled = app_window.app_status.get(app, False)
+                    
+                    # Get app version
+                    app_version = app_window.app_versions.get(app, '')
+                    
+                    # Apply disabled filter
+                    if filter_disabled and not is_disabled:
+                        continue
+                    
+                    # Check if search term matches app name, package name, or version
+                    matches = False
+                    if not search_term:
+                        matches = True
+                    elif search_term in app_label.lower() or search_term in app.lower() or search_term in app_version.lower():
+                        matches = True
+                    
+                    if matches:
+                        display_name = display_label
+                        # Add version if available
+                        if app_version:
+                            display_name += f" v{app_version}"
+                        if is_disabled:
+                            display_name += " [DISABLED]"
+                        listbox.addItem(display_name)
+            except RuntimeError:
+                return
         
         # Load app labels in background
         def load_app_labels():
@@ -1206,7 +1218,10 @@ class AppMixin:
             self.log(f"Loaded {len(app_window.app_labels)} app names ({labels_found} with custom labels)")
             if labels_found == 0:
                 self.log("Warning: No app labels found. Labels may be stored as resource IDs.", "WARNING")
-            QTimer.singleShot(0, lambda: update_list())
+            if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                self._ui_caller.call.emit(update_list)
+            else:
+                QTimer.singleShot(0, update_list)
 
         # Load app versions in background
         def load_app_versions():
@@ -1231,7 +1246,10 @@ class AppMixin:
             self.log(f"Loaded versions for {versions_found}/{len(apps)} apps")
             self.update_status(f"Found {len(apps)} apps")
             # Final update to show all versions
-            QTimer.singleShot(0, lambda: update_list())
+            if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                self._ui_caller.call.emit(update_list)
+            else:
+                QTimer.singleShot(0, update_list)
         
         search_entry.textChanged.connect(update_list)
         filter_checkbox.stateChanged.connect(lambda: update_list())
@@ -1352,12 +1370,19 @@ class AppMixin:
                 def _refresh_after_uninstall():
                     # Clear any stale selection, then rebuild the list from the
                     # (now smaller) original_apps using the current search term.
-                    listbox.clearSelection()
-                    listbox.setCurrentItem(None)
-                    update_list()
+                    try:
+                        listbox.clearSelection()
+                        listbox.setCurrentItem(None)
+                        update_list()
+                    except RuntimeError:
+                        pass
 
-                QTimer.singleShot(0, _refresh_after_uninstall)
-                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Uninstall Complete", summary))
+                if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                    self._ui_caller.call.emit(_refresh_after_uninstall)
+                else:
+                    QTimer.singleShot(0, _refresh_after_uninstall)
+
+                self._safe_notify_info("Uninstall Complete", summary)
 
             threading.Thread(target=do_uninstall, daemon=True).start()
         
@@ -1384,8 +1409,7 @@ class AppMixin:
                 if not result['success']:
                     error_msg = result['stderr'] or "Unknown error"
                     self.log(f"Error getting APK path: {error_msg}", "ERROR")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to get APK path:\n{error_msg}"))
+                    self._safe_notify_error("Error", f"Failed to get APK path: {error_msg}")
                     return
                 
                 # Parse APK path (format: package:/data/app/.../base.apk)
@@ -1395,8 +1419,7 @@ class AppMixin:
                 
                 if not apk_paths:
                     self.log("Could not find APK path", "ERROR")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", "Could not find APK path on device"))
+                    self._safe_notify_error("Error", "Could not find APK path on device")
                     return
                 
                 self.log(f"Found {len(apk_paths)} APK file(s)")
@@ -1435,8 +1458,7 @@ class AppMixin:
                     if not result['success']:
                         error_msg = result['stderr'] or "Unknown error"
                         self.log(f"Error pulling APK {i+1}: {error_msg}", "ERROR")
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to pull APK {i+1}:\n{error_msg}"))
+                        self._safe_notify_error("Error", f"Failed to pull APK {i+1}: {error_msg}")
                         # Clean up already pulled APKs
                         for apk in local_apks:
                             try:
@@ -1475,17 +1497,12 @@ class AppMixin:
                 if result['success']:
                     self.log("App reinstalled successfully")
                     self.update_status("App reinstalled successfully")
-                    apk_locations = '\n'.join(local_apks)
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App reinstalled successfully!\n\nAPK(s) saved at:\n{apk_locations}"))
-                    # Keep APKs in the folder for easy access - don't delete them
+                    self._safe_notify_info("Success", f"App reinstalled successfully! Saved in: {apks_dir}")
                 else:
                     error_msg = result['stderr'] or "Unknown error"
                     self.log(f"Error installing: {error_msg}", "ERROR")
                     self.update_status("Failed to reinstall app")
-                    apk_locations = '\n'.join(local_apks)
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to install app:\n{error_msg}\n\nAPK(s) saved at:\n{apk_locations}"))
+                    self._safe_notify_error("Error", f"Failed to install app: {error_msg}")
             
             threading.Thread(target=do_reinstall, daemon=True).start()
         
@@ -1520,8 +1537,7 @@ class AppMixin:
                     self.log(f"Package check failed: {result_check.get('stderr', 'No output')}", "ERROR")
                     self.log(f"Package name used: '{package_name}'", "DEBUG")
                     self.update_status("Failed to disable app")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to disable {display_name}:\n\n{error_msg}\n\nPackage: {package_name}"))
+                    self._safe_notify_error("Error", f"Failed to disable {display_name}: {error_msg}")
                     return
                 
                 result = self.adb.run_command(f"{self.get_device_flag()} shell pm disable-user {package_name}")
@@ -1531,9 +1547,11 @@ class AppMixin:
                     # Update status
                     app_window.app_status[package_name] = True
                     # Refresh the list
-                    QTimer.singleShot(0, lambda: update_list())
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", "App disabled successfully"))
+                    if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                        self._ui_caller.call.emit(update_list)
+                    else:
+                        QTimer.singleShot(0, update_list)
+                    self._safe_notify_info("Success", "App disabled successfully")
                 else:
                     error_msg = result['stderr'] if result['stderr'] else result['stdout']
                     if not error_msg or error_msg.strip() == '':
@@ -1541,8 +1559,7 @@ class AppMixin:
                     self.log(f"Error: {error_msg}", "ERROR")
                     self.log(f"Package name used: '{package_name}'", "DEBUG")
                     self.update_status("Failed to disable app")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to disable app:\n{error_msg}"))
+                    self._safe_notify_error("Error", f"Failed to disable app: {error_msg}")
             
             threading.Thread(target=do_disable, daemon=True).start()
         
@@ -1577,8 +1594,7 @@ class AppMixin:
                     self.log(f"Package check failed: {result_check.get('stderr', 'No output')}", "ERROR")
                     self.log(f"Package name used: '{package_name}'", "DEBUG")
                     self.update_status("Failed to enable app")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to enable {display_name}:\n\n{error_msg}\n\nPackage: {package_name}"))
+                    self._safe_notify_error("Error", f"Failed to enable {display_name}: {error_msg}")
                     return
                 
                 # Try to enable the app
@@ -1592,17 +1608,21 @@ class AppMixin:
                         # Update status
                         app_window.app_status[package_name] = False
                         # Refresh the list
-                        QTimer.singleShot(0, lambda: update_list())
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", "App enabled successfully"))
+                        if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                            self._ui_caller.call.emit(update_list)
+                        else:
+                            QTimer.singleShot(0, update_list)
+                        self._safe_notify_info("Success", "App enabled successfully")
                     else:
                         # Sometimes ADB returns success but with info message
                         self.log(f"Enable result: {output}")
                         self.update_status("Enable completed")
                         app_window.app_status[package_name] = False
-                        QTimer.singleShot(0, lambda: update_list())
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Enable completed:\n{output}"))
+                        if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                            self._ui_caller.call.emit(update_list)
+                        else:
+                            QTimer.singleShot(0, update_list)
+                        self._safe_notify_info("Success", f"Enable completed: {output}")
                 else:
                     error_msg = result['stderr'] if result['stderr'] else result['stdout']
                     if not error_msg or error_msg.strip() == '':
@@ -1615,14 +1635,13 @@ class AppMixin:
                     
                     # Provide helpful message for common errors
                     if 'SecurityException' in error_msg or 'Shell cannot change component state' in error_msg:
-                        help_text = f"Failed to enable {display_name}:\n\n{error_msg}\n\nThis error usually means:\n1. The app doesn't exist or was uninstalled\n2. The app requires root access to enable\n3. The package name is invalid\n\nTry refreshing the app list."
+                        help_text = f"Failed to enable {display_name}: {error_msg} (may require root or was uninstalled)"
                     elif 'null' in error_msg.lower():
-                        help_text = f"Failed to enable {display_name}:\n\n{error_msg}\n\nThe package name appears to be invalid. Try refreshing the app list."
+                        help_text = f"Failed to enable {display_name}: invalid package name"
                     else:
-                        help_text = f"Failed to enable {display_name}:\n\n{error_msg}"
+                        help_text = f"Failed to enable {display_name}: {error_msg}"
                     
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", help_text))
+                    self._safe_notify_error("Error", help_text)
             
             threading.Thread(target=do_enable, daemon=True).start()
 
@@ -1647,14 +1666,14 @@ class AppMixin:
                 if result['success']:
                     self.log("App start command sent successfully")
                     self.update_status("App started")
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Started:\n{display_name}"))
+                    self._safe_notify_info("Success", f"Started: {display_name}")
                 else:
                     error_msg = result['stderr'] if result['stderr'] else result['stdout']
                     if not error_msg or error_msg.strip() == '':
                         error_msg = "Unknown error"
                     self.log(f"Failed to start app: {error_msg}", "ERROR")
                     self.update_status("Failed to start app")
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to start:\n{display_name}\n\n{error_msg}"))
+                    self._safe_notify_error("Error", f"Failed to start: {display_name}: {error_msg}")
             
             threading.Thread(target=do_start, daemon=True).start()
 
@@ -1675,14 +1694,14 @@ class AppMixin:
                 if result['success']:
                     self.log("App stop (kill) command sent successfully")
                     self.update_status("App stopped")
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Stopped (killed):\n{display_name}"))
+                    self._safe_notify_info("Success", f"Stopped (killed): {display_name}")
                 else:
                     error_msg = result['stderr'] if result['stderr'] else result['stdout']
                     if not error_msg or error_msg.strip() == '':
                         error_msg = "Unknown error"
                     self.log(f"Failed to stop app: {error_msg}", "ERROR")
                     self.update_status("Failed to stop app")
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to stop:\n{display_name}\n\n{error_msg}"))
+                    self._safe_notify_error("Error", f"Failed to stop: {display_name}: {error_msg}")
             
             threading.Thread(target=do_stop, daemon=True).start()
 
@@ -1703,14 +1722,14 @@ class AppMixin:
                 if result['success']:
                     self.log("App force-stop command sent successfully")
                     self.update_status("App force-stopped")
-                    QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Force-stopped:\n{display_name}"))
+                    self._safe_notify_info("Success", f"Force-stopped: {display_name}")
                 else:
                     error_msg = result['stderr'] if result['stderr'] else result['stdout']
                     if not error_msg or error_msg.strip() == '':
                         error_msg = "Unknown error"
                     self.log(f"Failed to force stop app: {error_msg}", "ERROR")
                     self.update_status("Failed to force stop app")
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to force stop:\n{display_name}\n\n{error_msg}"))
+                    self._safe_notify_error("Error", f"Failed to force stop: {display_name}: {error_msg}")
             
             threading.Thread(target=do_force_stop, daemon=True).start()
         
@@ -1793,25 +1812,28 @@ class AppMixin:
                         if package_name not in app_window.original_apps:
                             app_window.original_apps.append(package_name)
                         # Refresh the list
-                        QTimer.singleShot(0, lambda: update_list())
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App reinstalled for current user successfully!\n\n{package_name} is now available again."))
+                        if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                            self._ui_caller.call.emit(update_list)
+                        else:
+                            QTimer.singleShot(0, update_list)
+                        self._safe_notify_info("Success", f"App reinstalled for current user successfully: {package_name}")
                     else:
                         self.log(f"Reinstall result: {output}")
                         self.update_status("Reinstall completed")
                         if package_name not in app_window.original_apps:
                             app_window.original_apps.append(package_name)
-                        QTimer.singleShot(0, lambda: update_list())
-                        # Thread-safe messagebox - use QTimer to call from main thread
-                        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"Reinstall completed:\n{output}"))
+                        if hasattr(self, '_ui_caller') and self._ui_caller is not None:
+                            self._ui_caller.call.emit(update_list)
+                        else:
+                            QTimer.singleShot(0, update_list)
+                        self._safe_notify_info("Success", f"Reinstall completed: {output}")
                 else:
                     error_msg = result['stderr'] if result['stderr'] else result['stdout']
                     if not error_msg or error_msg.strip() == '':
                         error_msg = "Unknown error"
                     self.log(f"Error: {error_msg}", "ERROR")
                     self.update_status("Failed to reinstall app")
-                    # Thread-safe messagebox - use QTimer to call from main thread
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"Failed to reinstall {package_name}:\n\n{error_msg}\n\nNote: This only works for apps that were previously installed but uninstalled for your user account."))
+                    self._safe_notify_error("Error", f"Failed to reinstall {package_name}: {error_msg}")
             
             threading.Thread(target=do_reinstall, daemon=True).start()
         

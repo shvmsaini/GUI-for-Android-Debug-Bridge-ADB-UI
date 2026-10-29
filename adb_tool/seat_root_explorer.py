@@ -495,9 +495,11 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
 
                 for i, (name, remote_path) in enumerate(files_to_copy):
                     pct = int(100 * i / len(files_to_copy))
-                    QTimer.singleShot(0, lambda p=pct: (
+                    # Marshal to GUI thread — PyQt6 silently drops
+                    # QTimer.singleShot() from worker threads.
+                    parent.run_on_main_thread(lambda p=pct, n=name: (
                         progress.setValue(p),
-                        progress.setLabelText(f"Copying {name} to gateway…"),
+                        progress.setLabelText(f"Copying {n} to gateway…"),
                     ))
 
                     # Run scp ON the seat (we already have a root shell there).
@@ -549,10 +551,16 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
 
                     except Exception as e:
                         parent.log(f"  Failed to copy {name}: {e}", "ERROR")
-                        QTimer.singleShot(0, lambda n=name, err=str(e): QMessageBox.critical(
-                            explorer, "Copy Failed",
-                            f"Failed to copy {n}:\n\n{err}"
-                        ))
+                        # Marshal to GUI thread — PyQt6 silently drops
+                        # QTimer.singleShot() from worker threads, and
+                        # QMessageBox must run on the GUI thread anyway.
+                        from .safe_dialog import safe_critical
+                        parent.run_on_main_thread(
+                            lambda n=name, err=str(e): safe_critical(
+                                explorer, "Copy Failed",
+                                f"Failed to copy {n}: {err}"
+                            )
+                        )
                         return
                     finally:
                         # Clean up askpass script on seat
@@ -561,12 +569,16 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         except:
                             pass
 
-                QTimer.singleShot(0, lambda: (
+                # Marshal to GUI thread — PyQt6 silently drops
+                # QTimer.singleShot() from worker threads, and QMessageBox
+                # must run on the GUI thread anyway.
+                from .safe_dialog import safe_info
+                parent.run_on_main_thread(lambda: (
                     progress.setValue(100),
                     progress.close(),
-                    QMessageBox.information(
+                    safe_info(
                         explorer, "Copy to Gateway Complete",
-                        f"Copied {len(files_to_copy)} file(s) to:\n\n{gateway_host}:{target_path}"
+                        f"Copied {len(files_to_copy)} file(s) to: {gateway_host}:{target_path}"
                     ),
                 ))
 
