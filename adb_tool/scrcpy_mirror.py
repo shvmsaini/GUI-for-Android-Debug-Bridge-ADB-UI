@@ -110,6 +110,13 @@ KEYCODE_DPAD_LEFT = 21
 KEYCODE_DPAD_RIGHT = 22
 KEYCODE_DPAD_CENTER = 23
 
+# Text editing & control keycodes
+KEYCODE_TAB = 61
+KEYCODE_SPACE = 62
+KEYCODE_ENTER = 66
+KEYCODE_DEL = 67            # Backspace
+KEYCODE_FORWARD_DEL = 112    # Forward Delete
+
 
 # ──────────────────────────────────────────────────────────────────────
 #  Thread-safe frame signal
@@ -147,6 +154,7 @@ class VideoDisplayWidget(QWidget):
         self._disconnected = False         # True when screen disconnected
 
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
@@ -303,6 +311,7 @@ class VideoDisplayWidget(QWidget):
             pass
 
     def mousePressEvent(self, event):
+        self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton and self._client:
             coords = self._widget_to_device_coords(event.position().toPoint())
             if coords:
@@ -310,6 +319,14 @@ class VideoDisplayWidget(QWidget):
                 self._dragging = True
                 self._drag_start = coords
                 self._safe_touch(0, coords[0], coords[1])  # ACTION_DOWN
+
+    def keyPressEvent(self, event):
+        """Forward keyboard input from the display widget to the main mirror window."""
+        parent_win = self.window()
+        if parent_win is not None and parent_win is not self and hasattr(parent_win, 'keyPressEvent'):
+            parent_win.keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._dragging and self._client:
@@ -2040,11 +2057,31 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         # Note: Cmd+W/Ctrl+W is handled by QShortcut for better focus handling
-
         if self._client is None:
             return super().keyPressEvent(event)
 
         key = event.key()
+        modifiers = event.modifiers()
+        has_ctrl_or_cmd = bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier))
+
+        # Clipboard paste (Ctrl+V / Cmd+V)
+        if has_ctrl_or_cmd:
+            if key == Qt.Key.Key_V:
+                try:
+                    from PyQt6.QtWidgets import QApplication
+                    cb = QApplication.clipboard()
+                    clip_text = cb.text() if cb else ""
+                    if clip_text:
+                        if hasattr(self._client, 'paste_text'):
+                            self._client.paste_text(clip_text)
+                        elif hasattr(self._client, 'input_text'):
+                            self._client.input_text(clip_text)
+                except Exception as e:
+                    self._log("DEBUG", f"Paste failed: {e}")
+                return
+            return super().keyPressEvent(event)
+
+        # Android system / navigation keys
         if key == Qt.Key.Key_Escape:
             self._client.press_key(KEYCODE_BACK)
             return
@@ -2055,21 +2092,47 @@ class ScrcpyMirrorWindow(QMainWindow):
             self._client.press_key(KEYCODE_APP_SWITCH)
             return
 
-        # D-pad/arrow key support
-        if key == Qt.Key.Key_Up or key == Qt.Key.Key_W:
+        # Text editing & control keys
+        if key == Qt.Key.Key_Backspace:
+            self._client.press_key(KEYCODE_DEL)
+            return
+        if key == Qt.Key.Key_Delete:
+            self._client.press_key(KEYCODE_FORWARD_DEL)
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._client.press_key(KEYCODE_ENTER)
+            return
+        if key == Qt.Key.Key_Tab:
+            self._client.press_key(KEYCODE_TAB)
+            return
+        if key == Qt.Key.Key_Space:
+            self._client.press_key(KEYCODE_SPACE)
+            return
+
+        # Directional navigation (arrow keys only - WASD are standard typing characters)
+        if key == Qt.Key.Key_Up:
             self._client.press_key(KEYCODE_DPAD_UP)
             return
-        if key == Qt.Key.Key_Down or key == Qt.Key.Key_S:
+        if key == Qt.Key.Key_Down:
             self._client.press_key(KEYCODE_DPAD_DOWN)
             return
-        if key == Qt.Key.Key_Left or key == Qt.Key.Key_A:
+        if key == Qt.Key.Key_Left:
             self._client.press_key(KEYCODE_DPAD_LEFT)
             return
-        if key == Qt.Key.Key_Right or key == Qt.Key.Key_D:
+        if key == Qt.Key.Key_Right:
             self._client.press_key(KEYCODE_DPAD_RIGHT)
             return
-        if key == Qt.Key.Key_Enter or key == Qt.Key.Key_Return or key == Qt.Key.Key_Space:
-            self._client.press_key(KEYCODE_DPAD_CENTER)
+
+        # Regular text typing (letters, digits, punctuation, symbols, unicode)
+        txt = event.text()
+        if txt and txt.isprintable():
+            try:
+                if hasattr(self._client, 'input_text'):
+                    self._client.input_text(txt)
+                else:
+                    self._client.press_key(KEYCODE_SPACE if txt == ' ' else KEYCODE_ENTER)
+            except Exception as e:
+                self._log("DEBUG", f"input_text failed: {e}")
             return
 
         super().keyPressEvent(event)
