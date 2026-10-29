@@ -538,14 +538,18 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
 
         fast_btn = QPushButton("⚡ Fast")
         fast_btn.setToolTip("2 Mbps / 30 fps / 800px — for slow remote/seat connections (embedded)")
-        fast_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=2_000_000,
-                                                                  max_fps=30, max_size=800))
+        fast_btn.clicked.connect(lambda: self._open_mirror_window(
+            bitrate=2_000_000, max_fps=30, max_size=800,
+            seat_context=self.seat_port_manager and self._device_to_seat_context(self.current_device or ""))
+        )
         scrcpy_row.addWidget(fast_btn)
 
         normal_btn = QPushButton("🎬 Normal")
         normal_btn.setToolTip("8 Mbps / 60 fps / 1024px — embedded mirror (decent quality)")
-        normal_btn.clicked.connect(lambda: self._open_mirror_window(bitrate=8_000_000,
-                                                                   max_fps=60, max_size=1024))
+        normal_btn.clicked.connect(lambda: self._open_mirror_window(
+            bitrate=8_000_000, max_fps=60, max_size=1024,
+            seat_context=self.seat_port_manager and self._device_to_seat_context(self.current_device or ""))
+        )
         scrcpy_row.addWidget(normal_btn)
 
         scrcpy_row.addStretch()
@@ -878,7 +882,10 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         self.mirror_separate_btn.setFixedHeight(26)
         self.mirror_separate_btn.setToolTip(
             "Open mirror in a separate window with recording options")
-        self.mirror_separate_btn.clicked.connect(lambda: self._open_mirror_window())
+        self.mirror_separate_btn.clicked.connect(
+            lambda: self._open_mirror_window(
+                seat_context=self.seat_port_manager and self._device_to_seat_context(self.current_device or ""))
+        )
         self.mirror_separate_btn.setVisible(False)
         log_controls.addWidget(self.mirror_separate_btn)
 

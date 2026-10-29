@@ -39,6 +39,206 @@ except ImportError:
     _check_embedded_mirror = None
 
 
+def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
+                       timeout=2.5):
+    """Run scrcpy_canary.py as a subprocess to probe py_scrcpy_sdk.
+
+    Returns ``(ok, exit_code_or_signal, detail)``:
+      * ``ok=True``  → canary survived past first frame (or past timeout
+                       with the listener alive). Proceed with the real
+                       mirror window.
+      * ``ok=False`` → canary died (negative exit = signal N, positive =
+                       Python exception). Detail is a short human-readable
+                       string for the dialog.
+
+    The canary is the same module the real mirror would use, but in a
+    short-lived process. Native crashes (SIGSEGV / SIGABRT) that would
+    take down our GUI take down only the canary instead. Python-level
+    exceptions are caught and reflected as a non-zero exit code so we
+    never confuse them with success.
+
+    Disable via env var ``ADB_GUI_SKIP_SCRCPY_CANARY=1`` for bisecting.
+    """
+    if os.environ.get("ADB_GUI_SKIP_SCRCPY_CANARY") == "1":
+        return True, 0, "skipped via env"
+
+    import json as _json
+    cmd = [_json.dumps({
+        "device_id": device_id,
+        "adb_path": adb_path or "adb",
+        "bitrate": int(bitrate),
+        "max_fps": int(max_fps),
+        "max_size": int(max_size),
+    }) + "\n"]
+
+    # Use the same Python interpreter we're running under so PyQt6,
+    # py_scrcpy_sdk, and the bundled cv2 stub all resolve identically.
+    here = os.path.dirname(os.path.abspath(__file__))
+    canary_script = os.path.join(here, "scrcpy_canary.py")
+
+    # CREATE_NO_WINDOW on Windows so no console pops up. On macOS/Linux
+    # start_new_session so a SIGINT to the GUI doesn't kill the canary
+    # before it finishes its 1.5 s run.
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    else:
+        kwargs["start_new_session"] = True
+
+    stderr_lines = []
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, canary_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            **kwargs,
+        )
+    except Exception as e:
+        # Can't even spawn — don't block the user.
+        return True, 0, f"canary spawn failed: {e}"
+
+    try:
+        proc.stdin.write(cmd[0])
+        proc.stdin.flush()
+        proc.stdin.close()
+    except Exception:
+        pass
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Canary still alive past the timeout — that's success (it
+        # would have crashed in the first second if it were going to).
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return True, 0, "alive past timeout"
+
+    # Drain stderr so the parent doesn't deadlock on a full pipe.
+    try:
+        if proc.stderr is not None:
+            stderr_lines = proc.stderr.read().splitlines()
+    except Exception:
+        pass
+
+    rc = proc.returncode
+    # Negative return code on POSIX means killed by signal:
+    #   rc = -SIGSEGV  → -11  → "signal 11 (SIGSEGV)"
+    # Positive return codes come from our own sys.exit(N).
+    if rc == 0:
+        return True, 0, "ok"
+
+    if rc < 0:
+        import signal as _sig
+        try:
+            signame = _sig.Signals(-rc).name
+        except (ValueError, AttributeError):
+            signame = f"signal {-rc}"
+        detail = f"{signame} (canary subprocess)"
+        # Pull the last JSON error line if any.
+        for line in reversed(stderr_lines):
+            if '"kind": "error"' in line:
+                try:
+                    j = _json.loads(line)
+                    detail = f"{signame}: {j.get('msg', '')[:120]}"
+                except Exception:
+                    pass
+                break
+        return False, rc, detail
+
+    # rc > 0 — Python exception in the canary
+    detail = "canary raised an exception"
+    for line in reversed(stderr_lines):
+        if '"kind": "error"' in line:
+            try:
+                j = _json.loads(line)
+                detail = j.get("msg", detail)[:200]
+            except Exception:
+                pass
+            break
+        # Plain Python traceback tail (last line)
+        if line.strip().startswith(("AdbError", "Error", "Exception")):
+            detail = line.strip()[:200]
+    return False, rc, detail
+
+
+def _show_canary_failure_dialog(parent, device_id):
+    """Show Retry / Open Native / Close when the canary died.
+
+    Uses a plain QDialog (not QMessageBox.exec()) so we sidestep the
+    Qt 6.11/macOS 26 QTextEngine::validate() NULL-deref that bites
+    QMessageBox inside button slots. See safe_dialog.py for the same
+    pattern. Three buttons — user can always escape.
+    """
+    from PyQt6.QtWidgets import (
+        QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+        QDialogButtonBox,
+    )
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Mirror Unavailable")
+    dlg.setModal(True)
+    dlg.setMinimumWidth(420)
+
+    layout = QVBoxLayout(dlg)
+    layout.setContentsMargins(16, 12, 16, 12)
+    layout.setSpacing(10)
+
+    msg = QLabel(
+        "The embedded mirror crashed during initialization in a probe "
+        "subprocess. The main app is fine — only the probe died.\n\n"
+        "This is a known intermittent issue with py-scrcpy-sdk on macOS "
+        "(native library conflict). Try Open Native scrcpy for a "
+        "different code path, or Retry to launch the embedded mirror "
+        "again.",
+        dlg,
+    )
+    msg.setWordWrap(True)
+    layout.addWidget(msg)
+
+    btns = QDialogButtonBox(dlg)
+    retry_btn = btns.addButton("Retry", QDialogButtonBox.ButtonRole.AcceptRole)
+    native_btn = btns.addButton("Open Native scrcpy",
+                                 QDialogButtonBox.ButtonRole.ActionRole)
+    close_btn = btns.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
+    layout.addWidget(btns)
+
+    # Each button sets a distinct done() code so we know which was clicked
+    # after exec() returns. Don't use accepted/rejected — they collide when
+    # the user presses Enter on the default button.
+    retry_btn.clicked.connect(lambda: dlg.done(1))
+    native_btn.clicked.connect(lambda: dlg.done(2))
+    close_btn.clicked.connect(lambda: dlg.done(0))
+    code = dlg.exec()
+
+    if code == 1:
+        # Retry: re-invoke _open_mirror_window on the parent. Use the
+        # same defaults the user originally clicked with — find the
+        # caller's kwargs by re-deriving from the parent. We only have
+        # device_id here, so use the conservative defaults. The user
+        # can re-pick Fast/Normal afterwards.
+        try:
+            parent._open_mirror_window(device_id=device_id)
+        except Exception:
+            pass
+    elif code == 2:
+        # Open Native scrcpy — totally separate binary, no py_scrcpy_sdk.
+        try:
+            parent.scrcpy_device(device_id=device_id)
+        except Exception:
+            pass
+
+
 class ScrcpyMixin:
     """Mixin class providing scrcpy screen mirroring functionality."""
 
@@ -303,7 +503,7 @@ class ScrcpyMixin:
             self.logs_view = 'screen'
             self._start_in_window_mirror()
 
-    def _open_mirror_window(self, device_id=None, bitrate=8_000_000,
+    def _open_mirror_window(self, device_id=None, bitrate=3_000_000,
                             max_fps=60, max_size=1024, seat_context=None):
         """Open the mirror in a separate window with recording options.
 
@@ -313,7 +513,7 @@ class ScrcpyMixin:
 
         Args:
             device_id: Optional device ID to mirror. Defaults to self.current_device.
-            bitrate: Bitrate in bps. Defaults to 8 Mbps — embedded mirror quality.
+            bitrate: Bitrate in bps. Defaults to 3 Mbps — embedded mirror quality.
                 For best text quality, use native scrcpy via "Open Scrcpy" button.
                 Use 2 Mbps for bandwidth-sensitive seat/remote mirroring.
             max_fps: Max frames per second. Defaults to 60 to match typical
@@ -348,18 +548,37 @@ class ScrcpyMixin:
                     "Install: pip install py-scrcpy-sdk opencv-python-headless imageio"))
                 return
 
-        # The body of this function actually constructs and shows the
-        # ScrcpyMirrorWindow. We schedule it via singleShot(0) so the
-        # caller's button-slot handler fully unwinds before any Qt
-        # window/NSWindow is allocated. Running the construction
-        # synchronously from inside a button click occasionally triggers
-        # "QPaintDevice: Cannot destroy paint device that is being painted"
-        # → SIGSEGV on macOS, because Qt repaints/widgets parented to the
-        # clicked button can fire while the new window is being created.
-        # Deferring is the same pattern already used for the in-panel
-        # mirror (toggle_screen_view → _start_in_window_mirror) and for
-        # the QMessageBox.safe_* dialogs in this same file.
-        adb_path = getattr(self.adb, 'adb_path', 'adb')
+        # Canary probe — run py_scrcpy_sdk in a short-lived subprocess
+        # before we commit to building a real mirror window. If the SDK
+        # SIGSEGVs (FFmpeg init, libavdevice.dylib duplicate-class on
+        # macOS, etc.), only the canary dies — our GUI stays up and the
+        # user gets Retry / Open Native / Close instead of a process
+        # crash. ~2.5 s on success, ~0.3 s on a real failure because
+        # the crash is immediate. See scrcpy_canary.py for the rationale.
+        adb_path = getattr(self.adb, "adb_path", "adb")
+        canary_ok, _canary_rc, canary_detail = _run_scrcpy_canary(
+            device_id=device_id,
+            adb_path=adb_path,
+            bitrate=bitrate,
+            max_fps=max_fps,
+            max_size=max_size,
+        )
+        if not canary_ok:
+            self.log(
+                f"scrcpy canary crashed: {canary_detail} — "
+                f"refusing to open mirror window in-process",
+                "ERROR",
+            )
+            # Defer + safe dialog (Qt 6.11/macOS 26 QTextEngine crash —
+            # see safe_dialog.py for the full rationale). The dialog
+            # offers Retry (re-runs the canary), Open Native scrcpy
+            # (separate code path, doesn't touch py_scrcpy_sdk), and
+            # Close.
+            QTimer.singleShot(
+                0,
+                lambda did=device_id: _show_canary_failure_dialog(self, did),
+            )
+            return
 
         # Workaround adb 1.0.41 bug where 'adb reverse' fails with
         # 'more than one device/emulator' on localhost:PORT connections.
@@ -525,7 +744,46 @@ class ScrcpyMixin:
     def _launch_scrcpy_for_device(self, device_id):
         """Open mirror window for a specific device (local — uses defaults)."""
         # Inherits the local defaults: 3 Mbps / 60 fps.
-        self._open_mirror_window(device_id=device_id)
+        seat_context = self._device_to_seat_context(device_id)
+        self._open_mirror_window(device_id=device_id, seat_context=seat_context)
+
+    def _device_to_seat_context(self, device_id):
+        """Map a device_id (e.g., localhost:65432) to a seat name/rack for the window title if it came from a seat.
+
+        Returns:
+            Optional seat name (str or None). When not None, the mirror window will show extended seat/rack/IP info in its title.
+        """
+        # Fast bail: only local host/port connections come via seats
+        if not device_id or not isinstance(device_id, str):
+            return None
+        # Check localhost:PORT, 127.0.0.1:PORT, and localhost:localhost:PORT
+        if not any(x in device_id for x in ('localhost:', '127.0.0.1:')):
+            return None
+        # Extract the port part(s)
+        import re
+        m = re.search(r':(\d+(?::\d+)?)$', device_id)
+        if not m:
+            return None
+        port_str = m.group(1)
+        # Try to find a seat history entry whose port matches. Prefer exact match on 'PORT'
+        # but also allow ':PORT:PORT' (nested reverse tunneling).
+        seat_history = self.seat_port_manager.load_history('seat')
+        if not seat_history:
+            return None
+        # Single port first
+        if ':' not in port_str:
+            target_port = port_str
+            for entry in seat_history:
+                if entry.get('port') == target_port:
+                    return entry.get('seat')
+        # Nested port (outer port unique in history)
+        else:
+            outer_port = port_str.split(':')[0]
+            for entry in seat_history:
+                if entry.get('port') == outer_port:
+                    return entry.get('seat')
+        # No match
+        return None
 
     def find_scrcpy(self):
         """Find scrcpy executable (PATH + common locations)."""
@@ -701,6 +959,12 @@ class ScrcpyMixin:
 
     def _on_mirror_init(self, device_name):
         """Mirror connected — enable nav buttons and attach client."""
+        # The listener thread can emit init_done slightly after the
+        # user stopped the mirror (e.g. they switched back to the
+        # logs panel). Bail before touching Qt attributes to avoid
+        # SIGSEGV on a stale mirror_video / nav_buttons.
+        if getattr(self, 'mirror_closing', False):
+            return
         try:
             res = ""
             if self.mirror_client and self.mirror_client.codec_meta:
@@ -716,6 +980,11 @@ class ScrcpyMixin:
 
     def _on_mirror_error(self, error_msg):
         """Mirror error — log it and switch back to logs."""
+        # The listener thread can emit error slightly after the user
+        # stopped the mirror. Bail before touching Qt/status bar to
+        # avoid working on stale state.
+        if getattr(self, 'mirror_closing', False):
+            return
         try:
             # Stop the watchdog so it doesn't fire after the user already saw this.
             self._stop_mirror_watchdog()

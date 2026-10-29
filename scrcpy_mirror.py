@@ -1269,11 +1269,35 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def _start_client(self):
         """Create and start the ScrcpyClient, then listen for frames."""
+        # CRITICAL: bail immediately if the window has been closed.
+        # ``QTimer.singleShot(0, self._start_client)`` may have been
+        # scheduled in __init__ *before* the user closed the window.
+        # By the time this tick fires the C++ QMainWindow (and its
+        # child widgets — QStatusBar, QComboBox, VideoDisplayWidget, …)
+        # has been deleted. Any subsequent Qt access (self.status,
+        # self.video, signal.emit) dereferences freed memory and
+        # SIGSEGVs the process. Python's ``except RuntimeError`` does
+        # NOT catch a native segfault — there's no Python frame to
+        # long-jump out of.
+        if self._closing:
+            self._log("DEBUG", "_start_client: window already closing — aborting")
+            return
         self._log("DEBUG", f"_start_client() called for {self.device_id}")
         ok, msg = _check_deps()
         if not ok:
-            QMessageBox.warning(self, "Dependencies Missing", msg)
-            self.close()
+            # _start_client is always invoked via QTimer.singleShot(0,
+            # ...) so we're already outside the originating button
+            # slot — no need for a further singleShot here. Guard the
+            # QMessageBox anyway in case Qt re-introduces the text-
+            # engine race in a future version.
+            try:
+                QMessageBox.warning(self, "Dependencies Missing", msg or "scrcpy dependencies missing")
+            except RuntimeError:
+                pass
+            try:
+                self.close()
+            except RuntimeError:
+                pass
             return
 
         # Eagerly import py_scrcpy_sdk and av in the MAIN THREAD before
@@ -1470,6 +1494,11 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def _on_frame(self, frame_array):
         """Receive a frame in the Qt main thread and render it."""
+        # Listener thread can still emit a frame after the window has
+        # been closed (closeEvent's disconnect isn't instantaneous).
+        # Bail before touching Qt widgets to avoid SIGSEGV.
+        if self._closing:
+            return
         try:
             import time as _time
             self.video.update_frame(frame_array)
@@ -1498,6 +1527,12 @@ class ScrcpyMirrorWindow(QMainWindow):
 
     def _on_init(self, device_name):
         """Server is ready — enable buttons, resize to match device aspect ratio."""
+        # The listener thread can emit init_done slightly after the user
+        # closes the window — the C++ QMainWindow (and its child widgets)
+        # is gone by the time this slot runs. Bail before touching any
+        # Qt attribute to avoid SIGSEGV.
+        if self._closing:
+            return
         try:
             res = ""
             if self._client and self._client.codec_meta:
@@ -1642,6 +1677,13 @@ class ScrcpyMirrorWindow(QMainWindow):
         )
 
         def _restart():
+            # The auto-retry path uses QTimer.singleShot(..., _restart),
+            # so this can fire AFTER the user has closed the window and
+            # the C++ QMainWindow has been destroyed. Bail first to
+            # avoid touching any Qt attribute on a freed object →
+            # SIGSEGV. _start_client has its own _closing check too,
+            # but stopping here also avoids running _stop_frame_watchdog
+            # which manipulates a QTimer whose parent may be gone.
             if self._closing:
                 return
             self._stop_frame_watchdog()
@@ -1915,6 +1957,11 @@ class ScrcpyMirrorWindow(QMainWindow):
 
         All UI updates (status bar, dialogs) happen here on the main thread.
         """
+        # The screenshot worker can finish AFTER the user closed the
+        # mirror window — the queued singleShot(0, self._on_screenshot_done)
+        # can fire on a deleted QMainWindow. Bail to avoid SIGSEGV.
+        if self._closing:
+            return
         if not ok:
             # If pull failed, the screencap file may still be sitting on
             # the device — try to clean it up so we don't leave litter.
@@ -1928,18 +1975,30 @@ class ScrcpyMirrorWindow(QMainWindow):
                     )
                 except Exception:
                     pass
-            self.status.showMessage(f"Screenshot failed: {error}")
-            QMessageBox.warning(
-                self, "Screenshot Failed",
-                f"Failed to take screenshot:\n{error}",
-            )
+            try:
+                self.status.showMessage(f"Screenshot failed: {error}")
+            except RuntimeError:
+                pass
+            try:
+                QMessageBox.warning(
+                    self, "Screenshot Failed",
+                    f"Failed to take screenshot:\n{error}",
+                )
+            except RuntimeError:
+                pass
             return
 
-        self.status.showMessage(f"Screenshot saved: {filename}")
-        QMessageBox.information(
-            self, "Screenshot Saved",
-            f"Screenshot saved to:\n{dest_path}",
-        )
+        try:
+            self.status.showMessage(f"Screenshot saved: {filename}")
+        except RuntimeError:
+            pass
+        try:
+            QMessageBox.information(
+                self, "Screenshot Saved",
+                f"Screenshot saved to:\n{dest_path}",
+            )
+        except RuntimeError:
+            pass
 
     # ──────────────────────────────────────────────────────────────────
     #  Keyboard shortcuts
@@ -1986,26 +2045,32 @@ class ScrcpyMirrorWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # Mark the window as closing FIRST so any concurrent
+        # background-thread callbacks (the listener thread, the auto-
+        # retry timer, _start_client ticks) can bail before they touch
+        # any Qt attribute. ``_closing`` is the single source of truth
+        # for "the C++ QMainWindow is going away".
         self._closing = True
         # Stop the frame-arrival watchdog so it doesn't fire on a deleted widget
         self._stop_frame_watchdog()
         # Disconnect signals so no more callbacks fire on a deleted widget.
-        try:
-            self.signal.frame_ready.disconnect(self._on_frame)
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            self.signal.init_done.disconnect(self._on_init)
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            self.signal.error.disconnect(self._on_error)
-        except (TypeError, RuntimeError):
-            pass
-        try:
-            self.signal.disconnected.disconnect(self._on_disconnect)
-        except (TypeError, RuntimeError):
-            pass
+        # IMPORTANT: also disconnect error_retry and auto_retry — both
+        # of those slots schedule a QTimer.singleShot(0, self._start_client)
+        # which would otherwise fire on the deleted C++ QMainWindow and
+        # SIGSEGV.
+        for sig, slot in (
+            (self.signal.frame_ready,     self._on_frame),
+            (self.signal.init_done,       self._on_init),
+            (self.signal.error,           self._on_error),
+            (self.signal.error_retry,     self._on_error),  # bound method shared with .error
+            (self.signal.auto_retry,      self._on_auto_retry),
+            (self.signal.disconnected,    self._on_disconnect),
+        ):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                # Already disconnected or never connected — that's fine.
+                pass
         if self._client is not None:
             try:
                 self._client.stop()
