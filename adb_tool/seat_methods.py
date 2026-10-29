@@ -2641,203 +2641,40 @@ class SeatMixin:
         """Instance-method wrapper so callers can do ``self._read_arp_table()``."""
         return _read_arp_table()
 
-    def _ssh_run_arp_on_gateway(self, gateway_user, gateway_host, password):
-        """SSH into the gateway and run `arp -a` to discover connected seats.
-
-        Returns dict {name: ip} like _read_arp_table() but from the gateway's
-        network, not the local machine. Honours ``~/.ssh/config`` ProxyCommand
-        (so ``*.vrack`` hosts tunnel via the configured jump host).
-        """
-        import paramiko
-        arp_entries = {}
-
-        # Resolve ProxyCommand / User / Port from ~/.ssh/config so vrack
-        # gateways (which SSH-over-HTTPS through a jump host) work.
-        cfg_user, cfg_host, cfg_port, proxy_cmd = _lookup_ssh_config(gateway_host)
-        if cfg_user and not gateway_user:
-            gateway_user = cfg_user
-        if cfg_host:
-            gateway_host = cfg_host
-
-        sock = None
-        proc = None
-        if proxy_cmd:
-            try:
-                # Split the proxy command into argv (shlex honours quoted args).
-                proxy_argv = shlex.split(proxy_cmd)
-                proc = subprocess.Popen(
-                    proxy_argv,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=0,
-                )
-                sock = _ProxySocket(proc)
-            except Exception as e:
-                self.log(f"ProxyCommand setup failed: {e}", "DEBUG")
-                sock = None
-                try:
-                    if proc is not None:
-                        proc.kill()
-                except Exception:
-                    pass
-
-        client = None
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            connect_kwargs = dict(
-                username=gateway_user,
-                password=password,
-                timeout=8, banner_timeout=8, auth_timeout=8,
-                allow_agent=False, look_for_keys=False,
-            )
-            if cfg_port:
-                connect_kwargs['port'] = cfg_port
-            if sock is not None:
-                connect_kwargs['sock'] = sock
-
-            client.connect(gateway_host, **connect_kwargs)
-
-            stdin, stdout, stderr = client.exec_command('arp -a', timeout=8)
-            # Read stdout with a hard total budget, using Channel.recv_ready()
-            # instead of select.select([channel],...) — the latter is fragile on
-            # macOS where paramiko.Channel.fileno() can race with the channel
-            # lifecycle, leaving the worker thread blocked until the channel
-            # timeout fires (which makes the dialog look "stuck on Loading").
-            ch = stdout.channel
-            ch.settimeout(2)  # per-recv bound; combined with the total budget below
-            chunks = []
-            start = time.time()
-            MAX_BUDGET = 5.0  # seconds; hard ceiling for the whole read
-            while time.time() - start < MAX_BUDGET:
-                if ch.recv_ready():
-                    try:
-                        chunk = ch.recv(4096)
-                    except socket.timeout:
-                        break
-                    if not chunk:
-                        break  # EOF
-                    chunks.append(chunk)
-                    continue
-                # No data ready right now. If the remote command has exited
-                # and the channel is at EOF, recv_ready() stays False and
-                # channel.exit_status_ready() becomes True — drain once more
-                # then break.
-                if ch.exit_status_ready():
-                    # Final drain — anything still buffered.
-                    while ch.recv_ready():
-                        tail = ch.recv(4096)
-                        if not tail:
-                            break
-                        chunks.append(tail)
-                    break
-                # Brief sleep so we don't busy-loop; total budget still
-                # bounded above.
-                time.sleep(0.05)
-            out = b''.join(chunks).decode('utf-8', 'replace') if chunks else ''
-
-            # Bound stderr too — channel timeout above caps each read; if
-            # the remote never closes stderr we'll bail after this loop
-            # rather than blocking forever.
-            err_chunks = []
-            estart = time.time()
-            while time.time() - estart < 2.0:
-                try:
-                    if stderr.channel.recv_ready():
-                        d = stderr.channel.recv_stderr(4096)
-                        if not d:
-                            break
-                        err_chunks.append(d)
-                        continue
-                    if stderr.channel.exit_status_ready():
-                        break
-                except socket.timeout:
-                    break
-                time.sleep(0.05)
-            err = b''.join(err_chunks).decode('utf-8', 'replace') if err_chunks else ''
-
-            if err:
-                self.log(f"Gateway arp -a error: {err}", "DEBUG")
-
-            for line in out.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                name = line.split(None, 1)[0] if line else ""
-                ip = None
-                if '(' in line and ')' in line:
-                    inside = line.split('(', 1)[1].split(')', 1)[0].strip()
-                    if _is_dotted_quad(inside):
-                        ip = inside
-                if ip and name:
-                    arp_entries[name] = ip
-
-        except Exception as e:
-            error_msg = f"Remote arp failed: {e}"
-            self.log(error_msg, "DEBUG")
-        finally:
-            try:
-                if client is not None:
-                    client.close()
-            except Exception:
-                pass
-            try:
-                if sock is not None:
-                    sock.close()
-            except Exception:
-                pass
-            try:
-                if proc is not None and proc.poll() is None:
-                    proc.kill()
-            except Exception:
-                pass
-
-        return arp_entries
-
     def _ssh_run_arp_via_gateway_explorer(self, gateway_user, gateway_host, password):
         """SSH into the gateway and run `arp -a` using the SAME approach as
         the Gateway Explorer (which the user confirmed works).
 
         Uses `_ssh_connect` from GatewayMixin (paramiko.ProxyCommand from
         ~/.ssh/config), opens a session, runs `arp -a`, parses output.
-        Returns dict {name: ip}.
+        Returns ``(arp_entries_dict, error_str)`` so the caller can show a
+        real error in the dialog hint instead of silently falling back to a
+        sparse local arp table.
         """
         arp_entries = {}
         client = None
+        err = None
         try:
             # Mirror open_gateway_explorer() exactly:
-            client, _err = self._ssh_connect(gateway_host, gateway_user, password)
+            client, connect_err = self._ssh_connect(gateway_host, gateway_user, password)
             if client is None:
-                # _ssh_connect already returned a descriptive error string.
-                self.log(f"Seat scan SSH connect failed: {_err}", "DEBUG")
-                return arp_entries
-            # Run arp -a with a bounded timeout (channel + total budget).
-            import time
-            stdin, stdout, stderr = client.exec_command('arp -a', timeout=10)
-            ch = stdout.channel
-            ch.settimeout(2)
-            chunks = []
-            start = time.time()
-            while time.time() - start < 5.0:
-                if ch.recv_ready():
-                    try:
-                        d = ch.recv(4096)
-                    except Exception:
-                        break
-                    if not d:
-                        break
-                    chunks.append(d)
-                    continue
-                if ch.exit_status_ready():
-                    while ch.recv_ready():
-                        d = ch.recv(4096)
-                        if not d:
-                            break
-                        chunks.append(d)
-                    break
-                time.sleep(0.05)
-            out = b''.join(chunks).decode('utf-8', 'replace') if chunks else ''
+                err = connect_err or "SSH connect failed"
+                self.log(f"Seat scan SSH connect failed: {err}", "DEBUG")
+                return arp_entries, err
+
+            # Run arp -a with a generous timeout. exec_command(timeout=…)
+            # bounds the whole read; .read() then drains whatever is
+            # buffered without racing on channel state.
+            stdin, stdout, stderr = client.exec_command('arp -a', timeout=15)
+            try:
+                exit_code = stdout.channel.recv_exit_status()
+            except Exception:
+                exit_code = -1
+            out = stdout.read().decode('utf-8', 'replace')
+            err_bytes = stderr.read().decode('utf-8', 'replace') if stderr else ''
+
+            if err_bytes:
+                self.log(f"Gateway arp -a stderr: {err_bytes.strip()}", "DEBUG")
 
             # Parse arp output the same way _read_arp_table() does.
             for line in out.splitlines():
@@ -2852,15 +2689,23 @@ class SeatMixin:
                         ip = inside
                 if ip and name:
                     arp_entries[name] = ip
+
+            if not arp_entries and not out.strip():
+                err = "Remote arp -a returned no output"
+                self.log(f"Seat scan: {err}", "DEBUG")
+            elif not arp_entries:
+                err = f"Remote arp -a returned {len(out.splitlines())} lines but no parseable IPs"
+                self.log(f"Seat scan: {err}", "DEBUG")
         except Exception as e:
-            self.log(f"Seat scan: SSH arp failed: {e}", "DEBUG")
+            err = f"SSH arp failed: {e}"
+            self.log(f"Seat scan: {err}", "DEBUG")
         finally:
             if client is not None:
                 try:
                     client.close()
                 except Exception:
                     pass
-        return arp_entries
+        return arp_entries, err
 
     def _show_add_seat_dialog(self):
         """Show dialog to connect to a new seat. Gateway field comes first;
@@ -3102,24 +2947,22 @@ class SeatMixin:
                 source = "none"
                 error_msg = None
                 try:
-                    remote = self._ssh_run_arp_via_gateway_explorer(
+                    remote, ssh_err = self._ssh_run_arp_via_gateway_explorer(
                         gateway_user, gateway_host, gw_password
                     )
                     if remote:
-                        # Return only the IP address (what we need for seat connection).
-                        # arp -a output: "hostname (ip)" — extract just the IP.
-                        def _ip_key(entry):
-                            try:
-                                return tuple(int(p) for p in entry[1].split('.'))
-                            except Exception:
-                                return (0, 0, 0, 0)
+                        # Sort by IP, return only the IP (what we need for
+                        # seat connection). arp -a output: "hostname (ip)".
                         for ip in sorted(remote.values(), key=lambda x: (
                             tuple(int(p) for p in x.split('.')) if _is_dotted_quad(x) else (0,0,0,0)
                         )):
-                            suggestions.append(ip)
+                            if _is_dotted_quad(ip):
+                                suggestions.append(ip)
                         source = "gateway"
                     else:
                         self.log("Remote arp returned no entries; falling back to local", "DEBUG")
+                        if ssh_err:
+                            error_msg = ssh_err
                 except Exception as e:
                     error_msg = f"Remote arp failed: {e}"
                     self.log(error_msg, "DEBUG")
@@ -3142,7 +2985,7 @@ class SeatMixin:
                     seat_cache[gateway_host] = suggestions
                 update_seat_combo(suggestions)
                 search_btn.setEnabled(True)
-                if source == "none":
+                if not suggestions:
                     if error_msg:
                         self.log(f"Seat scan: {error_msg}", "WARNING")
                         hint.setText(
@@ -3152,7 +2995,18 @@ class SeatMixin:
                         hint.setStyleSheet(f"color: {self.colors.get('error', '#cc4444')}; font-size: 9pt;")
                     else:
                         self.log("Seat scan: no entries found", "DEBUG")
-                        hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
+                        hint.setText(
+                            "⚠ Gateway arp -a returned nothing.\n"
+                            "   Gateway may have no live seats or arp isn't installed."
+                        )
+                        hint.setStyleSheet(f"color: {self.colors.get('error', '#cc4444')}; font-size: 9pt;")
+                else:
+                    # Reset hint to neutral on success.
+                    hint.setText(
+                        f"ⓘ Found {len(suggestions)} seat(s) from gateway. "
+                        "Click 🔍 to refresh."
+                    )
+                    hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
 
             # NO THREADING. Run synchronously now.
             do_scan()

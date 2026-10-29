@@ -40,7 +40,7 @@ except ImportError:
 
 
 def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
-                       timeout=2.5):
+                       timeout=0.8):
     """Run scrcpy_canary.py as a subprocess to probe py_scrcpy_sdk.
 
     Returns ``(ok, exit_code_or_signal, detail)``:
@@ -553,7 +553,7 @@ class ScrcpyMixin:
         # SIGSEGVs (FFmpeg init, libavdevice.dylib duplicate-class on
         # macOS, etc.), only the canary dies — our GUI stays up and the
         # user gets Retry / Open Native / Close instead of a process
-        # crash. ~2.5 s on success, ~0.3 s on a real failure because
+        # crash. ~0.6 s on success, ~0.3 s on a real failure because
         # the crash is immediate. See scrcpy_canary.py for the rationale.
         adb_path = getattr(self.adb, "adb_path", "adb")
         canary_ok, _canary_rc, canary_detail = _run_scrcpy_canary(
@@ -562,6 +562,7 @@ class ScrcpyMixin:
             bitrate=bitrate,
             max_fps=max_fps,
             max_size=max_size,
+            timeout=0.8,  # 0.6 s instead of 2.5 s — still catches init crashes
         )
         if not canary_ok:
             self.log(
@@ -589,8 +590,16 @@ class ScrcpyMixin:
         if hasattr(self.adb, 'ensure_reverse_tunnel_works'):
             self.adb.ensure_reverse_tunnel_works(device_id)
 
+        # Defer the actual ScrcpyMirrorWindow construction by a few
+        # event-loop ticks so any in-flight paint cycle for the clicked
+        # button completes first. A 0-ms singleShot fires inside the
+        # same QAbstractButton::mouseReleaseEvent stack → SIGSEGV via
+        # "QPaintDevice: Cannot destroy paint device that is being
+        # painted" (observed empirically on macOS — the canary passes
+        # and the crash fires *during construction*, not during SDK
+        # init). 50 ms is plenty for a paint to drain on any platform.
         QTimer.singleShot(
-            0,
+            50,
             lambda: self._open_mirror_window_impl(
                 device_id=device_id,
                 adb_path=adb_path,
