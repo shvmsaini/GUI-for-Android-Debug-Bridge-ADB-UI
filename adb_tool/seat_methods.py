@@ -2823,21 +2823,18 @@ class SeatMixin:
         client = None
         err = None
         try:
-            # Mirror open_gateway_explorer() exactly:
-            client, connect_err = self._ssh_connect(gateway_host, gateway_user, password)
+            # Connect with bounded 6s timeout to avoid freezing on bad networks
+            client, connect_err = self._ssh_connect(gateway_host, gateway_user, password, timeout=6)
             if client is None:
                 err = connect_err or "SSH connect failed"
                 self.log(f"Seat scan SSH connect failed: {err}", "DEBUG")
                 return arp_entries, err
 
-            # Run arp -a with a generous timeout. exec_command(timeout=…)
-            # bounds the whole read; .read() then drains whatever is
-            # buffered without racing on channel state.
-            stdin, stdout, stderr = client.exec_command('arp -a', timeout=15)
-            try:
-                exit_code = stdout.channel.recv_exit_status()
-            except Exception:
-                exit_code = -1
+            # Run arp -a with a bounded 6s timeout
+            stdin, stdout, stderr = client.exec_command('arp -a', timeout=6)
+            # CRITICAL: Read stdout and stderr BEFORE anything else to avoid
+            # Paramiko buffer deadlock (recv_exit_status before read() blocks forever
+            # if remote stdout buffer fills up).
             out = stdout.read().decode('utf-8', 'replace')
             err_bytes = stderr.read().decode('utf-8', 'replace') if stderr else ''
 
@@ -3074,12 +3071,15 @@ class SeatMixin:
                 update_seat_combo(seat_cache[gateway_host])
                 return
 
-            # Show "Loading..." and disable button
+            # Show "Scanning..." and disable button
             seat_combo.blockSignals(True)
             seat_combo.clear()
-            seat_combo.addItem("⏳ Loading seats from gateway...")
+            seat_combo.addItem("⏳ Scanning gateway for seats...")
+            seat_combo.setCurrentText("⏳ Scanning gateway for seats...")
             seat_combo.blockSignals(False)
             search_btn.setEnabled(False)
+            hint.setText("⏳ Connecting to gateway via SSH and scanning for seats...")
+            hint.setStyleSheet(f"color: {self.colors['accent']}; font-size: 9pt;")
 
             # Try to get a cached password (per-gateway, with global
             # fallback). If neither exists, prompt once and cache both
@@ -3094,6 +3094,8 @@ class SeatMixin:
                 if not ok or not gw_password:
                     search_btn.setEnabled(True)
                     update_seat_combo([])
+                    hint.setText("ⓘ Click 🔍 to SSH into the gateway and fetch seats via `arp -a`.")
+                    hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
                     return
                 try:
                     self.credential_manager.set_password(gateway_host, gateway_user, gw_password)
@@ -3103,30 +3105,24 @@ class SeatMixin:
                 except Exception:
                     pass
 
-            def do_scan():
-                """Run remote arp first, fall back to local arp on failure.
+            def do_scan_worker():
+                """Run remote arp in background thread with bounded timeouts.
 
-                Runs synchronously on the GUI thread. The dialog blocks for
-                ~8s during the scan. Mirrors the gateway explorer approach
-                (uses _ssh_connect from GatewayMixin) but stays on the GUI
-                thread to avoid PyQt6 cross-thread marshaling bugs.
+                Never blocks the GUI thread. If gateway is slow or unreachable,
+                the background thread finishes without locking up the app.
                 """
                 suggestions = []
-                source = "none"
                 error_msg = None
                 try:
                     remote, ssh_err = self._ssh_run_arp_via_gateway_explorer(
                         gateway_user, gateway_host, gw_password
                     )
                     if remote:
-                        # Sort by IP, return only the IP (what we need for
-                        # seat connection). arp -a output: "hostname (ip)".
                         for ip in sorted(remote.values(), key=lambda x: (
                             tuple(int(p) for p in x.split('.')) if _is_dotted_quad(x) else (0,0,0,0)
                         )):
                             if _is_dotted_quad(ip):
                                 suggestions.append(ip)
-                        source = "gateway"
                     else:
                         self.log("Remote arp returned no entries; falling back to local", "DEBUG")
                         if ssh_err:
@@ -3143,41 +3139,44 @@ class SeatMixin:
                         )):
                             if ip and _is_dotted_quad(ip):
                                 suggestions.append(ip)
-                        if suggestions:
-                            source = "local"
                     except Exception:
                         pass
 
-                # Apply result directly (GUI thread)
-                if gateway_host not in seat_cache:
-                    seat_cache[gateway_host] = suggestions
-                update_seat_combo(suggestions)
-                search_btn.setEnabled(True)
-                if not suggestions:
-                    if error_msg:
-                        self.log(f"Seat scan: {error_msg}", "WARNING")
-                        hint.setText(
-                            f"⚠ Seat scan failed: {error_msg}\n"
-                            "   Check VPN / gateway connectivity, then click 🔍 again."
-                        )
-                        hint.setStyleSheet(f"color: {self.colors.get('error', '#cc4444')}; font-size: 9pt;")
-                    else:
-                        self.log("Seat scan: no entries found", "DEBUG")
-                        hint.setText(
-                            "⚠ Gateway arp -a returned nothing.\n"
-                            "   Gateway may have no live seats or arp isn't installed."
-                        )
-                        hint.setStyleSheet(f"color: {self.colors.get('error', '#cc4444')}; font-size: 9pt;")
-                else:
-                    # Reset hint to neutral on success.
-                    hint.setText(
-                        f"ⓘ Found {len(suggestions)} seat(s) from gateway. "
-                        "Click 🔍 to refresh."
-                    )
-                    hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
+                def on_finish():
+                    try:
+                        if not dialog.isVisible():
+                            return
+                        if gateway_host not in seat_cache and suggestions:
+                            seat_cache[gateway_host] = suggestions
+                        update_seat_combo(suggestions)
+                        search_btn.setEnabled(True)
+                        if not suggestions:
+                            if error_msg:
+                                self.log(f"Seat scan: {error_msg}", "WARNING")
+                                hint.setText(
+                                    f"⚠ Seat scan failed: {error_msg}\n"
+                                    "   Check VPN / gateway connectivity, then click 🔍 again."
+                                )
+                                hint.setStyleSheet(f"color: {self.colors.get('error', '#cc4444')}; font-size: 9pt;")
+                            else:
+                                self.log("Seat scan: no entries found", "DEBUG")
+                                hint.setText(
+                                    "⚠ Gateway arp -a returned nothing.\n"
+                                    "   Gateway may have no live seats or arp isn't installed."
+                                )
+                                hint.setStyleSheet(f"color: {self.colors.get('error', '#cc4444')}; font-size: 9pt;")
+                        else:
+                            hint.setText(
+                                f"ⓘ Found {len(suggestions)} seat(s) from gateway. "
+                                "Click 🔍 to refresh."
+                            )
+                            hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
+                    except (RuntimeError, AttributeError):
+                        pass
 
-            # NO THREADING. Run synchronously now.
-            do_scan()
+                self.run_on_main_thread(on_finish)
+
+            threading.Thread(target=do_scan_worker, daemon=True).start()
 
         search_btn.clicked.connect(on_search_clicked)
 

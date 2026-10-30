@@ -147,7 +147,7 @@ def main():
             _emit("first_frame")
             return False  # stop listening
 
-        client.listen(on_frame, timeout=2.0)
+        client.listen(on_frame, timeout=0.6)
         _emit("listened", got_frame=got_frame["v"])
 
         # Clean shutdown — same as the real mirror's closeEvent.
