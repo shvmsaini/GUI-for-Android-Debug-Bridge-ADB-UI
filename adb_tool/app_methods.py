@@ -482,8 +482,13 @@ class AppMixin:
                 pass
 
         # Schedule cleanup after showing completion message
+        # NOTE: QTimer.singleShot from a worker thread is silently dropped
+        # on PyQt6 (see pyqt6-singleshot-worker-thread-dropped.md). Use
+        # run_on_main_thread so the cleanup actually fires on the GUI thread.
         self.log("Scheduling cleanup of APK file on seat /tmp", "DEBUG")
-        QTimer.singleShot(2000, _cleanup)
+        self.run_on_main_thread(lambda: (
+            QTimer.singleShot(2000, _cleanup) if not getattr(self, '_closing', False) else None
+        ))
         self.update_status("Gateway: ✅ Installed")
 
     def _show_progress(self, current, total):
@@ -526,38 +531,51 @@ class AppMixin:
             msg = f"Installed {total} APK file(s) on {device_label} successfully!"
 
         try:
-            # Show completion messagebox with "Launch" option for full success
-            if installed == total and installed > 0:
-                if detected_pkg:
-                    # Auto-detected package: offer to launch it directly
-                    launch_text = (
-                        f"{msg}\n\n"
-                        f"Detected package: {detected_pkg}\n\n"
-                        f"Do you want to launch this app?"
-                    )
-                    reply = QMessageBox.question(
-                        self, "Install Complete",
-                        launch_text,
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.Yes
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
-                        self.log(f"Auto-launching detected package: {detected_pkg}", "INFO")
-                        self._launch_package(detected_pkg)
-                else:
-                    # Couldn't auto-detect: fall back to manual package entry
-                    reply = QMessageBox.question(
-                        self, "Install Complete",
-                        msg + "\n\nDo you want to launch an app?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.Yes
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
-                        self.launch_app_dialog()
-            else:
-                # Partial failure - just show simple message
-                QMessageBox.information(self, "Install Complete", msg)
-            self.log("Completion popup displayed", "INFO")
+            # Defer the QMessageBox to the next event-loop tick so it runs
+            # outside the slot's sendPostedEvents() flush. On Qt 6.11 +
+            # macOS 26, opening a modal QMessageBox with multi-line text
+            # from inside that flush window can SIGSEGV in
+            # QTextEngine::validate() (QTBUG-128437 family). See
+            # qt-6-11-macos-textengine-crash.md.
+            def _show_done():
+                try:
+                    if installed == total and installed > 0:
+                        if detected_pkg:
+                            launch_text = (
+                                f"{msg}\n\n"
+                                f"Detected package: {detected_pkg}\n\n"
+                                f"Do you want to launch this app?"
+                            )
+                            reply = QMessageBox.question(
+                                self, "Install Complete",
+                                launch_text,
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.Yes
+                            )
+                            if reply == QMessageBox.StandardButton.Yes:
+                                self.log(f"Auto-launching detected package: {detected_pkg}", "INFO")
+                                self._launch_package(detected_pkg)
+                        else:
+                            reply = QMessageBox.question(
+                                self, "Install Complete",
+                                msg + "\n\nDo you want to launch an app?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.Yes
+                            )
+                            if reply == QMessageBox.StandardButton.Yes:
+                                self.launch_app_dialog()
+                    else:
+                        QMessageBox.information(self, "Install Complete", msg)
+                    self.log("Completion popup displayed", "INFO")
+                except (RuntimeError, ReferenceError) as e:
+                    self.log(f"Could not show completion popup: {e}", "ERROR")
+                except Exception as e:
+                    self.log(f"Popup error: {e}", "ERROR")
+
+            # We're already on the GUI thread (slot was delivered via
+            # _ui_caller.call.emit or run_on_main_thread), so singleShot(0)
+            # is safe and will fire on the next event-loop turn.
+            QTimer.singleShot(0, _show_done)
         except (RuntimeError, ReferenceError) as e:
             self.log(f"Could not show completion popup: {e}", "ERROR")
         except Exception as e:

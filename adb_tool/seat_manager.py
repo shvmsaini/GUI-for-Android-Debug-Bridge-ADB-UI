@@ -474,18 +474,24 @@ class SeatPortManager:
 
         Args:
             seat: seat name (e.g. ``seat007``) — used to match the
-                ``-L *:<seat>:5555`` tunnel form.
-            gateway: optional SSH gateway host — used to also match any
-                ``-L`` or ``-J`` tunnels to that gateway (the install-key
-                ProxyJump uses ``-J``).
+                ``-L *:<seat>:5555`` auto-connect tunnel AND the
+                ``-J <gateway> mtc@<seat>`` install-key ProxyJump.
+            gateway: optional, kept for backwards compatibility. NOT
+                used as a tunnel pattern — multiple seats commonly share
+                a gateway, and using it as a pkill pattern would kill
+                the other seats' tunnels when this seat reconnects.
         """
         seat_re = re.escape(seat)
+        # Patterns are seat-scoped ONLY. If two seats use the same gateway,
+        # reconnecting seat-B must not kill seat-A's tunnel. The seat name
+        # appears in the auto-connect -L target (:seat:5555) and in the
+        # install-key ProxyJump destination (mtc@<seat>) — that's enough
+        # to uniquely identify this seat's ssh processes.
         patterns = [
-            f'ssh.*-L.*:{seat_re}:5555',  # the auto-connect -L tunnel
+            f'ssh.*-L.*:{seat_re}:5555',           # auto-connect -L tunnel
+            f'ssh.*mtc@{seat_re}\\b',              # install-key SSH into this seat
+            f'ssh.*-J.*\\s+mtc@{seat_re}\\b',      # install-key ProxyJump into this seat
         ]
-        if gateway:
-            patterns.append(f'ssh.*-J.*{re.escape(gateway)}')  # install-key ProxyJump
-            patterns.append(f'ssh.*-L.*{re.escape(gateway)}')  # any -L via this gateway
         for pat in patterns:
             try:
                 subprocess.run(

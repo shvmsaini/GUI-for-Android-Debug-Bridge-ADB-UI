@@ -443,7 +443,17 @@ class LoggingMixin:
                 except Exception as e:
                     error_msg = f"Logcat error: {str(e)}"
                     self.log(error_msg, "ERROR")
-                    self._ui_caller.call.emit(lambda: QMessageBox.critical(self, "Logcat Error", error_msg))
+                    # Defer the QMessageBox to the next event-loop tick so it
+                    # runs outside the slot's sendPostedEvents() flush. On
+                    # Qt 6.11 + macOS 26 a modal QMessageBox opened from inside
+                    # that flush can SIGSEGV in QTextEngine::validate()
+                    # (qt-6-11-macos-textengine-crash.md).
+                    def _show_logcat_err():
+                        try:
+                            QMessageBox.critical(self, "Logcat Error", error_msg)
+                        except (RuntimeError, ReferenceError):
+                            pass
+                    self._ui_caller.call.emit(lambda: QTimer.singleShot(0, _show_logcat_err))
                     self.log_running = False
                     self._ui_caller.call.emit(lambda: self.logcat_button.setText("▶️ Start"))
                     import traceback
