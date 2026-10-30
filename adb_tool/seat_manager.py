@@ -248,22 +248,25 @@ class SeatPortManager:
                         continue
 
                     parts = line.split('|')
-                    if len(parts) != 4:
-                        # Reject anything that isn't exactly 4 pipe-separated
-                        # fields.  This silently drops legacy `=`-prefixed
-                        # entries and malformed lines — no point trying to
-                        # salvage them, they'll be re-written in the new
-                        # format on next connect.
-                        continue
-
+                    headend = ''
                     if entry_type == 'seat':
+                        if len(parts) != 4:
+                            continue
                         seat, port, gateway, ts = parts
                     else:  # portforward
-                        # RACK|HEAD|USER|TS → we surface it to the UI as
-                        # {seat=rack, port='', gateway=user@rack}
-                        seat, port, gateway, ts = parts
-                        gateway = f"{gateway}@{seat}"
-                        port = ''
+                        # Canonical format: RACK|HEAD|USER|TS
+                        # Legacy format:    RACK=HEAD|USER|TS
+                        if len(parts) == 4:
+                            seat, headend, user, ts = parts
+                            gateway = f"{user}@{seat}"
+                            port = ''
+                        elif len(parts) == 3 and '=' in parts[0]:
+                            seat, headend = parts[0].split('=', 1)
+                            user, ts = parts[1], parts[2]
+                            gateway = f"{user}@{seat}"
+                            port = ''
+                        else:
+                            continue
 
                     # Timestamp must be a valid integer. Drop the line
                     # if it's anything else (NaN, empty, junk).
@@ -272,12 +275,15 @@ class SeatPortManager:
                     except (ValueError, TypeError):
                         continue
 
-                    entries.append({
+                    entry_dict = {
                         'seat': seat,
                         'port': port,
                         'gateway': gateway,
                         'timestamp': ts_int
-                    })
+                    }
+                    if entry_type == 'portforward':
+                        entry_dict['headend'] = headend
+                    entries.append(entry_dict)
         except Exception as e:
             if self.log_callback:
                 self.log_callback(f"Error loading {entry_type} history: {e}", "ERROR")
@@ -307,12 +313,12 @@ class SeatPortManager:
             return sorted_entries[:limit]
 
         elif entry_type == 'portforward':
-            # Group by gateway, keep most recent
+            # Group by (gateway, headend), keep most recent
             unique = {}
             for e in entries:
-                gateway = e['gateway']
-                if gateway not in unique or e['timestamp'] > unique[gateway]['timestamp']:
-                    unique[gateway] = e
+                key = (e['gateway'], e.get('headend', ''))
+                if key not in unique or e['timestamp'] > unique[key]['timestamp']:
+                    unique[key] = e
             # Sort by timestamp desc and return top N
             sorted_entries = sorted(unique.values(), key=lambda x: x['timestamp'], reverse=True)
             return sorted_entries[:limit]
@@ -366,26 +372,26 @@ class SeatPortManager:
                     kept.append(line)
                     continue
                 parts = stripped.split('|')
-                if len(parts) != 4:
-                    # Pass through malformed lines untouched — never silently
-                    # delete something we don't understand.
+                matches = False
+                if len(parts) == 4:
+                    if entry_type == 'portforward':
+                        disk_gateway = f"{parts[2]}@{parts[0]}"
+                    else:
+                        disk_gateway = parts[2]
+
+                    matches = (
+                        parts[0] == seat
+                        and parts[1] == (port if entry_type == 'seat' else parts[1])
+                        and disk_gateway == gateway
+                    )
+                elif len(parts) == 3 and entry_type == 'portforward' and '=' in parts[0]:
+                    r, h = parts[0].split('=', 1)
+                    disk_gateway = f"{parts[1]}@{r}"
+                    matches = (r == seat and disk_gateway == gateway)
+                else:
                     kept.append(line)
                     continue
-                # For portforwards, `load_history` rewrites gateway to
-                # "user@rack" in memory, but on disk field 2 is just `user`.
-                # So when matching against the GUI's `gateway` arg (the
-                # user@rack form), compare against `user@parts[0]` instead
-                # of parts[2].
-                if entry_type == 'portforward':
-                    disk_gateway = f"{parts[2]}@{parts[0]}"
-                else:
-                    disk_gateway = parts[2]
 
-                matches = (
-                    parts[0] == seat
-                    and parts[1] == (port if entry_type == 'seat' else parts[1])
-                    and disk_gateway == gateway
-                )
                 if matches and not removed:
                     removed = True
                     continue

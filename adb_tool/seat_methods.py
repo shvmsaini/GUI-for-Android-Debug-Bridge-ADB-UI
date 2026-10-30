@@ -1549,7 +1549,12 @@ class SeatMixin:
         for entry in all_pf:
             # Apply search filter
             if pf_filter:
-                if pf_filter in entry['gateway'].lower() or pf_filter in entry['port'].lower():
+                pf_gw = entry['gateway'].lower()
+                pf_head = entry.get('headend', '').lower()
+                pf_seat = entry.get('seat', '').lower()
+                pf_port = entry.get('port', '').lower()
+                if (pf_filter in pf_gw or pf_filter in pf_head or
+                    pf_filter in pf_seat or pf_filter in pf_port):
                     top_pf.append(entry)
             else:
                 top_pf.append(entry)
@@ -1598,22 +1603,26 @@ class SeatMixin:
                 or active_rack_host in entry['gateway'].split('@', 1)[-1]
             )
 
-            # Format: show rack info if this is the active one
+            # Determine headend
+            headend = entry.get('headend', '').strip()
+            if is_active_rack and pf_status and pf_status.get('headend'):
+                headend = pf_status.get('headend').strip()
+            headend_display = headend if headend else "default"
+            if len(headend_display) > 35:
+                headend_display = headend_display[:32] + "…"
+
             # Truncate long gateway names to prevent horizontal scrolling
             gateway = entry['gateway']
             if len(gateway) > 50:
                 gateway = gateway[:47] + "…"
-            active_rack_display = active_rack if active_rack else ""
-            if active_rack_display and len(active_rack_display) > 50:
-                active_rack_display = active_rack_display[:47] + "…"
 
-            if is_active_rack:
-                # Show rack info - this is the active port forward
-                text = f"🟢 {gateway}\n📡 Rack: {active_rack_display}"
-                btn_connected = True  # Force connected state for active rack
+            # Format: show headend on the line above the gateway
+            if is_active_rack or is_connected:
+                text = f"🟢 Headend: {headend_display}\n{gateway}"
+                btn_connected = True
             else:
-                text = f"{gateway}"
-                btn_connected = is_connected
+                text = f"Headend: {headend_display}\n{gateway}"
+                btn_connected = False
 
             # Wrap the portforward button in a container so we can append a
             # ✕ remove button alongside it (mirrors the seat row layout).
@@ -1796,7 +1805,8 @@ class SeatMixin:
             parts = entry['gateway'].split('@')
             if len(parts) == 2:
                 user_part, gateway_host = parts
-                self.connect_portforward(entry['gateway'], 'cs1', user_part)
+                partition = entry.get('headend') or 'cs1'
+                self.connect_portforward(entry['gateway'], partition, user_part)
             else:
                 self.log("Invalid gateway format", "ERROR")
 
