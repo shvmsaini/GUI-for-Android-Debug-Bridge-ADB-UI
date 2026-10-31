@@ -2953,6 +2953,13 @@ def main():
     window = ADBGUI()
     window.setWindowIcon(icon)
     window.show()
+
+    # In-app stress testing mode for SIGSEGV / SIGABRT verification
+    if '--stress' in sys.argv or '--stress-test' in sys.argv:
+        from adb_tool.stress_tester import run_in_app_stress_test
+        # Start after event loop and initial UI painting settles
+        QTimer.singleShot(1200, lambda: run_in_app_stress_test(window))
+
     sys.exit(app.exec())
 
 

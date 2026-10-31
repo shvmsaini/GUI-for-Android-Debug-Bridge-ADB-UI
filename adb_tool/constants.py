@@ -64,22 +64,32 @@ _PREV_SESSION_LOG_PATH = os.path.join(_app_log_dir, "session.prev.log")
 
 # Path for faulthandler to write native crash traces (SIGSEGV, SIGABRT, etc.)
 _FAULTHANDLER_LOG_PATH = os.path.join(_crash_log_dir, "faulthandler_crash.log")
-_FAULTHANDLER_PREV_PATH = os.path.join(_crash_log_dir, "faulthandler_prev.log")
+_FAULTHANDLER_PENDING_PATH = os.path.join(_crash_log_dir, "faulthandler_pending.log")
+_FAULTHANDLER_PREV_PATH = _FAULTHANDLER_PENDING_PATH  # Backward compat alias
+_UNHANDLED_CRASH_MARKER = os.path.join(_crash_log_dir, ".unhandled_crash_marker")
 
-# On startup, do NOT truncate any crash log from the previous run!
-# If the previous log has data, archive it before starting this session.
+# On startup, check if faulthandler captured a real crash (>0 bytes) during the previous run.
+# If so, move it to _FAULTHANDLER_PENDING_PATH so _check_for_previous_crash can alert the user once.
+# If 0 bytes (normal exit), remove it so it starts clean.
 try:
-    if os.path.exists(_FAULTHANDLER_LOG_PATH) and os.path.getsize(_FAULTHANDLER_LOG_PATH) > 0:
-        shutil.copy2(_FAULTHANDLER_LOG_PATH, _FAULTHANDLER_PREV_PATH)
-        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        shutil.copy2(_FAULTHANDLER_LOG_PATH, os.path.join(_crash_log_dir, f"crash_native_{_ts}.log"))
-        # Remove the previous file so the new session starts fresh
-        os.remove(_FAULTHANDLER_LOG_PATH)
+    if os.path.exists(_FAULTHANDLER_LOG_PATH):
+        if os.path.getsize(_FAULTHANDLER_LOG_PATH) > 0:
+            shutil.move(_FAULTHANDLER_LOG_PATH, _FAULTHANDLER_PENDING_PATH)
+        else:
+            os.remove(_FAULTHANDLER_LOG_PATH)
+except Exception:
+    pass
+
+# Clean up legacy faulthandler_prev.log if lingering
+try:
+    _legacy_prev = os.path.join(_crash_log_dir, "faulthandler_prev.log")
+    if os.path.exists(_legacy_prev) and _legacy_prev != _FAULTHANDLER_PENDING_PATH:
+        os.remove(_legacy_prev)
 except Exception:
     pass
 
 try:
-    _FAULTHANDLER_FILE = open(_FAULTHANDLER_LOG_PATH, 'a', encoding='utf-8')
+    _FAULTHANDLER_FILE = open(_FAULTHANDLER_LOG_PATH, 'w', encoding='utf-8')
     # all_threads=True ensures all threads' stack traces are printed on native crash
     faulthandler.enable(_FAULTHANDLER_FILE, all_threads=True)
     # Register SIGUSR1 (if supported) to dump thread stacks on demand without crashing

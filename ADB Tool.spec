@@ -52,6 +52,7 @@ hiddenimports += [
     'adb_tool.safe_dialog',
     'adb_tool.constants',
     'adb_tool.bundled_scripts',
+    'adb_tool.stress_tester',
     'paramiko',
     'paramiko.transport',
     'paramiko.auth_handler',

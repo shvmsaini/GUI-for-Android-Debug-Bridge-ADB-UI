@@ -20,6 +20,7 @@ from .constants import (
     APP_VERSION, _crash_log_dir, _app_log_dir,
     _SESSION_LOG_PATH, _PREV_SESSION_LOG_PATH,
     _FAULTHANDLER_LOG_PATH, _FAULTHANDLER_PREV_PATH,
+    _FAULTHANDLER_PENDING_PATH, _UNHANDLED_CRASH_MARKER,
     ADB_SEAT_PORTS_FILE, PORTFORWARD_RACKS_FILE,
 )
 
@@ -205,6 +206,13 @@ def _write_crash_report(exc_type, exc_value, exc_tb, source="main"):
 
             f.write("=" * 70 + "\n")
             f.write("Please share this report when requesting support.\n")
+
+        # Mark that an unhandled crash occurred so next startup can notify once if the process dies
+        try:
+            with open(_UNHANDLED_CRASH_MARKER, 'w', encoding='utf-8') as mf:
+                mf.write(crash_file)
+        except Exception:
+            pass
 
         log_to_session_file(f"Crash report written to: {crash_file}", level="CRITICAL")
         return crash_file
@@ -428,46 +436,45 @@ def create_diagnostic_bundle(parent=None, save_path=None):
 
 
 def _check_for_previous_crash():
-    """On startup, check if there's evidence of a crash from the previous run."""
+    """On startup, check if there's evidence of an actual crash from the previous run.
+
+    Only notifies if:
+      1. faulthandler captured a native crash trace (_FAULTHANDLER_PENDING_PATH), OR
+      2. an unhandled Python exception crashed the app (_UNHANDLED_CRASH_MARKER).
+
+    Never prompts on normal runs, never checks arbitrary system logs, and
+    cleans up the pending flag immediately so it will NEVER prompt repeatedly.
+    """
     crash_reason = None
     crash_log_to_view = None
 
-    # Check 1: faulthandler log from previous run
-    if os.path.exists(_FAULTHANDLER_PREV_PATH) and os.path.getsize(_FAULTHANDLER_PREV_PATH) > 0:
+    # Check 1: Native crash (SIGSEGV / SIGABRT / SIGBUS) from immediate previous session
+    if os.path.exists(_FAULTHANDLER_PENDING_PATH) and os.path.getsize(_FAULTHANDLER_PENDING_PATH) > 0:
         crash_reason = "Native crash (SIGSEGV / SIGABRT / SIGBUS) detected via faulthandler"
-        crash_log_to_view = _FAULTHANDLER_PREV_PATH
+        crash_log_to_view = _FAULTHANDLER_PENDING_PATH
 
-    # Check 2: active faulthandler log with existing content
-    elif os.path.exists(_FAULTHANDLER_LOG_PATH) and os.path.getsize(_FAULTHANDLER_LOG_PATH) > 0:
-        crash_reason = "Native crash trace found in faulthandler log"
-        crash_log_to_view = _FAULTHANDLER_LOG_PATH
+    # Check 2: Unhandled Python exception crash marker from immediate previous session
+    elif os.path.exists(_UNHANDLED_CRASH_MARKER):
+        try:
+            with open(_UNHANDLED_CRASH_MARKER, 'r', encoding='utf-8') as f:
+                target_log = f.read().strip()
+            if target_log and os.path.exists(target_log):
+                crash_reason = "Unhandled Python exception crash"
+                crash_log_to_view = target_log
+        except Exception:
+            pass
 
-    # Check 3: recent Python crash report in crashes/
-    if not crash_reason and os.path.isdir(_crash_log_dir):
-        now = datetime.now().timestamp()
-        for fname in sorted(os.listdir(_crash_log_dir), reverse=True):
-            if fname.startswith("crash_") and fname.endswith(".log"):
-                cpath = os.path.join(_crash_log_dir, fname)
+    if not crash_reason:
+        # Clean up any empty marker files
+        for cleanup_f in (_FAULTHANDLER_PENDING_PATH, _FAULTHANDLER_PREV_PATH, _UNHANDLED_CRASH_MARKER):
+            if os.path.exists(cleanup_f):
                 try:
-                    # Created in the last 2 hours
-                    if now - os.path.getmtime(cpath) < 2 * 3600:
-                        crash_reason = "Application exception crash report found"
-                        crash_log_to_view = cpath
-                        break
+                    os.remove(cleanup_f)
                 except Exception:
                     pass
-
-    # Check 4: recent macOS .ips report
-    if not crash_reason:
-        recent_ips = find_recent_system_crash_reports()
-        if recent_ips:
-            crash_reason = "macOS native crash report (.ips) found for ADB Tool"
-            crash_log_to_view = recent_ips[0]
-
-    if not crash_reason:
         return
 
-    # Present crash notification dialog to the user
+    # Present crash notification dialog to the user once
     try:
         dlg = QDialog(None)
         dlg.setWindowTitle("Previous Crash Detected")
@@ -520,11 +527,26 @@ def _check_for_previous_crash():
         elif action == "open" and crash_log_to_view:
             _open_path(crash_log_to_view)
 
-        # Clear previous faulthandler file after notifying
-        if os.path.exists(_FAULTHANDLER_PREV_PATH):
+    except Exception:
+        pass
+    finally:
+        # CRITICAL: Always clean up the crash markers immediately, so it NEVER prompts again!
+        if os.path.exists(_FAULTHANDLER_PENDING_PATH):
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                shutil.copy2(_FAULTHANDLER_PENDING_PATH, os.path.join(_crash_log_dir, f"archived_native_{ts}.log"))
+                os.remove(_FAULTHANDLER_PENDING_PATH)
+            except Exception:
+                pass
+
+        if os.path.exists(_UNHANDLED_CRASH_MARKER):
+            try:
+                os.remove(_UNHANDLED_CRASH_MARKER)
+            except Exception:
+                pass
+
+        if os.path.exists(_FAULTHANDLER_PREV_PATH) and _FAULTHANDLER_PREV_PATH != _FAULTHANDLER_PENDING_PATH:
             try:
                 os.remove(_FAULTHANDLER_PREV_PATH)
             except Exception:
                 pass
-    except Exception:
-        pass

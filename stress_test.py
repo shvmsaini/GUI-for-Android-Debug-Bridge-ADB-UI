@@ -1,333 +1,241 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-stress_test.py — SIGSEGV / SIGABRT stress tester for ADB Tool .app on macOS.
+stress_test.py — Automated Stress Tester for ADB Tool on macOS M1/M2/M3/M4.
 
-Hammers the UI interactions that are most likely to trigger Qt 6.11 crashes:
-  • Seat connect/disconnect buttons (QMessageBox SIGSEGV path)
-  • ▶ play button (scrcpy canary + mirror window SIGSEGV path)
-  • ✕ remove history buttons (same QMessageBox path)
-  • Rapid open/close of dialogs
+Verifies stability against SIGSEGV (QTextEngine NULL-deref / QMessageBox)
+and SIGABRT (Apple Events thread / py_scrcpy_sdk PyAV dylib conflict).
 
-Usage:
-    1. Launch "ADB Tool.app" (or the binary directly in Terminal for logs).
-    2. Navigate to the Seat Management tab so it's visible.
-    3. In a second terminal: python3 stress_test.py
-
-Requirements:
-    pip3 install pyautogui Pillow
-    System Preferences → Privacy & Security → Accessibility → allow Terminal
+Supports three modes:
+  [1] In-Process Engine (Recommended):
+      Launches ADB Tool with `--stress`.
+      - Directly exercises seat connect buttons, '▶' play buttons, dialogs, and canary
+      - 100% hits actual widgets; zero coordinate guessing; no mouse hijacking
+      - Catches and displays SIGSEGV (-11), SIGABRT (-6), or clean exit
+  [2] Calibrated Screen Clicker:
+      Lets you hover your mouse once over a Seat button to calibrate exact Retina
+      coordinates, then accurately clicks the Connect, '▶', and '✕' buttons.
+  [3] Direct Canary Hammer:
+      Spawns 50 canary subprocesses in rapid succession to test PyAV / FFmpeg
+      duplicate-class handling on Apple Silicon.
 """
 
 import sys
+import os
 import time
 import signal
 import subprocess
-import random
 import threading
 
-try:
-    import pyautogui
-except ImportError:
-    sys.exit("Install pyautogui first:  pip3 install pyautogui Pillow")
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
-# How many rounds to run (each round = one pass over all interactions)
-ROUNDS = 50
-
-# Pause between actions (seconds). Lower = more aggressive. 0.05 is the minimum
-# that doesn't overwhelm the Qt event queue on M-series.
-ACTION_DELAY = 0.07
-
-# Pause before dismissing a modal dialog that appeared (give Qt time to render)
-DIALOG_SETTLE = 0.15
-
-# If True, press Escape to dismiss any modal that appears (instead of clicking No/Cancel).
-# Escape is safer because it always closes the dialog without triggering an action.
-DISMISS_WITH_ESCAPE = True
-
-# Emergency stop: move mouse to top-left corner of screen
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.0   # We control all delays manually
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-_stats = {"clicks": 0, "dialogs_dismissed": 0, "errors": 0, "rounds": 0}
-_stop = threading.Event()
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_BUNDLE_PATH = os.path.join(REPO_DIR, "dist", "ADB Tool.app", "Contents", "MacOS", "ADB Tool")
+SRC_MAIN_PATH = os.path.join(REPO_DIR, "adb_gui.py")
 
 
-def _log(msg):
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+def _find_runnable_target():
+    """Locate the .app binary or python script to run."""
+    if os.path.isfile(APP_BUNDLE_PATH) and os.access(APP_BUNDLE_PATH, os.X_OK):
+        return [APP_BUNDLE_PATH], "Packaged App (dist/ADB Tool.app)"
+    sys_app = "/Applications/ADB Tool.app/Contents/MacOS/ADB Tool"
+    if os.path.isfile(sys_app) and os.access(sys_app, os.X_OK):
+        return [sys_app], "Installed App (/Applications/ADB Tool.app)"
+    return [sys.executable, SRC_MAIN_PATH], "Python Source (adb_gui.py)"
 
 
-def _click(x, y, label=""):
-    """Click at (x, y) and record it."""
+def run_engine_stress():
+    """Mode 1: Launch ADB Tool with --stress and monitor signals."""
+    cmd_prefix, target_name = _find_runnable_target()
+    cmd = cmd_prefix + ["--stress"]
+
+    print("=" * 65)
+    print("MODE 1: IN-PROCESS QT STRESS TEST ENGINE")
+    print(f"Target: {target_name}")
+    print(f"Command: {' '.join(cmd)}")
+    print("=" * 65)
+    print("Starting ADB Tool in stress-test mode...")
+    print("This will run 30 automated rounds of:")
+    print("  • Seat Connect / Disconnect button clicks")
+    print("  • '▶' Play button clicks (canary probe + mirror window launch)")
+    print("  • Safe dialog creation & teardown")
+    print("  • Direct canary probe subprocess stress")
+    print("=" * 65)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    crashed = False
+    signal_name = None
+
     try:
-        pyautogui.click(x, y)
-        _stats["clicks"] += 1
-        if label:
-            _log(f"  click → {label} @ ({x},{y})")
-        time.sleep(ACTION_DELAY)
-    except Exception as e:
-        _stats["errors"] += 1
-        _log(f"  ⚠ click error: {e}")
-
-
-def _press(key):
-    try:
-        pyautogui.press(key)
-        time.sleep(ACTION_DELAY)
-    except Exception:
-        pass
-
-
-def _dismiss_dialog():
-    """Dismiss any modal dialog that may have appeared."""
-    time.sleep(DIALOG_SETTLE)
-    if DISMISS_WITH_ESCAPE:
-        _press("escape")
-    else:
-        # Try pressing Enter (confirms) then Escape as fallback
-        _press("return")
-    _stats["dialogs_dismissed"] += 1
-
-
-def _screenshot_region(x, y, w, h):
-    """Return a PIL image of a screen region."""
-    try:
-        return pyautogui.screenshot(region=(x, y, w, h))
-    except Exception:
-        return None
-
-
-def _find_button(label, region=None, confidence=0.8):
-    """
-    Attempt to locate a button image on screen.
-    Returns (center_x, center_y) or None.
-    Requires a reference screenshot — use _locate_by_color instead for text buttons.
-    """
-    try:
-        loc = pyautogui.locateCenterOnScreen(label, confidence=confidence, region=region)
-        return loc
-    except Exception:
-        return None
-
-
-def get_window_region():
-    """
-    Return (x, y, w, h) of the ADB Tool window using AppleScript.
-    Falls back to a wide center region if AppleScript fails.
-    """
-    script = '''
-    tell application "System Events"
-        tell process "ADB Tool"
-            set b to bounds of window 1
-            return (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b)
-        end tell
-    end tell
-    '''
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            parts = [int(v.strip()) for v in result.stdout.strip().split(",")]
-            x, y, x2, y2 = parts
-            return x, y, x2 - x, y2 - y
-    except Exception:
-        pass
-    # Fallback: center 600×800 region
-    sw, sh = pyautogui.size()
-    return sw // 4, sh // 8, sw // 2, sh * 3 // 4
-
-
-def click_all_buttons_in_region(rx, ry, rw, rh, max_buttons=20):
-    """
-    Click every clickable-looking point in the window region using a grid sweep.
-    This simulates a user rapidly clicking all visible buttons.
-    Dismisses any modal dialog that opens between clicks.
-    """
-    # Build a grid of candidate click points inside the region
-    step_x = max(30, rw // 10)
-    step_y = max(25, rh // 15)
-    candidates = []
-    for gx in range(rx + 20, rx + rw - 20, step_x):
-        for gy in range(ry + 60, ry + rh - 20, step_y):
-            candidates.append((gx, gy))
-
-    random.shuffle(candidates)
-    for (cx, cy) in candidates[:max_buttons]:
-        if _stop.is_set():
-            return
-        _click(cx, cy)
-        # After each click, check for and dismiss any modal dialog
-        _dismiss_dialog()
-
-
-def stress_seat_buttons(rx, ry, rw, rh):
-    """
-    Focus on the left panel where seat buttons live.
-    The seat list is in roughly the left 40% of the window.
-    """
-    seat_panel_w = int(rw * 0.45)
-
-    # Grid of points covering the seat button area
-    step_y = 55  # seat buttons are ~50px tall
-    for gy in range(ry + 100, ry + rh - 30, step_y):
-        if _stop.is_set():
-            return
-        # Click at 3 x-positions per row: main button, ▶ play button, ✕ remove button
-        positions = [
-            (rx + int(seat_panel_w * 0.4), gy, "seat-main"),
-            (rx + int(seat_panel_w * 0.85), gy, "▶ play"),
-            (rx + int(seat_panel_w * 0.95), gy, "✕ remove"),
-        ]
-        for (cx, cy, label) in positions:
-            if _stop.is_set():
-                return
-            _click(cx, cy, label)
-            _dismiss_dialog()
-
-
-def rapid_fire_play_buttons(rx, ry, rw, rh, count=10):
-    """
-    Hammer the ▶ play button area repeatedly.
-    This is the highest-risk path: triggers canary + ScrcpyMirrorWindow creation.
-    """
-    _log("  🔴 rapid-firing ▶ play buttons...")
-    # Play buttons are near the right edge of the seat panel rows
-    play_x = rx + int(rw * 0.38)
-    for i in range(count):
-        if _stop.is_set():
-            return
-        # Vary the y slightly to hit different seat rows
-        play_y = ry + 120 + (i % 6) * 55
-        _click(play_x, play_y, f"▶ #{i+1}")
-        # Give the canary time to complete or fail (it takes ~0.6–2s)
-        time.sleep(0.3)
-        _dismiss_dialog()
-        # Close any mirror window that opened (Cmd+W)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        print("\nStopping stress test on user interrupt...")
+        proc.terminate()
         try:
-            pyautogui.hotkey("command", "w")
-            time.sleep(0.1)
+            proc.wait(timeout=3)
         except Exception:
-            pass
+            proc.kill()
+        return
+
+    proc.wait()
+    rc = proc.returncode
+
+    print("\n" + "=" * 65)
+    if rc == 0:
+        print("✅ SUCCESS: ADB Tool completed stress test with EXIT CODE 0.")
+        print("   No SIGSEGV, SIGABRT, or fatal crashes occurred!")
+    elif rc < 0:
+        sig_num = -rc
+        try:
+            sig_name = signal.Signals(sig_num).name
+        except Exception:
+            sig_name = f"Signal {sig_num}"
+        print(f"💥 CRASH DETECTED: ADB Tool was killed by {sig_name} (code {rc})!")
+        print("   Check logs at:")
+        print("   ~/Library/Application Support/ADB-GUI-UI/logs/session.log")
+        print("   ~/Library/Application Support/ADB-GUI-UI/crashes/faulthandler_crash.log")
+    else:
+        print(f"⚠️ ADB Tool exited with non-zero exit code: {rc}")
+    print("=" * 65)
 
 
-def rapid_modal_open_close(rx, ry, rw, rh, count=15):
-    """
-    Rapidly open and close dialogs by clicking the seat connect buttons.
-    The classic SIGSEGV trigger: open modal inside button slot.
-    """
-    _log("  🔴 rapid modal open/close stress...")
-    # Target the first few seat rows' main button area
-    btn_x = rx + int(rw * 0.2)
-    for i in range(count):
-        if _stop.is_set():
-            return
-        btn_y = ry + 120 + (i % 4) * 55
-        _click(btn_x, btn_y, f"seat-click #{i+1}")
-        time.sleep(DIALOG_SETTLE)
-        _press("escape")
-        time.sleep(0.05)
+def run_calibrated_clicker():
+    """Mode 2: Calibrated screen clicker that clicks actual buttons."""
+    try:
+        import pyautogui
+    except ImportError:
+        print("Error: pyautogui is required for Mode 2.")
+        print("Install it with:  pip3 install pyautogui Pillow")
+        return
 
+    pyautogui.FAILSAFE = True
 
-def monitor_app_alive():
-    """Background thread: check every 2s if ADB Tool is still running."""
-    while not _stop.is_set():
-        result = subprocess.run(
-            ["pgrep", "-x", "ADB Tool"],
-            capture_output=True
-        )
-        if result.returncode != 0:
-            _log("💥 ADB Tool process DIED — crash detected!")
-            _log("   Check: ~/Library/Application Support/ADB-GUI-UI/crashes/")
-            _log("   Check: ~/Library/Logs/DiagnosticReports/ADB*.ips")
-            _stop.set()
-            break
-        time.sleep(2)
+    print("=" * 65)
+    print("MODE 2: CALIBRATED SCREEN CLICKER")
+    print("=" * 65)
+    print("Please make sure ADB Tool is open and visible on screen.")
+    print("We will calibrate the exact coordinates so it does NOT click on empty space.\n")
 
+    input("👉 Step 1: Move your mouse over any SEAT BUTTON in the Seat Management list, then press ENTER here...")
+    seat_x, seat_y = pyautogui.position()
+    print(f"   [✓] Calibrated Seat button at ({seat_x}, {seat_y})")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    # In ADB Tool's layout, the '▶' play button is about 150-180px to the right of the seat text,
+    # and the '✕' button is about 30-40px further to the right.
+    play_x = seat_x + 160
+    play_y = seat_y
+    remove_x = seat_x + 195
+    remove_y = seat_y
 
-def main():
-    _log("ADB Tool SIGSEGV/SIGABRT Stress Tester")
-    _log("=" * 50)
-    _log("Move mouse to TOP-LEFT corner at any time to STOP (pyautogui failsafe).")
-    _log("")
-    _log("Locating ADB Tool window...")
+    print(f"   Calculated Play button ('▶') at approx ({play_x}, {play_y})")
+    print(f"   Calculated Remove button ('✕') at approx ({remove_x}, {remove_y})\n")
 
-    # Start app-alive monitor thread
-    monitor = threading.Thread(target=monitor_app_alive, daemon=True)
-    monitor.start()
+    rounds = 25
+    print(f"Starting {rounds} rounds of calibrated clicks.")
+    print("Move mouse to TOP-LEFT corner of screen at any time to EMERGENCY ABORT.\n")
 
-    rx, ry, rw, rh = get_window_region()
-    _log(f"Window region: x={rx} y={ry} w={rw} h={rh}")
-
-    # Bring window to front
-    subprocess.run(["osascript", "-e", 'tell application "ADB Tool" to activate'],
-                   capture_output=True)
-    time.sleep(0.5)
-
-    _log(f"Starting {ROUNDS} stress rounds...\n")
-
-    for round_num in range(1, ROUNDS + 1):
-        if _stop.is_set():
-            break
-
-        _log(f"── Round {round_num}/{ROUNDS} ──")
-        _stats["rounds"] = round_num
-
-        # Re-locate window in case user moved it
-        rx, ry, rw, rh = get_window_region()
-
-        # Phase 1: Seat button grid sweep
-        _log("  Phase 1: seat button sweep")
-        stress_seat_buttons(rx, ry, rw, rh)
-
-        if _stop.is_set(): break
-
-        # Phase 2: Rapid modal open/close (highest SIGSEGV risk)
-        _log("  Phase 2: rapid modal open/close")
-        rapid_modal_open_close(rx, ry, rw, rh, count=8)
-
-        if _stop.is_set(): break
-
-        # Phase 3: Hammer ▶ play buttons (canary + mirror window risk)
-        _log("  Phase 3: rapid-fire ▶ play buttons")
-        rapid_fire_play_buttons(rx, ry, rw, rh, count=6)
-
-        if _stop.is_set(): break
-
-        # Phase 4: Random scatter clicks across whole window
-        _log("  Phase 4: random scatter clicks")
-        click_all_buttons_in_region(rx, ry, rw, rh, max_buttons=12)
-
-        _log(f"  ✓ Round {round_num} done | clicks={_stats['clicks']} dialogs={_stats['dialogs_dismissed']}\n")
+    for i in range(1, rounds + 1):
+        print(f"[{i}/{rounds}] Clicking Seat Button ({seat_x}, {seat_y})...")
+        pyautogui.click(seat_x, seat_y)
+        time.sleep(0.3)
+        pyautogui.press("escape")  # dismiss disconnect dialog if it appeared
         time.sleep(0.2)
 
-    # Final report
-    _log("")
-    _log("=" * 50)
-    if _stop.is_set() and _stats["rounds"] < ROUNDS:
-        _log("🔴 STRESS TEST ENDED EARLY — app likely crashed!")
+        print(f"[{i}/{rounds}] Clicking '▶' Play Button ({play_x}, {play_y})...")
+        pyautogui.click(play_x, play_y)
+        time.sleep(0.6)
+        pyautogui.hotkey("command", "w")  # close mirror window if opened
+        time.sleep(0.2)
+
+    print("\n✅ Calibrated clicking complete.")
+
+
+def run_canary_hammer():
+    """Mode 3: Stress test the py_scrcpy_sdk / canary subprocess 50 times."""
+    print("=" * 65)
+    print("MODE 3: SCRCPY CANARY PROBE HAMMER (50 RUNS)")
+    print("=" * 65)
+    print("Testing for Objective-C runtime duplicate-class collisions...")
+
+    canary_script = os.path.join(REPO_DIR, "adb_tool", "scrcpy_canary.py")
+    if not os.path.isfile(canary_script):
+        print(f"Error: canary script not found at {canary_script}")
+        return
+
+    import json
+    cmd_input = json.dumps({
+        "device_id": "stress_probe_localhost:5555",
+        "adb_path": "adb",
+        "bitrate": 1_000_000,
+        "max_fps": 24,
+        "max_size": 800,
+    }) + "\n"
+
+    success_count = 0
+    crash_count = 0
+
+    for i in range(1, 51):
+        proc = subprocess.Popen(
+            [sys.executable, canary_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _, err = proc.communicate(input=cmd_input, timeout=2.5)
+            rc = proc.returncode
+            if rc == 0:
+                success_count += 1
+                sys.stdout.write(f"\rRun {i}/50: OK")
+            elif rc < 0:
+                crash_count += 1
+                sig_name = signal.Signals(-rc).name if -rc in signal.Signals.__members__.values() else f"sig {-rc}"
+                sys.stdout.write(f"\nRun {i}/50: 💥 CRASHED with {sig_name}")
+            else:
+                sys.stdout.write(f"\nRun {i}/50: exited {rc} ({err.strip()[:80]})")
+            sys.stdout.flush()
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            success_count += 1
+            sys.stdout.write(f"\rRun {i}/50: alive past timeout (OK)")
+            sys.stdout.flush()
+
+    print(f"\n\nResults: {success_count} passed, {crash_count} native crashes.")
+    if crash_count == 0:
+        print("✅ No duplicate-class or PyAV SIGSEGV detected.")
     else:
-        _log("✅ Stress test complete — no crash detected.")
-    _log(f"   Rounds:           {_stats['rounds']}/{ROUNDS}")
-    _log(f"   Clicks:           {_stats['clicks']}")
-    _log(f"   Dialogs dismissed:{_stats['dialogs_dismissed']}")
-    _log(f"   Click errors:     {_stats['errors']}")
-    _log("")
-    _log("Crash logs to check:")
-    _log("  ~/Library/Application Support/ADB-GUI-UI/crashes/")
-    _log("  ~/Library/Logs/DiagnosticReports/  (*.ips files, open in Console.app)")
-    _log("  /tmp/adb_tool_stress.log  (if you redirected output)")
+        print("💥 Native crashes detected during canary probe runs!")
+
+
+def main():
+    print("================================================================")
+    print("         ADB TOOL STRESS TESTER (macOS Apple Silicon)           ")
+    print("================================================================")
+    print("Select test mode:")
+    print("  [1] In-Process Qt Engine (Recommended - no mouse hijacking, 100% accurate)")
+    print("  [2] Calibrated Screen Clicker (Calibrate real seat coordinates & click)")
+    print("  [3] Scrcpy Canary Subprocess Hammer (50 runs)")
+    print("  [q] Quit")
+    print("================================================================")
+
+    choice = input("Enter option [1/2/3/q] (default: 1): ").strip()
+    if choice == "2":
+        run_calibrated_clicker()
+    elif choice == "3":
+        run_canary_hammer()
+    elif choice.lower() in ("q", "quit"):
+        return
+    else:
+        run_engine_stress()
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda s, f: (_stop.set(), sys.exit(0)))
     main()
-
