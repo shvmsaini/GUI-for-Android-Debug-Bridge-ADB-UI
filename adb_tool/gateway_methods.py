@@ -15,7 +15,7 @@ import re
 import tempfile
 import uuid
 from datetime import datetime
-from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread, QEvent
 from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QWidget, QLineEdit, QCheckBox, QComboBox, QTableWidgetItem, QSizePolicy, QFrame,
@@ -34,6 +34,36 @@ from .credentials import CredentialManager
 from . import bundled_scripts
 
 
+# --- Cross-thread prompt helpers ------------------------------------------------
+# `run_command_clicked` runs in a worker thread but needs to ask the user
+# a question via a Qt dialog (GUI thread). We can't use QTimer.singleShot
+# from a worker thread (PyQt6 silently drops it — see
+# pyqt6-singleshot-worker-thread-dropped.md), so we post a QEvent carrying
+# a callback. The GUI-thread event loop dispatches the event, the callback
+# fills in the answer, and the worker thread waits on a threading.Event.
+
+_ANSWER_READY = threading.Event()
+
+
+class _AskEvent(QEvent):
+    """Custom QEvent carrying a callable to run on the GUI thread."""
+    def __init__(self, fn):
+        super().__init__(QEvent.Type(QEvent.registerEventType()))
+        self.fn = fn
+
+
+class _AnswerWaiter(QObject):
+    """Event filter that signals _ANSWER_READY when an _AskEvent fires."""
+    def eventFilter(self, obj, event):
+        if isinstance(event, _AskEvent):
+            try:
+                event.fn()
+            finally:
+                _ANSWER_READY.set()
+            return True
+        return False
+
+
 def _format_size(size_bytes):
     """Format a file size in bytes to a human-readable string."""
     if size_bytes < 0:
@@ -45,6 +75,29 @@ def _format_size(size_bytes):
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024.0
     return f"{size_bytes:.1f} PB"
+
+
+# Match the multi-line "W A R N I N G ... COMPUTER FRAUD AND ABUSE ACT"
+# banner that sshd prints when you first connect to a seat (and that gets
+# surfaced as noise in scp's stderr). The banner starts with a line
+# containing only asterisks and "W A R N I N G" and ends with a blank line.
+# We also strip the "Warning: Permanently added ... to the list of known
+# hosts." line that precedes it on first connect.
+_SEAT_BANNER = re.compile(
+    r'(?:Warning: Permanently added [^\n]*to the list of known hosts\.\s*\n)?'
+    r'(?:\s*\* \* \* \* \* \* \* \* \* \* \* W A R N I N G[^\n]*\n'
+    r'(?:[^\n]*\n)*?'
+    r'\s*\n)',
+    re.MULTILINE,
+)
+
+
+def _strip_seat_banner(text):
+    """Remove the seat's legal-warning banner from scp/ssh output."""
+    if not text:
+        return text
+    cleaned = _SEAT_BANNER.sub('', text)
+    return cleaned.strip() or text.strip()
 
 
 def _gather_all_gateways(seat_port_manager, seat_sh_devices):
@@ -1178,8 +1231,13 @@ class GatewayMixin:
                 if not ok or not seat_host:
                     return
 
-            # Determine destination path on seat
-            dest_path = f"/storage/emulated/0/{raw_name}"
+            # Determine destination path on the seat.
+            # mtc user's SSH shell is sandboxed: it can't write to
+            # /sdcard or /storage/emulated/0 (both require SAF permissions
+            # or privileged shell). The only reliable destination is
+            # /data/local/tmp/, which is owned by the system/shell group
+            # and writable by the mtc account.
+            dest_path = f"/data/local/tmp/{raw_name}"
 
             # Get the mtc password — needed for SCP from gateway to seat.
             # The mtc password is cached globally (same across all seats).
@@ -1197,10 +1255,13 @@ class GatewayMixin:
                 creds.set_global_mtc_password(mtc_password)
 
             self.log(f"Gateway: copying {raw_name} to seat {seat_host}:{dest_path} via SCP on gateway", "INFO")
-            self.update_status(f"Copying to {seat_host}…")
+            self.update_status(f"Copying to {seat_host}:{dest_path}…")
 
-            progress = QProgressDialog(f"Copying to seat…", None, 0, 100, explorer)
-            progress.setWindowTitle("Copy to Seat")
+            progress = QProgressDialog(
+                f"Copying to {seat_host}:{dest_path}…",
+                None, 0, 100, explorer,
+            )
+            progress.setWindowTitle(f"Copy to Seat — {dest_path}")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(500)
             progress.setValue(0)
@@ -1226,6 +1287,8 @@ class GatewayMixin:
                     "esac\n"
                 )
 
+                exit_code = -1
+                last_err = ""
                 try:
                     # Write askpass script to gateway
                     stdin, stdout, stderr = ssh_client.exec_command(
@@ -1249,7 +1312,6 @@ class GatewayMixin:
                         f"{shlex.quote(remote_path)} "
                         f"mtc@{seat_host}:{shlex.quote(dest_path)}"
                     )
-                    self.log(f"Gateway: running SCP on {user}@{host} to {seat_host}", "DEBUG")
 
                     stdin, stdout, stderr = ssh_client.exec_command(scp_cmd, timeout=300)
                     exit_code = stdout.channel.recv_exit_status()
@@ -1258,8 +1320,7 @@ class GatewayMixin:
                 except Exception as e:
                     self.log(f"Failed to execute SCP on gateway: {e}", "ERROR")
                     exit_code = -1
-                    out = str(e)
-                    err = ""
+                    last_err = str(e)
                 finally:
                     # Clean up askpass script on gateway
                     try:
@@ -1274,21 +1335,30 @@ class GatewayMixin:
                         pass
                     self.update_status(message)
                     if success:
-                        self.log(f"Gateway: Copy-to-Seat succeeded via SCP on gateway", "INFO")
+                        self.log(
+                            f"Gateway: Copy-to-Seat succeeded to /data/local/tmp/{raw_name}",
+                            "INFO",
+                        )
                         QMessageBox.information(
                             self, "Copy Complete",
                             f"Copied to seat:\n\n{seat_host}:{dest_path}\n\n"
                             f"Command ran on {user}@{host}:\n"
-                            f"scp {raw_name} mtc@{seat_host}:/storage/emulated/0/"
+                            f"scp {raw_name} mtc@{seat_host}:/data/local/tmp/"
                         )
                     else:
                         self.log(f"Gateway Copy-to-Seat failed: {message}", "ERROR")
-                        QMessageBox.critical(self, "Copy Failed", f"Could not copy to seat:\n\n{message}")
+                        # Strip the noisy warning banner from scp output so
+                        # the user sees just the actionable error.
+                        clean = _strip_seat_banner(message)
+                        QMessageBox.critical(
+                            self, "Copy Failed",
+                            f"Could not copy to seat:\n\n{clean}",
+                        )
 
                 if exit_code == 0:
                     ui.call.emit(lambda: done(True, "Copy complete"))
                 else:
-                    error_msg = err or out or f"Exit code {exit_code}"
+                    error_msg = last_err or f"Exit code {exit_code}"
                     ui.call.emit(lambda: done(False, error_msg))
 
             threading.Thread(target=do_copy, daemon=True).start()
@@ -1364,7 +1434,20 @@ class GatewayMixin:
             edit_dlg.exec()
 
         def run_command_clicked():
-            """Run a shell command on the gateway and display output."""
+            """Run a shell command on the gateway and display output.
+
+            Uses an interactive shell channel so the remote side sources the
+            user's login profile (~/.zshrc / ~/.bashrc) — that picks up PATH
+            entries that shell functions add (e.g. `bct`). A non-interactive
+            ``exec_command`` channel only sources the login profile and skips
+            the interactive rc files, which is why commands like `bct login`
+            previously failed with `command not found`.
+
+            The PTY also lets the remote shell prompt for passwords and host
+            keys interactively. We watch the channel output and, when we see
+            a password/host-key prompt, ask the user via a Qt dialog on the
+            GUI thread and write the answer back into the channel's stdin.
+            """
             cmd, ok = QInputDialog.getMultiLineText(
                 explorer,
                 "Run Command",
@@ -1397,16 +1480,238 @@ class GatewayMixin:
             close_o.clicked.connect(output_dlg.accept)
             output_dlg.show()
 
+            def _ask_user(question_text, is_password):
+                """Ask the user a question from the GUI thread (blocking)."""
+                box = {'answer': None}
+
+                def ask():
+                    if is_password:
+                        ans, ok2 = QInputDialog.getText(
+                            output_dlg, "Remote Prompt",
+                            question_text,
+                            QLineEdit.EchoMode.Password,
+                        )
+                    else:
+                        ans, ok2 = QInputDialog.getText(
+                            output_dlg, "Remote Prompt",
+                            question_text,
+                        )
+                    box['answer'] = ans if ok2 else None
+                    output_dlg.activateWindow()
+
+                # Marshal to GUI thread and wait for the answer.
+                QApplication.postEvent(output_dlg, _AskEvent(ask))
+                _ANSWER_READY.clear()
+                # Spin a local event loop until the slot calls _ANSWER_READY.set().
+                # NOTE: _AnswerWaiter MUST NOT be passed a Python object as its
+                # QObject parent — that triggers `QObject(parent=…)` which
+                # rejects non-QObject args (the confusing "unexpected type
+                # 'Event'" error happens when a threading.Event is passed in).
+                # The waiter just needs to be alive long enough to filter
+                # events, so we hand it `output_dlg` (already a QObject).
+                waiter = _AnswerWaiter(output_dlg)
+                QApplication.instance().installEventFilter(waiter)
+                _ANSWER_READY.wait()
+                QApplication.instance().removeEventFilter(waiter)
+                return box['answer']
+
+            # Patterns that look like a remote prompt we should answer.
+            PASSWORD_PROMPTS = re.compile(
+                r"(password[: ]|passphrase|enter.*password|"
+                r"sudo.*password|verification code|token:|"
+                r"\(yes\/no\)|yes\/no\)|continue connecting \(yes\/no)",
+                re.IGNORECASE,
+            )
+            IS_PASSWORD = re.compile(
+                r"(password[: ]|passphrase|sudo.*password|verification code|token:)",
+                re.IGNORECASE,
+            )
+            # Strip ANSI / CSI control sequences for prompt scanning.
+            _CSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
             def do_run():
+                channel = None
                 try:
-                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=120)
-                    out = stdout.read().decode('utf-8', 'replace')
-                    err = stderr.read().decode('utf-8', 'replace')
-                    code = stdout.channel.recv_exit_status()
-                    combined = out
-                    if err:
-                        combined = (out + ("\n" if out else "") + err).rstrip()
+                    # get_pty=True forces a real PTY, which makes the remote
+                    # shell source interactive rc files (so `bct` is on PATH)
+                    # and lets it prompt for passwords / host keys.
+                    channel = ssh_client.invoke_shell(
+                        term='xterm',
+                        width=200,
+                        height=50,
+                    )
+                    channel.settimeout(0.2)
+                    # `cd` silently so the user doesn't see "cd /home/user"
+                    # echoed back. `/dev/null` redirects the cd's own output;
+                    # the *prompt* echo is silenced by sending a `clear`-ish
+                    # trick later in the cleanup. Send commands one at a time
+                    # so each gets its own prompt echo we can scrub.
+                    target_dir = current_path() or default_path
+                    channel.send(f"cd {shlex.quote(target_dir)} >/dev/null 2>&1\n")
+                    # Send a sentinel marker we'll use to find the start of
+                    # the actual command output.
+                    channel.send("echo __ADB_GUI_START__\n")
+                    channel.send(cmd + "\n")
+                    channel.send("echo __ADB_GUI_RC__=$?\n")
+
+                    collected = []
+                    pending_prompt = False  # True when we've already asked once and are waiting for the answer
+                    rc_line = ""
+                    saw_any_output = False
+
+                    import time
+                    deadline = time.time() + 300  # hard cap
+                    last_data_time = time.time()
+                    idle_limit = 30  # seconds with no output before we declare done
+
+                    while time.time() < deadline:
+                        if channel.recv_ready():
+                            try:
+                                chunk = channel.recv(4096).decode('utf-8', 'replace')
+                            except Exception:
+                                chunk = ""
+                            if chunk:
+                                saw_any_output = True
+                                last_data_time = time.time()
+                                collected.append(chunk)
+
+                                # Detect our end-of-command marker so we know
+                                # the command finished. The marker may straddle
+                                # chunks, so accumulate until we see a newline.
+                                rc_line += chunk
+                                if "__ADB_GUI_RC__=" in rc_line and "\n" in rc_line:
+                                    break
+                                if "\n" in rc_line:
+                                    # Once we have a full line past the marker,
+                                    # we're done — but keep draining briefly.
+                                    rc_line = ""
+
+                                scrubbed = _CSI.sub('', chunk).lower()
+
+                                # Password / host-key prompt?
+                                # Don't ask twice while we're still waiting on
+                                # the previous answer.
+                                if not pending_prompt and PASSWORD_PROMPTS.search(scrubbed):
+                                    pending_prompt = True
+                                    is_pw = bool(IS_PASSWORD.search(scrubbed))
+                                    # Pull the most recent visible line out of
+                                    # what we've collected — that's the prompt
+                                    # the user actually sees.
+                                    tail_visible = scrubbed.strip().split('\n')[-1] or "Password:"
+                                    # Truncate very long banners.
+                                    if len(tail_visible) > 200:
+                                        tail_visible = tail_visible[-200:]
+                                    answer = _ask_user(tail_visible, is_pw)
+                                    if answer is None:
+                                        # User cancelled — close channel and bail.
+                                        try: channel.close()
+                                        except Exception: pass
+                                        ui.call.emit(lambda: (
+                                            status.setText("❌ Cancelled"),
+                                            output.setPlainText("(cancelled by user)"),
+                                        ))
+                                        return
+                                    channel.send(answer + "\n")
+                                    # Next chunk will clear pending_prompt.
+                                    continue
+                                if pending_prompt and "\n" in chunk:
+                                    pending_prompt = False
+                        if channel.exit_status_ready() and not channel.recv_ready():
+                            # Channel closed.
+                            break
+                        if not channel.recv_ready():
+                            if saw_any_output and (time.time() - last_data_time) > idle_limit:
+                                break
+                            time.sleep(0.05)
+
+                    # Drain anything left
+                    try:
+                        while channel.recv_ready():
+                            collected.append(channel.recv(4096).decode('utf-8', 'replace'))
+                    except Exception:
+                        pass
+
+                    combined = "".join(collected)
+
+                    # ---- Output cleanup -----------------------------------------
+                    # `invoke_shell` returns the raw terminal stream: login
+                    # banner, prompt echoes, ANSI color codes, OSC title-set
+                    # sequences ("]0;..."), and the trailing prompt. We strip
+                    # all of that so the dialog shows just the command's own
+                    # output.
+                    #
+                    # 1) Find our START sentinel — everything before it is
+                    #    "shell setup" output (banner, cd echo, pre-cmd
+                    #    prompts) we don't want the user to see.
+                    start_idx = combined.find("__ADB_GUI_START__")
+                    if start_idx >= 0:
+                        # Skip past the sentinel and the newline that follows it.
+                        nl = combined.find("\n", start_idx)
+                        if nl >= 0:
+                            combined = combined[nl + 1:]
+                        else:
+                            combined = ""
+                        # The shell echoes back the line we typed
+                        # (`echo __ADB_GUI_START__`) before printing the
+                        # sentinel — strip that echoed line too.
+                        combined = re.sub(
+                            r'^[^\n@]*@[^\n]*[$#%][ ]*[^\n]*\n',
+                            '',
+                            combined,
+                            count=1,
+                        )
+                        # Now also strip the prompt echo of the user's own
+                        # command (e.g. "user@host:~$ ls"). We strip one
+                        # *terminal-styled* line at the start that matches
+                        # "<prompt> <cmd>\n" — the leading prompt echo before
+                        # the actual command output.
+                        combined = re.sub(
+                            r'^[^\n@]*@[^\n]*[$#%][ ]*[^\n]*\n',
+                            '',
+                            combined,
+                            count=1,
+                        )
+                    else:
+                        # START marker missing — show whatever we got so the
+                        # user can still see what happened.
+                        pass
+
+                    # 2) Pull out the exit code from the RC marker, drop the
+                    #    marker line itself.
+                    code = 0
+                    m = re.search(r"__ADB_GUI_RC__=(\d+)", combined)
+                    if m:
+                        code = int(m.group(1))
+                        combined = combined[:m.start()].rstrip()
+
+                    # 3) Strip OSC sequences that set the window title
+                    #    ("]0;...") and BEL terminators.
+                    combined = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', combined)
+
+                    # 4) Strip CSI sequences: SGR colors ("[0m", "[01;32m"…),
+                    #    cursor moves, erase-line, etc. Anything starting
+                    #    with ESC[ followed by parameter bytes and a final
+                    #    letter.
+                    combined = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', combined)
+
+                    # 5) Strip the leading "Last login: …" banner if the
+                    #    START marker didn't catch it (some shells print it
+                    #    through PAM motd, before our first echo).
+                    combined = re.sub(r'(?m)^Last login:.*$', '', combined)
+
+                    # 6) Strip the trailing prompt echo that the shell
+                    #    re-prints after the command finishes — it's a line
+                    #    like "user@host: /some/path$ " (or "% " or "# ").
+                    #    Only strip if it sits at the very end of the output.
+                    combined = re.sub(
+                        r'[\r\n]+[^\n@]*@[^\n]*[$#%][ ]*$',
+                        '',
+                        combined,
+                    )
+
+                    combined = combined.strip()
                     self.log(f"Gateway: ran '{cmd.splitlines()[0][:60]}', exit={code}", "INFO")
+
                     def apply():
                         status.setText(f"✅ Done (exit {code})" if code == 0 else f"⚠️ Exit {code}")
                         output.setPlainText(combined or "(no output)")
@@ -1419,6 +1724,12 @@ class GatewayMixin:
                         output.setPlainText(err)
                     ui.call.emit(apply_err)
                     self.log(f"Gateway: run failed: {err}", "ERROR")
+                finally:
+                    if channel is not None:
+                        try:
+                            channel.close()
+                        except Exception:
+                            pass
             threading.Thread(target=do_run, daemon=True).start()
 
         def mkdir_clicked():
