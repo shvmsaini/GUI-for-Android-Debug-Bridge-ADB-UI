@@ -889,6 +889,7 @@ ssh \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
     -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=accept-new \
     $SSH_ARGS \
     "$USER@$GATEWAY" \
     -Nfg
@@ -968,9 +969,11 @@ def deploy():
 
 def get_seat_script_path():
     """Return the on-disk path to the bundled seat.sh."""
+    deploy()
     return _SEAT_SCRIPT_PATH
 
 
 def get_portforward_script_path():
     """Return the on-disk path to the bundled portforwardRack.sh."""
+    deploy()
     return _PORTFORWARD_SCRIPT_PATH

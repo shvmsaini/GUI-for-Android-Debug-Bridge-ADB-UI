@@ -99,6 +99,9 @@ class SeatPortManager:
                     "WARNING"
                 )
                 # Intentional drop-through to bundled
+        which_pf = shutil.which('portforwardRack.sh') or shutil.which('portForwardRack.sh')
+        if which_pf and os.path.exists(which_pf):
+            return which_pf
         return bundled_scripts.get_portforward_script_path()
 
     # ------------------------------------------------------------------

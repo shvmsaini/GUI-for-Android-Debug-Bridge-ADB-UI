@@ -1610,28 +1610,35 @@ class SeatMixin:
         # Get current port forward status (using cached data)
         active_rack = None
         active_rack_host = None
-        if pf_status and pf_status.get('active'):
+        is_pf_active = bool(pf_status and pf_status.get('active'))
+        if is_pf_active:
             active_rack = pf_status.get('rack', '')
             # Normalize to a hostname we can match against gateway entries
             # (gateway entries are typically "user@host" or bare hostnames).
             active_rack_host = active_rack.split('@', 1)[-1].strip() if active_rack else ''
+        else:
+            self.seat_port_manager.mark_portforward_disconnected()
 
         # Sort: Connected/active port forwards first, then others
         connected_pf = []
         disconnected_pf = []
         for entry in top_pf:
-            # A port forward is connected only if:
-            #  - the internal state machine says this gateway is connected, OR
-            #  - this gateway matches the active rack reported by the script.
-            # Do NOT use seat-sh port fallback — those ports belong to seats,
-            # not port forwards, and cross-highlighting caused false positives.
-            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
-            is_active_rack = bool(active_rack_host) and (
-                active_rack_host == entry['gateway']
-                or entry['gateway'].endswith('@' + active_rack_host)
-                or active_rack_host in entry['gateway'].split('@', 1)[-1]
+            # A port forward is connected ONLY if the underlying script reports
+            # port forwarding as ACTIVE, and this entry matches the active rack
+            # or current session. This prevents false positive 🟢 highlights.
+            gw = entry.get('gateway', '')
+            gw_host = gw.split('@', 1)[-1].strip() if '@' in gw else gw
+            is_active_rack = is_pf_active and bool(active_rack_host) and (
+                active_rack_host == gw
+                or active_rack_host == gw_host
+                or gw.endswith('@' + active_rack_host)
+                or active_rack_host in gw_host
             )
-            if is_connected or is_active_rack:
+            is_connected = is_pf_active and (
+                self.seat_port_manager.is_portforward_connected(gw)
+                or is_active_rack
+            )
+            if is_connected:
                 connected_pf.append(entry)
             else:
                 disconnected_pf.append(entry)
@@ -1642,13 +1649,17 @@ class SeatMixin:
         top_pf = top_pf[:50]
 
         for entry in top_pf:
-            is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
-
-            # Check if this entry's gateway matches the active rack
-            is_active_rack = bool(active_rack_host) and (
-                active_rack_host == entry['gateway']
-                or entry['gateway'].endswith('@' + active_rack_host)
-                or active_rack_host in entry['gateway'].split('@', 1)[-1]
+            gw = entry.get('gateway', '')
+            gw_host = gw.split('@', 1)[-1].strip() if '@' in gw else gw
+            is_active_rack = is_pf_active and bool(active_rack_host) and (
+                active_rack_host == gw
+                or active_rack_host == gw_host
+                or gw.endswith('@' + active_rack_host)
+                or active_rack_host in gw_host
+            )
+            is_connected = is_pf_active and (
+                self.seat_port_manager.is_portforward_connected(gw)
+                or is_active_rack
             )
 
             # Determine headend
@@ -1665,7 +1676,7 @@ class SeatMixin:
                 gateway = gateway[:47] + "…"
 
             # Format: show headend on the line above the gateway
-            if is_active_rack or is_connected:
+            if is_connected:
                 text = f"🟢 Headend: {headend_display}\n{gateway}"
                 btn_connected = True
             else:
@@ -1832,7 +1843,16 @@ class SeatMixin:
         """Handle port forward button click"""
         if not entry:
             return
-        is_connected = self.seat_port_manager.is_portforward_connected(entry['gateway'])
+
+        pf_status = self.seat_port_manager.get_portforward_status()
+        is_pf_active = bool(pf_status and pf_status.get('active'))
+        active_rack = (pf_status.get('rack') or '').split('@')[-1].strip() if is_pf_active else ''
+        gw_host = entry.get('gateway', '').split('@')[-1].strip()
+
+        is_connected = is_pf_active and (
+            self.seat_port_manager.is_portforward_connected(entry['gateway'])
+            or (bool(active_rack) and (active_rack == gw_host or active_rack in entry['gateway']))
+        )
 
         if is_connected:
             # Confirm before tearing down a port-forward. Same rationale as
@@ -1853,15 +1873,20 @@ class SeatMixin:
             QTimer.singleShot(0, _do_pf_disconnect_confirm)
             return
         else:
-            # Connect (need partition and user from somewhere - for now use entry)
-            # Parse user from gateway like "user@pdc-dev-ek"
-            parts = entry['gateway'].split('@')
-            if len(parts) == 2:
-                user_part, gateway_host = parts
-                partition = entry.get('headend') or 'cs1'
-                self.connect_portforward(entry['gateway'], partition, user_part)
+            # Connect using gateway, headend/partition, and user from entry
+            gateway = entry.get('gateway', '').strip()
+            if '@' in gateway:
+                user_part, gateway_host = gateway.split('@', 1)
             else:
-                self.log("Invalid gateway format", "ERROR")
+                user_part = entry.get('user', '').strip() or 'user'
+                gateway_host = gateway
+                gateway = f"{user_part}@{gateway_host}"
+
+            partition = (entry.get('headend') or '').strip()
+            if not partition:
+                partition = '172.17.4.4'
+
+            self.connect_portforward(gateway, partition, user_part)
 
     def _on_remove_seat_history_clicked(self, entry):
         """Handle the ✕ button on a seat history row.
@@ -2772,9 +2797,15 @@ class SeatMixin:
         # Strip any user@ prefix from the gateway so the script sees a bare
         # hostname. The user is passed separately.
         if '@' in gateway:
-            gateway_host = gateway.split('@', 1)[1]
+            user_part, gateway_host = gateway.split('@', 1)
+            user = user or user_part
         else:
             gateway_host = gateway
+
+        user = user or 'user'
+        partition = (partition or '').strip()
+        if not partition:
+            partition = '172.17.4.4'
 
         # Get password from Keychain only (no plain text storage)
         # Keychain is keyed by the hostname and user, constructed as user@hostname
@@ -2790,8 +2821,17 @@ class SeatMixin:
                 return
 
         def do_connect():
+            askpass_file = None
             try:
-                # Resolve script path (custom override or bundled fallback)
+                # Apply trusted gateway override if configured for this host
+                if self._apply_trusted_gateway_config(gateway_host):
+                    self.log(
+                        f"Using trusted-cert override for {gateway_host} "
+                        "(host cert verification disabled for this gateway only)",
+                        "WARNING"
+                    )
+
+                # Resolve script path (custom override, PATH, or bundled fallback)
                 script_path = self.seat_port_manager._get_portforward_script_path()
 
                 # Check if script exists; fall back to bundled if not
@@ -2827,33 +2867,33 @@ class SeatMixin:
                 # Wait a moment for ports to be released
                 time.sleep(1)
 
-                # Use sshpass if available, otherwise try with SSH_ASKPASS
-                if shutil.which('sshpass'):
-                    cmd = ['sshpass', '-p', password, script_path, gateway_host, partition, user]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-                    stdout, stderr = result.stdout, result.stderr
-                    returncode = result.returncode
-                else:
-                    # Fallback: pass password via SSH_ASKPASS
-                    askpass_script = f"#!/bin/sh\necho {password}\n"
-                    askpass_file = '/tmp/adb_gui_askpass.sh'
-                    with open(askpass_file, 'w') as f:
-                        f.write(askpass_script)
-                    os.chmod(askpass_file, 0o755)
-                    env['SSH_ASKPASS'] = askpass_file
-                    env['SSH_ASKPASS_REQUIRE'] = 'force'
+                # Use SSH_ASKPASS to feed the password to ssh. DO NOT use
+                # sshpass: sshpass holds open a pty to ssh that, when the
+                # script's `ssh ... -Nfg` forks the tunnel child into background,
+                # ends up reaping it as soon as sshpass exits — the tunnel dies
+                # immediately and portforwardRack.sh status reports NOT ACTIVE.
+                #
+                # SSH_ASKPASS, by contrast, is invoked by ssh itself as a
+                # one-shot helper process and closes cleanly once ssh has
+                # the password; the forked tunnel child detaches properly
+                # and survives after the script exits.
+                import shlex
+                askpass_file = f"/tmp/adb_gui_askpass_pf_{os.getpid()}_{threading.get_ident()}.sh"
+                askpass_script = f"#!/bin/sh\nexec printf '%s\\n' {shlex.quote(password)}\n"
+                with open(askpass_file, 'w') as f:
+                    f.write(askpass_script)
+                os.chmod(askpass_file, 0o755)
+                env['SSH_ASKPASS'] = askpass_file
+                env['SSH_ASKPASS_REQUIRE'] = 'force'
+                env.setdefault('DISPLAY', ':0')
 
-                    cmd = [script_path, gateway_host, partition, user]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-                    stdout, stderr = result.stdout, result.stderr
-                    returncode = result.returncode
+                cmd = [script_path, gateway_host, partition, user]
+                self.log(f"Connecting port forward via {os.path.basename(script_path)} to {gateway_host}...", "INFO")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=35, env=env)
+                stdout, stderr = result.stdout or "", result.stderr or ""
+                returncode = result.returncode
 
-                    try:
-                        os.remove(askpass_file)
-                    except:
-                        pass
-
-                # Check for success: returncode 0 AND no obvious error messages
+                # Check for fatal errors in initial command execution
                 error_indicators = [
                     "Connection refused",
                     "Could not resolve hostname",
@@ -2864,6 +2904,7 @@ class SeatMixin:
                     "Network is unreachable",
                     "No route to host",
                     "ssh: ",
+                    "failed to start",
                 ]
                 has_error = (
                     returncode != 0
@@ -2871,20 +2912,42 @@ class SeatMixin:
                     or any(ind.lower() in stdout.lower() for ind in error_indicators)
                 )
 
+                # Verify actual status from the script / control socket
+                is_active = False
                 if not has_error:
+                    # Give background SSH daemon up to 2 seconds to bind ports and write state
+                    for _ in range(4):
+                        time.sleep(0.5)
+                        status = self.seat_port_manager.get_portforward_status()
+                        if status and status.get('active'):
+                            is_active = True
+                            break
+
+                self._cached_pf_status = None
+                if is_active:
                     self.seat_port_manager.mark_portforward_connected(gateway)
-                    # History is owned by portforwardRack.sh — it calls saveHistory
-                    # internally on successful start. We just read it back.
-                    self.log(f"Port forward connected for {gateway}", "INFO")
+                    self.log(f"Port forward connected for {gateway} (headend: {partition})", "INFO")
                     self.update_status(f"Port forward connected")
                     self.run_on_main_thread(self.refresh_seat_port_lists)
                 else:
-                    error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
+                    self.seat_port_manager.mark_portforward_disconnected()
+                    error = stderr.strip() or stdout.strip() or f"Port forward failed to become active (script code {returncode})"
                     self.log(f"Failed to set up port forward: {error}", "ERROR")
                     self.update_status("Failed to set up port forward")
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
             except Exception as e:
+                self.seat_port_manager.mark_portforward_disconnected()
+                self._cached_pf_status = None
                 self.log(f"Error setting up port forward: {str(e)}", "ERROR")
                 self.update_status("Error setting up port forward")
+                self.run_on_main_thread(self.refresh_seat_port_lists)
+            finally:
+                if askpass_file:
+                    try:
+                        if os.path.exists(askpass_file):
+                            os.remove(askpass_file)
+                    except Exception:
+                        pass
 
         threading.Thread(target=do_connect, daemon=True).start()
 
@@ -2919,8 +2982,9 @@ class SeatMixin:
                 cmd = [script_path, 'stop']
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
 
+                self.seat_port_manager.mark_portforward_disconnected()
+                self._cached_pf_status = None
                 if result.returncode == 0:
-                    self.seat_port_manager.mark_portforward_disconnected()
                     self.log("Port forward stopped", "INFO")
                     self.update_status("Port forward stopped")
                     self.run_on_main_thread(self.refresh_seat_port_lists)
@@ -2928,9 +2992,13 @@ class SeatMixin:
                     error = result.stderr or result.stdout or "Unknown error"
                     self.log(f"Failed to stop port forward: {error}", "ERROR")
                     self.update_status("Failed to stop port forward")
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
             except Exception as e:
+                self.seat_port_manager.mark_portforward_disconnected()
+                self._cached_pf_status = None
                 self.log(f"Error stopping port forward: {str(e)}", "ERROR")
                 self.update_status("Error stopping port forward")
+                self.run_on_main_thread(self.refresh_seat_port_lists)
 
         threading.Thread(target=do_disconnect, daemon=True).start()
 
@@ -3474,9 +3542,18 @@ class SeatMixin:
             partition = partition_edit.text().strip()
             user = user_edit.text().strip()
 
-            if not rack or not partition or not user:
-                QMessageBox.warning(dialog, "Input Required", "Please enter all fields")
+            if not rack:
+                QMessageBox.warning(dialog, "Input Required", "Please enter rack hostname")
                 return
+
+            if not user:
+                user = "user"
+            if not partition:
+                partition = "172.17.4.4"
+
+            if '@' in rack:
+                user_part, rack = rack.split('@', 1)
+                user = user_part or user
 
             # Gateway format: user@rack
             gateway = f"{user}@{rack}"
@@ -3492,7 +3569,7 @@ class SeatMixin:
                 password, ok = QInputDialog.getText(
                     dialog,
                     "Password Required",
-                    f"Enter password for {user}@{rack}:",
+                    f"Enter password for {user}@{rack_host}:",
                     QLineEdit.EchoMode.Password
                 )
                 if not ok or not password:
