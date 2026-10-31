@@ -38,6 +38,13 @@ class LoggingMixin:
         unless ``self._debug_logging`` is True — set it from a flag/setting
         to see the verbose flow without re-introducing log spam by default.
         """
+        # Always write to persistent session log on disk immediately (thread-safe)
+        try:
+            from .crash_handler import log_to_session_file
+            log_to_session_file(message, level=level)
+        except Exception:
+            pass
+
         if level == "DEBUG" and not getattr(self, "_debug_logging", False):
             return
 
@@ -129,8 +136,16 @@ class LoggingMixin:
                 self.log(f"Exported log to {path}")
                 self.update_status(f"Exported log to {path}")
             except Exception as e:
-                QMessageBox.critical(self, "Export Failed",
-                                     f"Could not write file:\n\n{e}")
+                from .safe_dialog import safe_critical
+                safe_critical(self, "Export Failed", f"Could not write file: {e}")
+
+    def export_diagnostic_bundle(self):
+        """Package all session logs, crash traces, and system info into a ZIP file."""
+        from .crash_handler import create_diagnostic_bundle
+        zip_path = create_diagnostic_bundle(parent=self)
+        if zip_path:
+            self.log(f"Exported diagnostic bundle to: {zip_path}", "INFO")
+            self.update_status(f"Diagnostic bundle saved to: {os.path.basename(zip_path)}")
 
     def toggle_log_view(self):
         """Toggle between App Logs and Logcat view"""

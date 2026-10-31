@@ -5,6 +5,9 @@ import os
 import sys
 import time
 import tempfile
+import shutil
+import signal
+from datetime import datetime
 import faulthandler
 
 # Application version - single source of truth. Bump on release.
@@ -45,16 +48,48 @@ else:
 # Crash log directory (subdirectory for crash reports)
 _crash_log_dir = os.path.join(_app_data_dir, "crashes")
 
-# Ensure the directory exists
-try:
-    os.makedirs(_crash_log_dir, exist_ok=True)
-except Exception:
-    _crash_log_dir = tempfile.gettempdir()  # Fallback to temp dir
+# Persistent application logs directory
+_app_log_dir = os.path.join(_app_data_dir, "logs")
 
-# Path for faulthandler to write native crash traces
+# Ensure the directories exist
+for _d in (_crash_log_dir, _app_log_dir):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except Exception:
+        pass
+
+# Session log paths
+_SESSION_LOG_PATH = os.path.join(_app_log_dir, "session.log")
+_PREV_SESSION_LOG_PATH = os.path.join(_app_log_dir, "session.prev.log")
+
+# Path for faulthandler to write native crash traces (SIGSEGV, SIGABRT, etc.)
 _FAULTHANDLER_LOG_PATH = os.path.join(_crash_log_dir, "faulthandler_crash.log")
+_FAULTHANDLER_PREV_PATH = os.path.join(_crash_log_dir, "faulthandler_prev.log")
+
+# On startup, do NOT truncate any crash log from the previous run!
+# If the previous log has data, archive it before starting this session.
 try:
-    _FAULTHANDLER_FILE = open(_FAULTHANDLER_LOG_PATH, 'w', encoding='utf-8')
-    faulthandler.enable(_FAULTHANDLER_FILE)
+    if os.path.exists(_FAULTHANDLER_LOG_PATH) and os.path.getsize(_FAULTHANDLER_LOG_PATH) > 0:
+        shutil.copy2(_FAULTHANDLER_LOG_PATH, _FAULTHANDLER_PREV_PATH)
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(_FAULTHANDLER_LOG_PATH, os.path.join(_crash_log_dir, f"crash_native_{_ts}.log"))
+        # Remove the previous file so the new session starts fresh
+        os.remove(_FAULTHANDLER_LOG_PATH)
 except Exception:
-    faulthandler.enable()  # If file open fails, use stderr
+    pass
+
+try:
+    _FAULTHANDLER_FILE = open(_FAULTHANDLER_LOG_PATH, 'a', encoding='utf-8')
+    # all_threads=True ensures all threads' stack traces are printed on native crash
+    faulthandler.enable(_FAULTHANDLER_FILE, all_threads=True)
+    # Register SIGUSR1 (if supported) to dump thread stacks on demand without crashing
+    if hasattr(signal, 'SIGUSR1'):
+        try:
+            faulthandler.register(signal.SIGUSR1, file=_FAULTHANDLER_FILE, all_threads=True)
+        except Exception:
+            pass
+except Exception:
+    try:
+        faulthandler.enable()  # Fallback to stderr
+    except Exception:
+        pass

@@ -284,6 +284,31 @@ class SettingsDialog(QDialog):
 
         content_layout.addWidget(history_group)
 
+        # Troubleshooting & Diagnostic Logs section
+        diag_group = QGroupBox("Troubleshooting & Crash Logs")
+        diag_layout = QVBoxLayout(diag_group)
+
+        diag_hint = QLabel(
+            "If you experience crashes or issues, you can export a complete diagnostic\n"
+            "bundle (session logs, native crash traces, and system info) to share with the developer."
+        )
+        diag_hint.setStyleSheet(f"color: {self.colors.get('text_secondary', '#666')}; font-size: 11px;")
+        diag_layout.addWidget(diag_hint)
+
+        diag_btn_row = QHBoxLayout()
+        export_bundle_btn = QPushButton("📦 Export Diagnostic Bundle (ZIP)")
+        export_bundle_btn.setToolTip("Export all logs, crash traces, and diagnostics into a single ZIP archive")
+        export_bundle_btn.clicked.connect(self._export_diagnostic_bundle)
+        diag_btn_row.addWidget(export_bundle_btn)
+
+        open_logs_btn = QPushButton("📂 Open Logs Folder")
+        open_logs_btn.setToolTip("Open the local folder containing session and crash logs in Finder / File Explorer")
+        open_logs_btn.clicked.connect(self._open_logs_folder)
+        diag_btn_row.addWidget(open_logs_btn)
+
+        diag_layout.addLayout(diag_btn_row)
+        content_layout.addWidget(diag_group)
+
         # Buttons
         button_row = QHBoxLayout()
         button_row.addStretch()
@@ -466,17 +491,27 @@ class SettingsDialog(QDialog):
 
         threading.Thread(target=do_purge, daemon=True).start()
 
+    def _export_diagnostic_bundle(self):
+        """Export all session logs, crash traces, and diagnostics into a single ZIP archive."""
+        from .crash_handler import create_diagnostic_bundle
+        create_diagnostic_bundle(parent=self)
+
+    def _open_logs_folder(self):
+        """Open the application's logs directory in Finder / File Explorer."""
+        from .crash_handler import open_logs_folder
+        open_logs_folder()
+
     def clear_stored_passwords(self):
-        reply = QMessageBox.question(
+        from .safe_dialog import safe_question_multiline, safe_info
+        confirmed = safe_question_multiline(
             self,
             "Clear Passwords",
             "Clear all stored SSH passwords?\n\n"
             "This will remove all Keychain entries for SSH credentials "
             "(gateways, seats, MTC, etc.).\n\n"
-            "You'll need to enter password again on next connection.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            "You'll need to enter passwords again on next connection."
         )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not confirmed:
             return
 
         if sys.platform == 'darwin':
@@ -484,25 +519,20 @@ class SettingsDialog(QDialog):
             creds = CredentialManager()
             deleted, failed = creds.clear_all()
             if deleted == 0 and failed == 0:
-                msg = ("No stored passwords found.\n\n"
-                       "If passwords still appear cached, they may have been "
-                       "added outside this app. Check Keychain Access → "
+                msg = ("No stored passwords found in Keychain.\n\n"
+                       "If passwords still appear cached, check Keychain Access → "
                        "search for 'ADB-GUI-UI'.")
-                QMessageBox.information(self, "No Passwords Found", msg)
+                safe_info(self, "No Passwords Found", msg)
             else:
                 msg = f"Cleared {deleted} stored password(s)."
                 if failed:
-                    msg += f"\n\n{failed} entry(ies) could not be removed "
-                    msg += "(may require Keychain access approval).\n\n"
-                    msg += "You can clear them manually via Keychain Access → "
-                    msg += "search for 'ADB-GUI-UI'."
-                QMessageBox.information(self, "Passwords Cleared", msg)
+                    msg += f"\n\n{failed} entry(ies) could not be removed."
+                safe_info(self, "Passwords Cleared", msg)
         else:
-            QMessageBox.information(
+            safe_info(
                 self,
                 "Not Supported",
-                "Password clearing is only supported on macOS.\n\n"
-                "Please clear Keychain entries manually through System Settings."
+                "Password clearing is only supported on macOS."
             )
 
     def browse_adb(self):
