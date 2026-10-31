@@ -3069,6 +3069,112 @@ class SeatMixin:
                     pass
         return arp_entries, err
 
+    def _ssh_run_arp_via_bct(self, gateway_user, gateway_host, password):
+        """SSH into the gateway, check if `bct` is available, then drive an
+        interactive shell: run `bct login` to reach the MTC host
+        (`[mtc@nc1 ~]$`), run `arp -a` there, and parse the output.
+
+        `bct login` needs a live terminal, so this uses an invoke_shell()
+        PTY and waits for prompts rather than exec_command().
+
+        Returns ``(arp_entries, error_str)``.
+        """
+        arp_entries = {}
+        err = None
+        client = None
+        try:
+            client, connect_err = self._ssh_connect(gateway_host, gateway_user, password, timeout=6)
+            if client is None:
+                err = connect_err or "SSH connect failed"
+                self.log(f"BCT arp SSH connect failed: {err}", "DEBUG")
+                return arp_entries, err
+
+            chan = client.invoke_shell(width=200, height=50)
+            chan.settimeout(0.5)
+
+            def read_until(markers, timeout_s):
+                buf = ''
+                deadline = time.time() + timeout_s
+                while time.time() < deadline:
+                    try:
+                        data = chan.recv(4096)
+                        if data:
+                            buf += data.decode('utf-8', 'replace')
+                            if any(m in buf for m in markers):
+                                return buf
+                            continue
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
+                return buf
+
+            # Wait for gateway prompt, then probe for bct inside the shell.
+            read_until(['$ ', '# ', '% '], 5)
+            chan.send('command -v bct\n')
+            probe_out = read_until(['$ ', '# ', '% '], 5)
+            cleaned = probe_out.replace('command -v bct', '').strip()
+            looks_like_prompt = cleaned.endswith('$ ') or cleaned.endswith('# ') or cleaned.endswith('% ') or cleaned == ''
+            if not cleaned or looks_like_prompt:
+                err = "bct not available on gateway"
+                self.log("BCT arp: bct not found via interactive probe", "DEBUG")
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                return arp_entries, err
+
+            # Run bct login, then arp -a on the MTC host.
+            chan.send('bct login\n')
+            login_out = read_until(['mtc@', ']$ ', ']# '], 15)
+            if 'mtc@' not in login_out and ']$' not in login_out and ']#' not in login_out:
+                err = "bct login did not reach an MTC prompt"
+                self.log("BCT arp: bct login failed", "DEBUG")
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                return arp_entries, err
+
+            # Run arp -a on MTC host.
+            read_until([], 0.5)
+            chan.send('arp -a\n')
+            arp_out = read_until(['\n[mtc@', ']$ '], 8)
+
+            # Parse IPs from arp output.
+            for line in arp_out.splitlines():
+                line = line.strip()
+                if not line or line.startswith('arp -a') or '$' in line.split(' ', 1)[0]:
+                    continue
+                name = line.split(None, 1)[0]
+                ip = None
+                if '(' in line and ')' in line:
+                    inside = line.split('(', 1)[1].split(')', 1)[0].strip()
+                    if _is_dotted_quad(inside):
+                        ip = inside
+                if ip and name:
+                    arp_entries[name] = ip
+
+            # Exit cleanly.
+            try:
+                chan.send('exit\n')
+                chan.close()
+            except Exception:
+                pass
+
+            if not arp_entries:
+                err = "bct arp -a returned no parseable IPs"
+                self.log("BCT arp: no IPs found", "DEBUG")
+        except Exception as e:
+            err = f"bct SSH arp failed: {e}"
+            self.log(err, "DEBUG")
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        return arp_entries, err
+
     def _show_add_seat_dialog(self):
         """Show dialog to connect to a new seat. Gateway field comes first;
         after selecting/typing one, seat IP auto-populates from remote
@@ -3310,23 +3416,47 @@ class SeatMixin:
                 """
                 suggestions = []
                 error_msg = None
-                try:
-                    remote, ssh_err = self._ssh_run_arp_via_gateway_explorer(
-                        gateway_user, gateway_host, gw_password
-                    )
-                    if remote:
-                        for ip in sorted(remote.values(), key=lambda x: (
-                            tuple(int(p) for p in x.split('.')) if _is_dotted_quad(x) else (0,0,0,0)
-                        )):
-                            if _is_dotted_quad(ip):
-                                suggestions.append(ip)
-                    else:
-                        self.log("Remote arp returned no entries; falling back to local", "DEBUG")
-                        if ssh_err:
-                            error_msg = ssh_err
-                except Exception as e:
-                    error_msg = f"Remote arp failed: {e}"
-                    self.log(error_msg, "DEBUG")
+                # Race the plain gateway `arp -a` against `bct login` + `arp -a`.
+                # Whichever returns IPs first wins; the loser is left to finish
+                # in its daemon thread and its result is discarded.
+                race_done = threading.Event()
+                race_result = {}
+                race_errors = []
+                race_finished = []
+
+                def run_candidate(name, fn):
+                    try:
+                        found, cand_err = fn(gateway_user, gateway_host, gw_password)
+                    except Exception as e:
+                        found, cand_err = {}, f"{name} failed: {e}"
+                    if found and not race_done.is_set():
+                        race_result['entries'] = found
+                        race_result['source'] = name
+                        race_done.set()
+                    elif cand_err:
+                        race_errors.append(cand_err)
+                    race_finished.append(name)
+
+                for name, fn in (
+                    ("gateway arp", self._ssh_run_arp_via_gateway_explorer),
+                    ("bct arp", self._ssh_run_arp_via_bct),
+                ):
+                    threading.Thread(target=run_candidate, args=(name, fn), daemon=True).start()
+
+                # Wait until a candidate wins or both have reported in.
+                deadline = time.time() + 15
+                while not race_done.is_set() and len(race_finished) < 2 and time.time() < deadline:
+                    race_done.wait(0.1)
+
+                if race_result:
+                    self.log(f"Seat scan won by {race_result['source']}", "DEBUG")
+                    for ip in sorted(race_result['entries'].values(), key=lambda x: (
+                        tuple(int(p) for p in x.split('.')) if _is_dotted_quad(x) else (0,0,0,0)
+                    )):
+                        if _is_dotted_quad(ip):
+                            suggestions.append(ip)
+                elif race_errors:
+                    error_msg = "; ".join(race_errors)
 
                 if not suggestions:
                     try:
