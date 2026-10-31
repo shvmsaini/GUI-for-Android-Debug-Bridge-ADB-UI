@@ -6,6 +6,7 @@ import time
 import shlex
 import shutil
 from datetime import datetime
+from typing import Optional
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject, QStandardPaths, QThread
 from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -20,7 +21,7 @@ from .adb_manager import ADBManager
 from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
-from .safe_dialog import safe_info, safe_warning, safe_critical
+from .safe_dialog import safe_info, safe_warning, safe_critical, safe_question
 from . import bundled_scripts
 
 # Optional: embedded scrcpy mirror (lazy-imported so the app still runs
@@ -924,7 +925,7 @@ class ScrcpyMixin:
                 client = ScrcpyClient(config)
                 client.adb.ensure_server = lambda: None
 
-                last_exc: Exception | None = None
+                last_exc = None  # type: Optional[Exception]
                 for attempt in range(3):
                     if self.mirror_closing:
                         return

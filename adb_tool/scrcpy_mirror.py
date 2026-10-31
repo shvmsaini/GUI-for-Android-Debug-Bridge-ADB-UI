@@ -15,6 +15,7 @@ Dependencies (lazy-imported so the rest of the app works without them):
 import sys
 import threading
 import traceback
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -391,25 +392,6 @@ class VideoDisplayWidget(QWidget):
 
             # Small delay to allow scroll to process
             _t.sleep(0.01)
-        except Exception:
-            pass
-
-            x_start = coords[0]
-            y_start = coords[1]
-
-            # Touch DOWN at start
-            self._client._send_touch_phase(0, x_start, y_start)
-
-            # Drag through intermediate positions
-            for seg in range(1, num_segments + 1):
-                current_y = int(y_start + step_dy * seg)
-                self._client._send_touch_phase(2, x_start, current_y)
-                _t.sleep(0.008)  # small delay between moves for smoothness
-
-            # Touch UP at final position
-            y_end = int(y_start + total_dy_scaled)
-            self._client._send_touch_phase(1, x_start, y_end)
-
         except Exception:
             pass
 
@@ -1398,7 +1380,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
                 # Retry start() a few times — transient "device not found"
                 # errors are common right after adb restarts.
-                last_exc: Exception | None = None
+                last_exc = None  # type: Optional[Exception]
                 for attempt in range(3):
                     if self._closing:
                         self._log("DEBUG", "Closing during start retries — aborting")
