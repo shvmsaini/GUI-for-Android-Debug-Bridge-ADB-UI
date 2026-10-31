@@ -10,11 +10,15 @@
 #     Notarization / Gatekeeper clearance when distributing externally.
 #
 # SIGSEGV / SIGABRT notes (Qt 6.11 / macOS 26):
-#   • scrcpy_canary.py is run as a subprocess (sys.executable canary_script).
-#     PyInstaller needs it as a DATA file (not just a hidden import) so the
-#     frozen sys.executable can find the .py source on disk.  We include
-#     the entire adb_tool/ package as datas so the canary's relative-import
-#     fallback also works.
+#   • scrcpy_canary.py runs as a subprocess via [sys.executable, '--canary'].
+#     The --canary CLI flag is handled in adb_gui.main() BEFORE any
+#     QApplication is created, so the canary subprocess never opens an
+#     ADB Tool window. This is critical in frozen builds: sys.executable
+#     IS the ADB Tool binary, so passing the canary script as argv1 would
+#     re-run the full GUI (a brief duplicate-window flash on every mirror
+#     click). The full adb_tool/ package is still bundled as datas so the
+#     relative-import fallback inside scrcpy_canary.py keeps working if
+#     scrcpy_canary is ever invoked standalone again.
 #   • av / numpy / py_scrcpy_sdk bring libav*.dylib / libopencv.dylib bundles.
 #     collect_all() picks up their binaries, but the duplicate-class SIGSEGV
 #     is handled in-process by the cv2 stub in scrcpy_mirror.py — no spec

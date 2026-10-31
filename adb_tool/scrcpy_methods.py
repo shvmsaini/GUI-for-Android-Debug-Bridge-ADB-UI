@@ -72,10 +72,16 @@ def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
         "max_size": int(max_size),
     }) + "\n"]
 
-    # Use the same Python interpreter we're running under so PyQt6,
-    # py_scrcpy_sdk, and the bundled cv2 stub all resolve identically.
-    here = os.path.dirname(os.path.abspath(__file__))
-    canary_script = os.path.join(here, "scrcpy_canary.py")
+    # Invoke the SAME process binary we're already running under, but
+    # with the `--canary` CLI flag (handled in adb_gui.main() before
+    # any QApplication is created). This avoids spawning a duplicate
+    # ADB Tool window: when frozen, sys.executable IS the ADB Tool
+    # binary, so passing the canary script as argv1 would re-run the
+    # full GUI instead of the canary — a brief flash of a second
+    # window every time the user clicks "Mirror" (the original bug).
+    # In script mode `sys.executable` is the system Python and the
+    # `--canary` flag still routes to scrcpy_canary.main() correctly.
+    cmd_argv = [sys.executable, "--canary"]
 
     # CREATE_NO_WINDOW on Windows so no console pops up. On macOS/Linux
     # start_new_session so a SIGINT to the GUI doesn't kill the canary
@@ -91,7 +97,7 @@ def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
 
     try:
         proc = subprocess.Popen(
-            [sys.executable, canary_script],
+            cmd_argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

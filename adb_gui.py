@@ -2915,6 +2915,17 @@ def main():
         print()
         return 0
 
+    # --canary: headless probe of py_scrcpy_sdk. Runs the same fragile
+    # native-init sequence the in-process mirror would, but never creates
+    # a QApplication or shows any windows. Used by _run_scrcpy_canary in
+    # scrcpy_methods.py — invoked as `[sys.executable, '--canary']` so a
+    # frozen binary doesn't spawn a duplicate ADB Tool GUI window. stdin
+    # is a single JSON line with device_id/adb_path/bitrate/max_fps/max_size;
+    # status is written as JSON lines to stderr; exit 0 on success.
+    if '--canary' in sys.argv:
+        from adb_tool import scrcpy_canary
+        sys.exit(scrcpy_canary.main())
+
     app = QApplication(sys.argv)
 
     # Check for a crash from the previous run (native crash detected by faulthandler)

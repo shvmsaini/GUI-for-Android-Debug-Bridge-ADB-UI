@@ -3204,7 +3204,7 @@ class SeatMixin:
             """Update seat combo box on GUI thread."""
             current_text = seat_combo.currentText().strip()
             # Don't overwrite if user is typing in seat field
-            if current_text == "⏳ Loading seats from gateway...":
+            if current_text == "⏳ Scanning gateway for seats...":
                 current_text = ""
             seat_combo.blockSignals(True)
             seat_combo.clear()
