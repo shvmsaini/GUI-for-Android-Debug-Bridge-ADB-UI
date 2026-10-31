@@ -1784,18 +1784,21 @@ class SeatMixin:
             # Confirm before tearing down a seat tunnel. Disconnect kills the
             # ssh -L tunnel and any open mirror window; accidental clicks on
             # the green "connected" button were a real annoyance.
-            reply = QMessageBox.question(
-                self,
-                "Disconnect seat?",
-                f"Disconnect from seat '{seat}'?\n\n"
-                f"This will tear down the tunnel and stop any open mirror window.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,  # default = No; safer
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            # Disconnect
-            self.disconnect_seat(entry['seat'])
+            # Defer to next event-loop tick to avoid opening a modal dialog
+            # inside the button-slot's sendPostedEvents() flush (SIGSEGV on
+            # macOS/Qt 6.11 via QTextEngine::validate() NULL-deref).
+            def _do_disconnect_confirm(s=seat, e=entry):
+                from .safe_dialog import safe_question_multiline
+                confirmed = safe_question_multiline(
+                    self,
+                    "Disconnect seat?",
+                    f"Disconnect from seat '{s}'?\n\n"
+                    f"This will tear down the tunnel and stop any open mirror window.",
+                )
+                if confirmed:
+                    self.disconnect_seat(e['seat'])
+            QTimer.singleShot(0, _do_disconnect_confirm)
+            return
         else:
             # Connect — fire `seat.sh auto-connect` internally without any
             # prompt dialog. Password must already be in Keychain for this
@@ -1835,18 +1838,19 @@ class SeatMixin:
             # the seat disconnect confirm: accidental clicks on the green
             # "active rack" button killed forwarding for everyone else
             # using that gateway.
-            reply = QMessageBox.question(
-                self,
-                "Stop port forward?",
-                f"Stop the active port forward for '{entry['gateway']}'?\n\n"
-                f"This tears down the ssh tunnels for every port on this rack.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,  # default = No; safer
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            # Disconnect
-            self.disconnect_portforward()
+            # Defer to avoid opening a modal inside a button-slot (macOS SIGSEGV).
+            def _do_pf_disconnect_confirm(e=entry):
+                from .safe_dialog import safe_question_multiline
+                confirmed = safe_question_multiline(
+                    self,
+                    "Stop port forward?",
+                    f"Stop the active port forward for '{e['gateway']}'?\n\n"
+                    f"This tears down the ssh tunnels for every port on this rack.",
+                )
+                if confirmed:
+                    self.disconnect_portforward()
+            QTimer.singleShot(0, _do_pf_disconnect_confirm)
+            return
         else:
             # Connect (need partition and user from somewhere - for now use entry)
             # Parse user from gateway like "user@pdc-dev-ek"
@@ -1873,15 +1877,14 @@ class SeatMixin:
         if not seat or not gateway:
             return
 
-        reply = QMessageBox.question(
+        from .safe_dialog import safe_question_multiline
+        confirmed = safe_question_multiline(
             self,
             "Remove seat from history?",
             f"Remove '{seat}' (port {port or 'auto'}) via {gateway} from seat history?\n\n"
             f"This only removes the entry from the list — it does not disconnect anything.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not confirmed:
             return
 
         removed = self.seat_port_manager.remove_history_entry(
@@ -1894,7 +1897,8 @@ class SeatMixin:
             # (Don't re-run external scripts; nothing on disk changed for them.)
             self.refresh_seat_port_lists(refetch=False)
         else:
-            QMessageBox.information(
+            from .safe_dialog import safe_info
+            safe_info(
                 self,
                 "Nothing removed",
                 f"Could not find '{seat}' in seat history — it may have been removed already.",
@@ -1916,15 +1920,14 @@ class SeatMixin:
         if not rack or not user_at_rack:
             return
 
-        reply = QMessageBox.question(
+        from .safe_dialog import safe_question_multiline
+        confirmed = safe_question_multiline(
             self,
             "Remove port forward from history?",
             f"Remove rack '{rack}' ({user_at_rack}) from port-forward history?\n\n"
             f"This only removes the entry from the list — it does not stop anything.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not confirmed:
             return
 
         removed = self.seat_port_manager.remove_history_entry(
@@ -1935,7 +1938,8 @@ class SeatMixin:
             self.log(f"Removed portforward history entry: {rack}", "DEBUG")
             self.refresh_seat_port_lists(refetch=False)
         else:
-            QMessageBox.information(
+            from .safe_dialog import safe_info
+            safe_info(
                 self,
                 "Nothing removed",
                 f"Could not find '{rack}' in port-forward history — it may have been removed already.",

@@ -154,6 +154,50 @@ def safe_question(parent, title, message):
     return role == QDialogButtonBox.StandardButton.Yes
 
 
+def safe_question_multiline(parent, title, message, yes_label="Yes", no_label="No"):
+    """Show a Yes/No confirmation dialog with multi-line message body.
+
+    Uses QPlainTextEdit instead of QLabel so arbitrary-length messages
+    render without triggering QTextEngine::itemize() on the title/button
+    text (which is kept short and plain).
+
+    Returns True for Yes, False for No/Cancel.
+    """
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(_shorten(title, 80))
+    dlg.setModal(True)
+    dlg.setMinimumWidth(420)
+
+    layout = QVBoxLayout(dlg)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(10)
+
+    # Use QPlainTextEdit for the body so long/multi-line messages are safe.
+    body = QPlainTextEdit(dlg)
+    body.setPlainText(str(message))
+    body.setReadOnly(True)
+    body.setMinimumHeight(80)
+    body.setMaximumHeight(200)
+    layout.addWidget(body)
+
+    btn_row = QHBoxLayout()
+    btn_row.addStretch(1)
+    yes_btn = QPushButton(_shorten(yes_label, 30), dlg)
+    yes_btn.setMinimumWidth(80)
+    no_btn = QPushButton(_shorten(no_label, 30), dlg)
+    no_btn.setMinimumWidth(80)
+    btn_row.addWidget(yes_btn)
+    btn_row.addWidget(no_btn)
+    layout.addLayout(btn_row)
+
+    result = {"chosen": False}
+    yes_btn.clicked.connect(lambda: (result.update({"chosen": True}), dlg.accept()))
+    no_btn.clicked.connect(lambda: dlg.reject())
+
+    dlg.exec()
+    return result["chosen"]
+
+
 def safe_multiline_dialog(parent, title, text, width=550, height=380):
     """Show detailed multi-line text in a read-only scrollable editor safely without QMessageBox."""
     dlg = QDialog(parent)

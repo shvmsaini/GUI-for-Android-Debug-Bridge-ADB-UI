@@ -61,6 +61,21 @@ def _setup_faulthandler():
     try:
         from .constants import _crash_log_dir
         crash_dir = _crash_log_dir
+    except ImportError:
+        # Running as __main__ (canary subprocess) — relative imports don't work.
+        try:
+            import sys as _sys
+            import os as _os
+            # The frozen app embeds adb_tool/ as a package in _MEIPASS or next to the exe.
+            _here = _os.path.dirname(_os.path.abspath(__file__))
+            _parent = _os.path.dirname(_here)
+            for _p in (_here, _parent):
+                if _p not in _sys.path:
+                    _sys.path.insert(0, _p)
+            from adb_tool.constants import _crash_log_dir  # noqa: E402
+            crash_dir = _crash_log_dir
+        except Exception:
+            crash_dir = _os.path.join(_os.path.expanduser("~"), ".adb_gui_crashes")
     except Exception:
         crash_dir = os.path.join(os.path.expanduser("~"), ".adb_gui_crashes")
     try:

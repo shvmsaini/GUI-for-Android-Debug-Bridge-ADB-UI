@@ -9,7 +9,7 @@ import traceback as _traceback_mod
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QMessageBox
+    QApplication, QFileDialog,
 )
 from .constants import APP_VERSION, _crash_log_dir, _FAULTHANDLER_LOG_PATH
 
@@ -78,26 +78,53 @@ def _crash_excepthook(exc_type, exc_value, exc_tb):
     # Call the original excepthook to print to stderr
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
-    # Try to show a dialog if QApplication is alive
+    # Try to show a dialog if QApplication is alive.
+    # Use a plain QDialog (not QMessageBox) to avoid QTextEngine::validate()
+    # NULL-deref on Qt 6.11 / macOS 26 when the message has multiple lines.
     try:
         app = QApplication.instance()
         if app and crash_file:
-            message = (
-                "ADB Tool encountered an unexpected error and has crashed.\n\n"
-                f"A crash report has been saved to:\n{crash_file}\n\n"
-                "Would you like to save a copy or open the report?"
+            from PyQt6.QtWidgets import (
+                QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
             )
-            reply = QMessageBox.critical(
-                None,
-                "ADB Tool Crash",
-                message,
-                QMessageBox.StandardButton.Save |
-                QMessageBox.StandardButton.Open |
-                QMessageBox.StandardButton.Discard
-            )
+            from PyQt6.QtCore import Qt
 
-            if reply == QMessageBox.StandardButton.Save:
-                # Let user pick a location to save it
+            dlg = QDialog(None)
+            dlg.setWindowTitle("ADB Tool Crash")
+            dlg.setModal(True)
+            dlg.setMinimumWidth(420)
+
+            layout = QVBoxLayout(dlg)
+            layout.setContentsMargins(16, 14, 16, 14)
+            layout.setSpacing(8)
+
+            hdr = QLabel("❌  ADB Tool encountered an unexpected error.", dlg)
+            hdr.setStyleSheet("font-weight: bold;")
+            hdr.setTextFormat(Qt.TextFormat.PlainText)
+            layout.addWidget(hdr)
+
+            sub = QLabel("A crash report has been saved. You can save a copy or open it.", dlg)
+            sub.setTextFormat(Qt.TextFormat.PlainText)
+            layout.addWidget(sub)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            save_btn = QPushButton("Save Copy", dlg)
+            open_btn = QPushButton("Open Log", dlg)
+            close_btn = QPushButton("Dismiss", dlg)
+            for b in (save_btn, open_btn, close_btn):
+                b.setMinimumWidth(90)
+                btn_row.addWidget(b)
+            layout.addLayout(btn_row)
+
+            chosen = {"v": "dismiss"}
+            save_btn.clicked.connect(lambda: (chosen.update({"v": "save"}), dlg.accept()))
+            open_btn.clicked.connect(lambda: (chosen.update({"v": "open"}), dlg.accept()))
+            close_btn.clicked.connect(dlg.reject)
+            dlg.exec()
+            action = chosen["v"]
+
+            if action == "save":
                 path, _ = QFileDialog.getSaveFileName(
                     None,
                     "Save Crash Report",
@@ -107,20 +134,18 @@ def _crash_excepthook(exc_type, exc_value, exc_tb):
                 if path:
                     try:
                         shutil.copy(crash_file, path)
-                        QMessageBox.information(None, "Saved", f"Crash report saved to:\n{path}")
-                    except Exception as e:
-                        QMessageBox.warning(None, "Save Failed", f"Could not save file:\n{e}")
-            elif reply == QMessageBox.StandardButton.Open:
-                # Try to open the file with the default application
+                    except Exception:
+                        pass
+            elif action == "open":
                 try:
                     if sys.platform == 'win32':
                         os.startfile(crash_file)
                     elif sys.platform == 'darwin':
                         subprocess.run(['open', crash_file])
-                    else:  # Linux
+                    else:
                         subprocess.run(['xdg-open', crash_file])
-                except Exception as e:
-                    QMessageBox.warning(None, "Open Failed", f"Could not open file:\n{e}")
+                except Exception:
+                    pass
     except Exception:
         # If showing dialog fails, just exit gracefully
         pass
@@ -128,58 +153,89 @@ def _crash_excepthook(exc_type, exc_value, exc_tb):
 
 def _check_for_previous_crash():
     """On startup, check if there's a faulthandler crash log from the previous run."""
-    if os.path.exists(_FAULTHANDLER_LOG_PATH):
-        try:
-            with open(_FAULTHANDLER_LOG_PATH, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read().strip()
+    if not os.path.exists(_FAULTHANDLER_LOG_PATH):
+        return
+    try:
+        with open(_FAULTHANDLER_LOG_PATH, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read().strip()
+        if not content:
+            return
 
-            if content:
-                # There was a native crash in the previous run
-                message = (
-                    "ADB Tool appears to have crashed in the previous session "
-                    "(detected via native crash handler).\n\n"
-                    "A crash report has been saved. Would you like to save a copy "
-                    "or view it?"
-                )
-                reply = QMessageBox.warning(
-                    None,
-                    "Previous Crash Detected",
-                    message,
-                    QMessageBox.StandardButton.Save |
-                    QMessageBox.StandardButton.Open |
-                    QMessageBox.StandardButton.Discard
-                )
+        # Use a safe QDialog (avoids QTextEngine::validate() NULL-deref on
+        # Qt 6.11 / macOS 26 that fires when QMessageBox lays out multi-line
+        # text — see safe_dialog.py for the full rationale).
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+            QPushButton, QPlainTextEdit,
+        )
+        from PyQt6.QtCore import Qt
 
-                if reply == QMessageBox.StandardButton.Save:
-                    path, _ = QFileDialog.getSaveFileName(
-                        None,
-                        "Save Crash Report",
-                        os.path.expanduser(f"~/adb_crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-                        "Log Files (*.log);;Text Files (*.txt);;All Files (*)"
-                    )
-                    if path:
-                        try:
-                            shutil.copy(_FAULTHANDLER_LOG_PATH, path)
-                            QMessageBox.information(None, "Saved", f"Crash report saved to:\n{path}")
-                        except Exception as e:
-                            QMessageBox.warning(None, "Save Failed", f"Could not save file:\n{e}")
-                elif reply == QMessageBox.StandardButton.Open:
-                    try:
-                        if sys.platform == 'win32':
-                            os.startfile(_FAULTHANDLER_LOG_PATH)
-                        elif sys.platform == 'darwin':
-                            subprocess.run(['open', _FAULTHANDLER_LOG_PATH])
-                        else:
-                            subprocess.run(['xdg-open', _FAULTHANDLER_LOG_PATH])
-                    except Exception as e:
-                        QMessageBox.warning(None, "Open Failed", f"Could not open file:\n{e}")
+        dlg = QDialog(None)
+        dlg.setWindowTitle("Previous Crash Detected")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(480)
 
-                # Clear the crash log for the next run
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        hdr = QLabel("⚠️  ADB Tool crashed in the previous session.", dlg)
+        hdr.setStyleSheet("font-weight: bold;")
+        hdr.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(hdr)
+
+        sub = QLabel("A native crash log was found. You can save or open it.", dlg)
+        sub.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(sub)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        save_btn = QPushButton("Save Copy", dlg)
+        open_btn = QPushButton("Open Log", dlg)
+        discard_btn = QPushButton("Dismiss", dlg)
+        for b in (save_btn, open_btn, discard_btn):
+            b.setMinimumWidth(90)
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+
+        chosen = {"v": "discard"}
+        save_btn.clicked.connect(lambda: (chosen.update({"v": "save"}), dlg.accept()))
+        open_btn.clicked.connect(lambda: (chosen.update({"v": "open"}), dlg.accept()))
+        discard_btn.clicked.connect(dlg.reject)
+
+        dlg.exec()
+        action = chosen["v"]
+
+        if action == "save":
+            from PyQt6.QtWidgets import QFileDialog
+            path, _ = QFileDialog.getSaveFileName(
+                None,
+                "Save Crash Report",
+                os.path.expanduser(f"~/adb_crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+                "Log Files (*.log);;Text Files (*.txt);;All Files (*)"
+            )
+            if path:
                 try:
-                    os.remove(_FAULTHANDLER_LOG_PATH)
+                    shutil.copy(_FAULTHANDLER_LOG_PATH, path)
                 except Exception:
                     pass
+        elif action == "open":
+            try:
+                if sys.platform == 'win32':
+                    os.startfile(_FAULTHANDLER_LOG_PATH)
+                elif sys.platform == 'darwin':
+                    subprocess.run(['open', _FAULTHANDLER_LOG_PATH])
+                else:
+                    subprocess.run(['xdg-open', _FAULTHANDLER_LOG_PATH])
+            except Exception:
+                pass
+
+        # Clear the crash log for the next run
+        try:
+            os.remove(_FAULTHANDLER_LOG_PATH)
         except Exception:
             pass
+    except Exception:
+        pass
 
 
