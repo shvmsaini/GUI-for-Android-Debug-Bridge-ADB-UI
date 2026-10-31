@@ -1787,17 +1787,18 @@ class SeatMixin:
             # Defer to next event-loop tick to avoid opening a modal dialog
             # inside the button-slot's sendPostedEvents() flush (SIGSEGV on
             # macOS/Qt 6.11 via QTextEngine::validate() NULL-deref).
-            def _do_disconnect_confirm(s=seat, e=entry):
+            def _do_disconnect_confirm(s=seat, g=gateway, e=entry):
                 from .safe_dialog import safe_question_multiline
                 confirmed = safe_question_multiline(
                     self,
                     "Disconnect seat?",
                     f"Disconnect from seat '{s}'?\n\n"
+                    f"Gateway: {g}\n\n"
                     f"This will tear down the tunnel and stop any open mirror window.",
                 )
                 if confirmed:
                     self.disconnect_seat(e['seat'])
-            QTimer.singleShot(0, _do_disconnect_confirm)
+            QTimer.singleShot(0, lambda: _do_disconnect_confirm(s=seat, g=gateway, e=entry))
             return
         else:
             # Connect — fire `seat.sh auto-connect` internally without any
@@ -2735,6 +2736,20 @@ class SeatMixin:
                     self.seat_port_manager.mark_seat_disconnected(seat)
                     self.log(f"Disconnected from seat {seat}", "INFO")
                     self.update_status(f"Disconnected from {seat}")
+
+                    # Close any associated mirror window for this device
+                    device_id = None
+                    # Try to find the device_id associated with this seat
+                    seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+                    for dev_info in seat_sh_devices:
+                        if dev_info.get('seat') == seat:
+                            device_id = dev_info.get('device')
+                            break
+
+                    # Close the mirror window if found
+                    if device_id:
+                        self.run_on_main_thread(lambda did=device_id: self._close_mirror_window_if_exists(did))
+
                     # Marshal to GUI thread — PyQt6 silently drops
                     # QTimer.singleShot() from worker threads.
                     self.run_on_main_thread(self.refresh_seat_port_lists)

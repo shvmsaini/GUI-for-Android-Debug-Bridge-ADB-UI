@@ -426,6 +426,8 @@ class DeviceMixin:
                                 font-weight: bold;
                                 text-align: left;
                                 padding-left: 8px;
+                                padding-top: 6px;
+                                padding-bottom: 6px;
                                 border: none;
                                 margin: 0px;
                             }}
@@ -439,6 +441,8 @@ class DeviceMixin:
                             QPushButton {{
                                 text-align: left;
                                 padding-left: 8px;
+                                padding-top: 6px;
+                                padding-bottom: 6px;
                                 border: none;
                                 margin: 0px;
                             }}

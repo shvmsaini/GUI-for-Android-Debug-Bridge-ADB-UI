@@ -520,6 +520,18 @@ class ScrcpyMixin:
             safe_warning(self, "No Device", "Please select a device first")
             return
 
+        # Check if a mirror window is already open for this device
+        if hasattr(self, '_active_mirror_windows') and device_id in self._active_mirror_windows:
+            mirror_window = self._active_mirror_windows[device_id]
+            try:
+                mirror_window.raise_()
+                mirror_window.activateWindow()
+                self.log(f"Mirror window for {device_id} already open; bringing to front", "INFO")
+                self.update_status(f"Mirror window for {device_id} already open")
+                return
+            except Exception as e:
+                self.log(f"Error focusing existing mirror window for {device_id}: {str(e)}", "ERROR")
+
         if ScrcpyMirrorWindow is None:
             # Defer + safe dialog (see requirements.txt pin comment for
             # the Qt 6.11/macOS 26 QTextEngine crash rationale).
@@ -1111,6 +1123,17 @@ class ScrcpyMixin:
             self.mirror_client.press_key(keycode)
         except Exception:
             pass
+
+    def _close_mirror_window_if_exists(self, device_id):
+        """Close the mirror window for a specific device if it exists."""
+        # Close standalone mirror window if it exists
+        if hasattr(self, '_active_mirror_windows') and device_id in self._active_mirror_windows:
+            mirror_window = self._active_mirror_windows[device_id]
+            try:
+                mirror_window.close()
+                self.log(f"Closed mirror window for device {device_id}", "INFO")
+            except Exception as e:
+                self.log(f"Error closing mirror window for {device_id}: {str(e)}", "ERROR")
 
     def _mirror_expand_notif(self):
         """Expand notifications via the scrcpy control socket."""

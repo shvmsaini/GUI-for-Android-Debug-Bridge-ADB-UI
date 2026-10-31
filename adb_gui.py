@@ -395,7 +395,9 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
 
         # Device selection row with buttons instead of combo
         device_row = QHBoxLayout()
-        device_row.addWidget(QLabel("Connected \nDevices:"))
+        connected_devices_label = QLabel("Connected \nDevices:")
+        connected_devices_label.setStyleSheet("padding-left: 4px;")
+        device_row.addWidget(connected_devices_label)
 
         # Create button group for devices
         self.device_buttons = {}
@@ -549,17 +551,17 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         scrcpy_row.addWidget(native_scrcpy_btn)
 
         fast_btn = QPushButton("⚡ Fast")
-        fast_btn.setToolTip("2 Mbps / 30 fps / 800px — for slow remote/seat connections (embedded)")
+        fast_btn.setToolTip("500 Kbps / 30 fps / 800px — for slow remote/seat connections (embedded)")
         fast_btn.clicked.connect(lambda: self._open_mirror_window(
-            bitrate=2_000_000, max_fps=30, max_size=800,
+            bitrate=500_000, max_fps=30, max_size=800,
             seat_context=self.seat_port_manager and self._device_to_seat_context(self.current_device or ""))
         )
         scrcpy_row.addWidget(fast_btn)
 
         normal_btn = QPushButton("🎬 Normal")
-        normal_btn.setToolTip("8 Mbps / 60 fps / 1024px — embedded mirror (decent quality)")
+        normal_btn.setToolTip("2 Mbps / 60 fps / 1024px — embedded mirror (decent quality)")
         normal_btn.clicked.connect(lambda: self._open_mirror_window(
-            bitrate=8_000_000, max_fps=60, max_size=1024,
+            bitrate=2_000_000, max_fps=60, max_size=1024,
             seat_context=self.seat_port_manager and self._device_to_seat_context(self.current_device or ""))
         )
         scrcpy_row.addWidget(normal_btn)
