@@ -349,13 +349,13 @@ class DeviceMixin:
 
                 if seat_name:
                     if host:
-                        button_label = f"{status_dot} 💺 {seat_name}\n📡 {host}\n📱 {device_id}"
+                        button_label = f"{status_dot} {seat_name}\n{host}\n{device_id}"
                         display_str = f"{display_name} ({device_id}) — seat {seat_name} @ {host}"
                     else:
-                        button_label = f"{status_dot} 💺 {seat_name}\n📱 {device_id}"
+                        button_label = f"{status_dot} {seat_name}\n{device_id}"
                         display_str = f"{display_name} ({device_id}) — seat {seat_name}"
                 else:
-                    button_label = f"📱 {display_name}\n{device_id}"
+                    button_label = f"{status_dot} {display_name}\n{device_id}"
                     display_str = f"{display_name} ({device_id})"
 
                 device_display_map[display_str] = device_id
@@ -426,8 +426,6 @@ class DeviceMixin:
                                 font-weight: bold;
                                 text-align: left;
                                 padding-left: 8px;
-                                padding-top: 6px;
-                                padding-bottom: 6px;
                                 border: none;
                                 margin: 0px;
                             }}
@@ -441,8 +439,6 @@ class DeviceMixin:
                             QPushButton {{
                                 text-align: left;
                                 padding-left: 8px;
-                                padding-top: 6px;
-                                padding-bottom: 6px;
                                 border: none;
                                 margin: 0px;
                             }}
