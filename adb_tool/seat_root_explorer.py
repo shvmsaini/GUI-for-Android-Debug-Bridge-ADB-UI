@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QComboBox, QDialogButtonBox, QCompleter, QSizePolicy,
     QProgressDialog
 )
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QTextCursor
 
 from adb_tool.seat_methods import (
     _SeatJumpHost, _SeatAuthError, _SeatShell, _SeatSshError,
@@ -813,7 +813,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     def apply():
                         status.setText(f"✅ Done (exit {code})" if code == 0 else f"⚠️ Exit {code}")
                         output.setPlainText(out or "(no output)")
-                        output.moveCursor(output.textCursor().End)
+                        output.moveCursor(QTextCursor.End)
                     ui.call.emit(apply)
                 except Exception as e:
                     err = str(e)
