@@ -26,12 +26,21 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QProcess, QFileInfo
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QCursor, QShortcut
 
 try:
-    from .safe_dialog import safe_info, safe_warning, safe_critical
+    from .safe_dialog import safe_info, safe_warning, safe_critical, safe_question_multiline
 except ImportError:
     # Fallback if running standalone
     def safe_info(parent, title, msg): QMessageBox.information(parent, title, msg)
     def safe_warning(parent, title, msg): QMessageBox.warning(parent, title, msg)
     def safe_critical(parent, title, msg): QMessageBox.critical(parent, title, msg)
+    def safe_question_multiline(parent, title, msg, yes_label="Yes", no_label="No"):
+        from PyQt6.QtWidgets import QMessageBox
+        box = QMessageBox(parent)
+        box.setWindowTitle(title)
+        box.setText(msg)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.button(QMessageBox.StandardButton.Yes).setText(yes_label)
+        box.button(QMessageBox.StandardButton.No).setText(no_label)
+        return box.exec() == QMessageBox.StandardButton.Yes
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2159,12 +2168,21 @@ class ScrcpyMirrorWindow(QMainWindow):
             # Start a background thread that collects frames
             def _recorder_thread():
                 import av
+                from fractions import Fraction
                 try:
                     container = av.open(self._recording_path, mode='w')
                     stream = container.add_stream('h264', rate=int(self.max_fps))
                     stream.width = self.video._last_frame_buf.shape[1] if hasattr(self.video, '_last_frame_buf') and self.video._last_frame_buf is not None else 720
                     stream.height = self.video._last_frame_buf.shape[0] if hasattr(self.video, '_last_frame_buf') and self.video._last_frame_buf is not None else 1280
                     stream.pix_fmt = 'yuv420p'
+                    # PyAV leaves ``stream.time_base`` as None until the
+                    # container header is written, so accessing
+                    # ``stream.time_base.denominator`` here would crash
+                    # with ``'NoneType' object has no attribute 'denominator'``
+                    # on the very first muxed frame. Set it explicitly:
+                    # with time_base = 1/rate, each frame's pts is just its
+                    # 0-based index — no Fractions math at runtime.
+                    stream.time_base = Fraction(1, int(self.max_fps))
 
                     # Cap capture duration to 30 minutes max to avoid huge files
                     end_time = self._recording_start_time + 30 * 60  # secs
@@ -2172,6 +2190,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                     import time
                     # Use local reference for thread safety
                     video_ref = self.video
+                    frame_idx = 0
                     while self._recording and time.time() < end_time:
                         time.sleep(0.02)  # ~50 fps capture
                         if not self._recording:
@@ -2179,31 +2198,84 @@ class ScrcpyMirrorWindow(QMainWindow):
                         frame_buf = np.array(video_ref._last_frame_buf) if hasattr(video_ref, '_last_frame_buf') else None
                         if frame_buf is None or frame_buf.size == 0:
                             continue
-                        # BGR -> RGB then allow av to convert to YUV on encode
-                        rgb_frame = frame_buf[:, :, ::-1]
-                        frame = av.VideoFrame.from_ndarray(rgb_frame, format='rgb24')
-                        frame.pts -= stream.time_base.denominator / stream.time_base.numerator
-                        container.mux(frame)
+                        # ``_last_frame_buf`` is already RGB-ordered —
+                        # ``update_frame()`` does the BGR→RGB swap once,
+                        # and the screenshot path consumes it the same way
+                        # (see ``_take_screenshot``). Don't flip it again
+                        # here: the previous ``rgb_frame = frame_buf[:, :, ::-1]``
+                        # was re-converting RGB→BGR, so the recorded video
+                        # showed inverted red/blue channels compared to
+                        # what the user sees on screen and the PNG snapshot.
+                        frame = av.VideoFrame.from_ndarray(frame_buf, format='rgb24')
+                        # time_base = 1/rate → pts is the frame index.
+                        # The previous code subtracted
+                        # ``stream.time_base.denominator / numerator`` from
+                        # ``frame.pts`` (which is None on the first frame),
+                        # causing the NoneType crash reported by users.
+                        frame.pts = frame_idx
+                        frame_idx += 1
+                        # ``container.mux`` expects an iterable of packets,
+                        # not a raw VideoFrame. PyAV encodes the frame into
+                        # one or more packets via ``stream.encode(frame)``,
+                        # then we mux each packet in turn. Passing the raw
+                        # frame directly triggers
+                        # ``'VideoFrame' object is not iterable``.
+                        for packet in stream.encode(frame):
+                            if packet is not None:
+                                container.mux(packet)
+
+                    # Flush any packets the encoder is still holding.
+                    for packet in stream.encode(None):
+                        if packet is not None:
+                            container.mux(packet)
 
                     try:
                         container.close()
                     except Exception:
                         pass
                     if self._recording:
-                        self.run_on_main_thread(lambda: safe_info(
-                            self, "Recording Stopped",
-                            f"Recording saved to:\n{dest_path}"
-                        ))
-                        self.run_on_main_thread(lambda: self.status.showMessage(f"Recording saved: {filename}"))
-                        self.run_on_main_thread(lambda: setattr(self, '_recording', False))
-                        self.run_on_main_thread(lambda: self._setup_recording_button())
+                        # Success popup with an "Open" action — clicking
+                        # Open hands the file off to the OS default player
+                        # via QDesktopServices so the user doesn't have to
+                        # dig through Finder/Explorer to find it.
+                        saved_path = dest_path
+                        saved_name = filename
+                        def _on_record_done(p=saved_path, n=saved_name):
+                            try:
+                                opened = safe_question_multiline(
+                                    self,
+                                    "Recording Saved",
+                                    f"Recording saved to:\n{p}\n\n"
+                                    f"Open it now?",
+                                    yes_label="Open",
+                                    no_label="Close",
+                                )
+                            except RuntimeError:
+                                opened = False
+                            if opened:
+                                from PyQt6.QtCore import QUrl
+                                from PyQt6.QtGui import QDesktopServices
+                                QDesktopServices.openUrl(QUrl.fromLocalFile(p))
+                            try:
+                                self.status.showMessage(f"Recording saved: {n}")
+                            except RuntimeError:
+                                pass
+                            setattr(self, '_recording', False)
+                            self._setup_recording_button()
+                        self.run_on_main_thread(_on_record_done)
                 except Exception as e:
                     try:
                         container.close()
                     except Exception:
                         pass
-                    self.run_on_main_thread(lambda:
-                        safe_warning(self, "Recording Error", f"Recording failed: {e}"))
+                    # Bind ``e`` as a default arg so the lambda captures
+                    # its value at construction time. Otherwise the lambda
+                    # runs on the next event-loop tick (via run_on_main_thread)
+                    # after the except block has already torn down ``e`` —
+                    # late-binding closure trap, same one that bites
+                    # ``lambda: func(i)`` loops.
+                    self.run_on_main_thread(lambda err=e:
+                        safe_warning(self, "Recording Error", f"Recording failed: {err}"))
                     self.run_on_main_thread(lambda: setattr(self, '_recording', False))
                     self.run_on_main_thread(lambda: self._setup_recording_button())
             threading.Thread(target=_recorder_thread, daemon=True).start()
