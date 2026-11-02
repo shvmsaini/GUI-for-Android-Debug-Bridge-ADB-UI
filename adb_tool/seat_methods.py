@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import subprocess
@@ -1078,11 +1079,214 @@ def _read_arp_table():
 class SeatMixin:
     """Mixin class providing seat and port forward management."""
 
+    # Spinner characters used for in-button "loading" feedback. Cycles
+    # ~8 times per second so the motion is visible without being dizzy.
+    # Wide-glyph set so we don't depend on Unicode font support.
+    _SPINNER_FRAMES = ("◐", "◓", "◑", "◒", "◐", "◓", "◑", "◒")
+
     # Sentinel block we insert into ~/.ssh/config for each trusted gateway.
     # We delimit with our own comment markers so we can find/remove our entries
     # on the next connect without disturbing other Host blocks the user has.
     _SSH_CONFIG_BEGIN = "# >>> adb-gui-ui trusted-gateway (BEGIN) >>>"
     _SSH_CONFIG_END = "# <<< adb-gui-ui trusted-gateway (END) <<<"
+
+    # ------------------------------------------------------------------
+    # Per-button "loading" animation
+    #
+    # When the user clicks Connect / Start mirror / Start port forward,
+    # the operation can take several seconds (SSH tunnel, ADB connect,
+    # scrcpy handshake). Without feedback the user can't tell whether
+    # the click registered. We animate the clicked button itself —
+    # disabled + spinning glyph + truncated original text — and
+    # restore it when the work completes.
+    #
+    # The state is keyed by ``id(button)`` (stable for the lifetime of
+    # the QPushButton, unique within the app) so multiple in-flight
+    # operations don't clobber each other.
+    # ------------------------------------------------------------------
+    def _mark_button_busy(self, button, busy_text):
+        """Mark a button as busy: disable it, swap its text for ``busy_text``
+        plus an animated spinner, and remember the original state so we can
+        restore it later.
+
+        Returns an opaque token the caller must pass to ``_unmark_button_busy``
+        when the operation completes (success OR failure — always).
+        """
+        if button is None:
+            return None
+        try:
+            btn_id = id(button)
+        except Exception:
+            return None
+
+        # Bail if this button is already busy — clicking twice shouldn't
+        # restart the spinner or stack timers.
+        if not hasattr(self, '_button_busy_state'):
+            self._button_busy_state = {}
+        if btn_id in self._button_busy_state:
+            return btn_id
+
+        # Snapshot original state so we can put it back exactly as it was.
+        # Wrap in try/except — between the click event and this call, the
+        # auto-refresh timer may have rebuilt the seat list and the original
+        # button has been deleted. A deleted C++ object raises RuntimeError
+        # from any property access, so guard every touch.
+        try:
+            original_text = button.text()
+            original_style = button.styleSheet()
+            original_tooltip = button.toolTip()
+            tight = button.maximumWidth() <= 50
+        except RuntimeError:
+            # Button was deleted between click and this call (e.g., the
+            # auto-refresh timer rebuilt the list). Nothing to animate on
+            # a dead button — bail out and let the rebuilt list handle
+            # visual feedback through the status bar instead.
+            return None
+        display_text = busy_text if not tight else ''
+
+        state = {
+            'button': button,
+            'original_text': original_text,
+            'original_style': original_style,
+            'original_tooltip': original_tooltip,
+            'busy_text': busy_text,
+            'display_text': display_text,
+            'tight': tight,
+            'frame': 0,
+        }
+        self._button_busy_state[btn_id] = state
+
+        # Disable to prevent double-clicks during the operation. Wrap the
+        # whole UI-mutation block in try/except: between the snapshot above
+        # and these calls the list can still be rebuilt (e.g., another
+        # QTimer fires). If the button is gone, clean up state and bail.
+        try:
+            button.setEnabled(False)
+            # Drop the hover style — disabled buttons can't be hovered anyway,
+            # and the busy background looks cleaner without it.
+            button.setStyleSheet(
+                "QPushButton {"
+                " background-color: #f0a020;"
+                " color: white;"
+                " font-weight: bold;"
+                " text-align: left;"
+                " padding: 4px;"
+                " border: none;"
+                "}"
+                " QPushButton:disabled {"
+                " background-color: #f0a020;"
+                " color: white;"
+                "}"
+            )
+            button.setToolTip(f"{busy_text}…")
+            if display_text:
+                button.setText(f"{self._SPINNER_FRAMES[0]} {display_text}…")
+            else:
+                button.setText(f"{self._SPINNER_FRAMES[0]}")
+        except RuntimeError:
+            # Button vanished after snapshot. Drop our state and bail.
+            self._button_busy_state.pop(btn_id, None)
+            return None
+
+        # Animate the spinner glyph at ~8 fps. QTimer fires on the GUI
+        # thread so direct setText() is safe (no run_on_main_thread needed).
+        timer = QTimer(button)
+        timer.setInterval(120)  # ms per frame
+
+        def _tick():
+            st = self._button_busy_state.get(btn_id)
+            if st is None:
+                timer.stop()
+                return
+            st['frame'] = (st['frame'] + 1) % len(self._SPINNER_FRAMES)
+            try:
+                if st.get('display_text'):
+                    button.setText(f"{self._SPINNER_FRAMES[st['frame']]} {st['display_text']}…")
+                else:
+                    button.setText(f"{self._SPINNER_FRAMES[st['frame']]}")
+            except RuntimeError:
+                # Button was deleted (e.g., list rebuilt during operation)
+                timer.stop()
+                self._button_busy_state.pop(btn_id, None)
+
+        timer.timeout.connect(_tick)
+        state['timer'] = timer
+        timer.start()
+        return btn_id
+
+    def _unmark_button_busy(self, token):
+        """Restore the button previously marked busy by ``_mark_button_busy``."""
+        if not token or not hasattr(self, '_button_busy_state'):
+            return
+        state = self._button_busy_state.pop(token, None)
+        if state is None:
+            return
+        button = state.get('button')
+        timer = state.get('timer')
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        if button is None:
+            return
+        try:
+            # The list is rebuilt after a successful connect, so the original
+            # button may already be deleted. setStyleSheet/setText would then
+            # raise RuntimeError. Just bail — the new button rendered by
+            # refresh_seat_port_lists has the correct final styling.
+            button.setStyleSheet(state['original_style'])
+            button.setText(state['original_text'])
+            button.setToolTip(state['original_tooltip'])
+            button.setEnabled(True)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _sync_refresh_panels(self):
+        """Force both the devices panel and the seat/port panel to refresh
+        immediately and in sync.
+
+        Used after any seat/port operation completes (connect, disconnect,
+        takeover) so the user sees the updated state without waiting for
+        the next timer tick (which can be up to 5 s away). Both refreshes
+        run sequentially on the GUI thread, so the panels stay consistent.
+        """
+        try:
+            self.refresh_devices(silent=True)
+        except Exception:
+            pass
+        try:
+            self.refresh_seat_port_lists(refetch=False)
+        except Exception:
+            pass
+
+    def _finalize_seat_connect_busy(self):
+        """Restore the clicked seat button once the connect attempt
+        finishes (success OR failure).
+
+        Called on the GUI thread via ``run_on_main_thread``. Pops the
+        pending busy token that ``connect_seat`` stashed on self, which
+        may have been replaced by a retry (in which case we just bail —
+        the newer token will own the button from here on).
+        """
+        token = getattr(self, '_pending_busy_token', None)
+        # Clear regardless so a retry doesn't double-restore.
+        self._pending_busy_token = None
+        if token is not None:
+            # The list rebuild at the end of connect will recreate the
+            # button from scratch with fresh styling, so we don't need to
+            # restore the original text. We just want to stop the spinner
+            # and re-enable the row.
+            self._unmark_button_busy(token)
+
+    def _finalize_portforward_busy(self):
+        """Same as ``_finalize_seat_connect_busy`` but for portforward."""
+        token = getattr(self, '_pending_busy_token_pf', None)
+        self._pending_busy_token_pf = None
+        if token is not None:
+            self._unmark_button_busy(token)
 
     def _is_gateway_trusted(self, gateway):
         """Return True if the user has opted in to trusting this gateway's cert."""
@@ -1152,7 +1356,7 @@ class SeatMixin:
 
         return True
 
-    def _start_seat_device_watcher(self, seat, port='5555', gateway=None, max_wait=60, interval=2, vysor_mode=True):
+    def _start_seat_device_watcher(self, seat, port='5555', gateway=None, max_wait=60, interval=2, seizure_mode=False):
         """Poll adb devices until the seat's device finishes authorizing.
 
         Right after `seat.sh auto-connect`, `adb connect localhost:<port>`
@@ -1167,13 +1371,10 @@ class SeatMixin:
         * If we hit the timeout, log a warning pointing at the phone prompt
           so the user knows where to look.
 
-        If ``vysor_mode`` is True, trigger an instant takeover if the device
-        shows as 'offline' or is missing within the first few seconds — this
-        handles the "seat connect but device is occupied by another user" case.
-        Once the watcher has seen the device online (status=='device'), future
-        disconnects are treated as lifecycle changes; pass ``vysor_mode=False``
-        to disable auto-takeover entirely (e.g., when restarting after a
-        successful takeover).
+        If ``seizure_mode`` is True, the watcher is being restarted after a
+        successful seizure (B has taken over from A). In this mode, we do NOT
+        auto-takeover - instead we notify the user that their connection was
+        seized and they should manually reconnect if desired.
 
         Other notes:
         * If the user disconnects the seat in the meantime, the watcher's
@@ -1193,8 +1394,16 @@ class SeatMixin:
         if prev is not None:
             try:
                 prev.stop()
+                # Disconnect all signals to prevent any pending callbacks
+                try:
+                    prev.timeout.disconnect()
+                except Exception:
+                    pass
+                # Delete the timer to free resources
+                prev.deleteLater()
             except Exception:
                 pass
+            self._seat_device_watcher = None
 
         watcher = QTimer(self)
         watcher.setInterval(interval * 1000)
@@ -1207,10 +1416,8 @@ class SeatMixin:
         # success against the wrong one.
         seat_device_id = f"localhost:{port}"
         elapsed = {'secs': 0}
-        takeover_state = {'attempted': False, 'disabled_after_success': False}
-        vysor_state = {
-            'enabled': vysor_mode,
-        }
+        # Track if we've ever seen the device as 'device' (not just 'offline')
+        first_device_seen = {'value': False}
 
         def tick():
             elapsed['secs'] += interval
@@ -1221,73 +1428,82 @@ class SeatMixin:
                 return
 
             devices = self.adb.get_devices(silent=True)
-            # Log what we're polling against
-            self.log(f"Device watcher: waiting for {seat_device_id} ({elapsed['secs']}/{max_wait}s)...", "INFO")
+
+            # Try to find our specific device first, but fall back to ANY localhost device
+            # (in case port changed due to seat.sh re-assignment)
             seat_dev_obj = next((d for d in devices if d.get('id') == seat_device_id), None)
             seat_status = seat_dev_obj.get('status') if seat_dev_obj else None
 
+            # If our specific device isn't found, check if there's ANY localhost device online
+            # (this handles port re-assignment by seat.sh)
+            if not seat_dev_obj or seat_status not in ('device', 'offline'):
+                localhost_devices = [d for d in devices if d.get('id', '').startswith('localhost:')]
+                if localhost_devices:
+                    # Use the first localhost device that's online
+                    online_localhost = next((d for d in localhost_devices if d.get('status') == 'device'), None)
+                    if online_localhost:
+                        seat_dev_obj = online_localhost
+                        seat_status = 'device'
+                        self.log(f"Found device on different port {online_localhost['id']} (expected {seat_device_id})", "DEBUG")
+
+            # Log what we're polling against
+            self.log(f"Waiting for {seat_device_id} ({elapsed['secs']}/{max_wait}s, current: {seat_status or 'none'})...", "DEBUG")
+
             if seat_status == 'device':
                 watcher.stop()
-                self.log(f"Seat device online — {seat} ready to use", "INFO")
-                self.update_status(f"Connected to {seat} — device ready")
-                # Once we've successfully claimed the device, disable auto-takeover
-                # for the rest of this watcher's lifetime. Future disconnects
-                # are lifecycle events the user should handle manually.
-                takeover_state['disabled_after_success'] = True
+                self.update_status(f"Connected to {seat}")
+                # Clear seized state on successful connection
+                if seat in getattr(self, '_seat_was_seized', {}):
+                    del self._seat_was_seized[seat]
+                first_device_seen['value'] = True
                 # Force a refresh so the UI reflects the new status.
                 self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
                 return
 
-            # Vysor mode: if the device is occupied by another adbd session,
-            # trigger an instant takeover. The competing user's TCP socket
-            # either shows up as 'offline' in `adb devices` OR — more
-            # commonly — makes `adb connect` get refused entirely so the
-            # device never appears in `adb devices` at all (status is None).
-            # Either way the SSH tunnel is up (seat.sh returned 0), so a
-            # missing device means someone else has the adbd session.
-            # ONCE the watcher has ever seen 'device', disable auto-takeover —
-            # that indicates an already-working connection that became offline
-            # due to network/user action; the user should manually handle it.
-            if seat_status in (None, 'offline') and not takeover_state['attempted'] and not takeover_state['disabled_after_success'] and vysor_state['enabled']:
-                # Give adbd a moment to come up after the initial connect
-                # before assuming "missing" means "occupied". On a fresh
-                # seat connect there's a 1-2s window where adbd is still
-                # starting and `adb devices` returns nothing — that's
-                # normal, not a competing session.
-                if elapsed['secs'] < 6:
-                    return
-                takeover_state['attempted'] = True
-                # Resolve gateway from watcher arg → connected_seats → history.
-                gw = gateway or self.seat_port_manager.connected_seats.get(seat)
-                if seat_status is None:
-                    self.log(
-                        f"Seat {seat} ({seat_device_id}) did not appear in `adb devices` "
-                        "after several seconds (likely occupied by a competing adbd session). "
-                        "Vysor Mode: executing instant takeover to disconnect other sessions...",
-                        "INFO"
-                    )
-                else:
-                    self.log(
-                        f"Seat {seat} ({seat_device_id}) is offline (occupied by competing connection). "
-                        "Vysor Mode: executing instant takeover to disconnect other sessions...",
-                        "INFO"
-                    )
-                self.update_status(f"⚡ Taking over {seat} (disconnecting other sessions)...")
-                # Stop the watcher now — takeover_seat will restart it via
-                # _start_seat_device_watcher once adbd comes back online.
-                watcher.stop()
-                self.takeover_seat(seat, gateway=gw, silent=True)
+            # If we've seen the device as 'device' before and it goes offline,
+            # this is either a seizure or a normal disconnect.
+            # Since we don't have cross-process state to know which, we always
+            # show a dialog indicating the connection was lost.
+            # The user should reconnect manually.
+            if seat_status in (None, 'offline') and first_device_seen['value']:
+                # Device went offline after being online - this could be:
+                # 1. Seizure by another user (most likely when seat.sh still shows as connected)
+                # 2. Normal disconnect (network drop, user manually disconnected)
+                # Since we can't distinguish, we show a general disconnect dialog.
+                # The seat.sh devices output will show whether the seat is still connected.
+                if elapsed['secs'] >= 2:  # Give a moment to confirm it's really disconnected
+                    # Notify the device that its connection was terminated
+                    self._notify_device_disconnect(seat, seat_device_id)
+                    self.run_on_main_thread(lambda: self._show_seat_disconnected_dialog(seat))
+                    watcher.stop()
+                    self.seat_port_manager.mark_seat_disconnected(seat)
+                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                return
+
+            # Vysor-style fast siege: if device is offline, immediately ask user to take over
+            # Show prompt right away at 1s when user is likely waiting for the connection
+            if seat_status == 'offline' and not first_device_seen['value']:
+                if elapsed['secs'] == 1:  # Ask immediately
+                    self.run_on_main_thread(lambda: self._fast_seize_device(seat_device_id))
+
+            # Fallback: If device is still offline after 3 seconds, escalate to adbd restart
+            if seat_status == 'offline' and elapsed['secs'] == 3 and not first_device_seen['value']:
+                self.run_on_main_thread(lambda: self.takeover_seat(seat, gateway=gateway, silent=False))
+
+            # Mark that we've seen the device as 'device'
+            if seat_status == 'device':
+                first_device_seen['value'] = True
 
             if elapsed['secs'] >= max_wait:
                 watcher.stop()
                 self.log(
                     f"Seat {seat} tunnel is up but device ({seat_device_id}) "
                     f"is still {seat_status or 'offline'} after {max_wait}s. Check the phone "
-                    f"for an 'Allow USB debugging?' prompt or click ⚡ to Take Over.",
+                    f"for an 'Allow USB debugging?' prompt.",
                     "WARNING"
                 )
                 self.update_status(
-                    f"Connected to {seat} — waiting for authorization or takeover"
+                    f"Connected to {seat} — waiting for authorization"
                 )
                 return
 
@@ -1297,6 +1513,118 @@ class SeatMixin:
 
         watcher.timeout.connect(tick)
         watcher.start()
+
+    def _show_seat_seized_dialog(self, seat):
+        """Show dialog when another user seizes a seat we were connected to."""
+        from .safe_dialog import safe_critical
+        safe_critical(
+            self,
+            "Seat Seized",
+            f"The seat '{seat}' has been seized by another user.\n\n"
+            "Click the seat button again to reconnect."
+        )
+
+    def _warn_user_before_takeover(self, seat, gateway):
+        """Warn user that takeover is disruptive."""
+        from .safe_dialog import safe_multiline_dialog
+        safe_multiline_dialog(
+            self,
+            "Seat Takeover in Progress",
+            f"Seizing seat {seat} via {gateway}.\n\n"
+            "This will disconnect any other user currently using this device."
+        )
+
+    def _on_manual_seizure_clicked(self, entry):
+        """Handle manual seizure button click - explicitly attempt to take over a seat"""
+        seat = entry.get('seat', '')
+        gateway = entry.get('gateway', '')
+
+        if not seat:
+            return
+
+        # Confirm with user before attempting takeover
+        from .safe_dialog import safe_question_multiline
+        confirmed = safe_question_multiline(
+            self,
+            "Confirm Seat Takeover",
+            f"Manually seize control of {seat} via {gateway}?\n"
+            "This will forcibly disconnect any other user currently using this device.\n"
+            "The other user will receive a notification that their connection was seized."
+        )
+
+        if not confirmed:
+            self.log(f"Manual seizure cancelled by user for seat {seat}", "INFO")
+            return
+
+        self.log(f"Starting manual seizure for seat {seat}", "INFO")
+        self.update_status(f"Seizing control of {seat}...")
+
+        # Find the current device for this seat
+        def find_and_seize():
+            seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+            device_id = None
+            for dev_info in seat_sh_devices:
+                if dev_info.get('seat') == seat:
+                    device_id = dev_info.get('device')
+                    break
+
+            if not device_id:
+                from .safe_dialog import safe_warning
+                self.run_on_main_thread(lambda: safe_warning(
+                    self, "No Device Found",
+                    f"Could not find device ID for seat {seat}.\n\n"
+                    "The seat may already be disconnected or the device info is not available."
+                ))
+                return
+
+            # Mark that we're actively seizing so the watcher can update UI appropriately
+            getattr(self, '_seat_was_seized', {}).setdefault(seat, True)
+
+            # Attempt takeover with full credentials (will prompt if needed)
+            self.takeover_seat(
+                seat,
+                gateway=gateway,
+                silent=False,  # Show warnings and dialogs
+                on_ready=lambda dev: self.run_on_main_thread(
+                    lambda: self.update_status(f"Successfully seized {seat}")
+                )
+            )
+
+        threading.Thread(target=find_and_seize, daemon=True).start()
+
+    def _show_seat_disconnected_dialog(self, seat):
+        """Show dialog when a seat disconnects unexpectedly."""
+        from .safe_dialog import safe_warning
+        safe_warning(
+            self,
+            "Seat Disconnected",
+            f"The seat '{seat}' has disconnected.\n\n"
+            "Click the seat button to reconnect."
+        )
+
+    def _notify_device_disconnect(self, seat, seat_device_id=None):
+        """Notify the device that its ADB connection was terminated (the other user disconnected)."""
+        try:
+            # Find the actual device ID from seat.sh devices if not provided
+            if not seat_device_id:
+                seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+                for dev_info in seat_sh_devices:
+                    if dev_info.get('seat') == seat:
+                        seat_device_id = dev_info.get('device')
+                        break
+
+            if not seat_device_id:
+                return  # No device to notify
+
+            # Send a system notification visible in the notification shade
+            # Uses cmd notification post on Android 4.4+ which requires no special permissions
+            msg = f"ADB connection to {seat} terminated by another user. Your screen mirroring or ADB access has been interrupted."
+            safe_msg = msg.replace("'", "'\\'")
+            result = self.adb.run_command(f"-s {seat_device_id} shell su -c \"cmd notification post -S adb_disconnect -t 'ADB Connection Terminated' '{safe_msg}'\"")
+            if result['success']:
+                self.log(f"Sent disconnect notification to {seat_device_id}", "DEBUG")
+        except Exception as e:
+            self.log(f"Could not send disconnect notification: {e}", "DEBUG")
 
     def refresh_seat_port_lists_async(self):
         """Timer entry point: run the seat.sh/portforward fetches off the GUI thread, then redraw."""
@@ -1481,7 +1809,7 @@ class SeatMixin:
             btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
             # Prevent horizontal scrolling - text should wrap within button bounds
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            btn.clicked.connect(lambda checked=False, e=entry: self._on_seat_clicked(e))
+            btn.clicked.connect(lambda checked=False, e=entry, b=btn: self._on_seat_clicked(e, source_button=b))
 
             if btn_connected:
                 # Connected seats use "success" (green) for active devices,
@@ -1546,7 +1874,8 @@ class SeatMixin:
             play_btn.setMinimumHeight(50)
             play_btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
             play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            play_btn.clicked.connect(lambda checked=False, seat=entry['seat']: self._scrcpy_via_seat(seat))
+            # Pass both seat and gateway to ensure correct device selection
+            play_btn.clicked.connect(lambda checked=False, seat=entry['seat'], gw=entry['gateway'], b=play_btn: self._scrcpy_via_seat(seat, gateway=gw, source_button=b))
             play_btn.setToolTip("Open mirror window")
             play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
 
@@ -1579,6 +1908,26 @@ class SeatMixin:
 
             container_layout.addWidget(btn, 1)  # Button takes available space
             container_layout.addWidget(play_btn, 0)  # Play button stays fixed
+
+            # Add seizure button for offline devices - gives users explicit control to take over
+            if btn_connected and device_status == 'offline':
+                seizure_btn = QPushButton("⚡")
+                seizure_btn.setMaximumWidth(40)
+                seizure_btn.setMinimumWidth(40)
+                seizure_btn.setMaximumHeight(50)
+                seizure_btn.setMinimumHeight(50)
+                seizure_btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+                seizure_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                seizure_btn.setToolTip("Take over seat - disconnect other users and claim this device")
+                seizure_btn.setStyleSheet(
+                    "QPushButton { border: none; padding: 0px; margin: 0px; font-size: 16px; }"
+                    " QPushButton:hover { background-color: #f39c12; color: white; }"
+                )
+                seizure_btn.clicked.connect(
+                    lambda checked=False, e=entry: self._on_manual_seizure_clicked(e)
+                )
+                container_layout.addWidget(seizure_btn, 0)
+
             container_layout.addWidget(remove_btn, 0)  # Remove button stays fixed
             container_layout.setContentsMargins(0, 0, 0, 0)
             container_layout.setSpacing(0)
@@ -1697,7 +2046,7 @@ class SeatMixin:
             btn.setMaximumHeight(50)
             btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            btn.clicked.connect(lambda checked, e=entry: self._on_portforward_clicked(e))
+            btn.clicked.connect(lambda checked, e=entry, b=btn: self._on_portforward_clicked(e, source_button=b))
 
             if btn_connected:
                 # Connected (or active rack): Green background, red on hover (to indicate disconnect/stop)
@@ -1771,7 +2120,7 @@ class SeatMixin:
             # Add container to layout (was: directly the button)
             self.portforward_list_layout.addWidget(pf_container)
 
-    def _on_seat_clicked(self, entry):
+    def _on_seat_clicked(self, entry, source_button=None):
         """Handle seat button click"""
         if not entry:
             return
@@ -1798,7 +2147,7 @@ class SeatMixin:
             # Defer to next event-loop tick to avoid opening a modal dialog
             # inside the button-slot's sendPostedEvents() flush (SIGSEGV on
             # macOS/Qt 6.11 via QTextEngine::validate() NULL-deref).
-            def _do_disconnect_confirm(s=seat, g=gateway, e=entry):
+            def _do_disconnect_confirm(s=seat, g=gateway, e=entry, b=source_button):
                 from .safe_dialog import safe_question_multiline
                 confirmed = safe_question_multiline(
                     self,
@@ -1808,10 +2157,33 @@ class SeatMixin:
                     f"This will tear down the tunnel and stop any open mirror window.",
                 )
                 if confirmed:
+                    # Animate the disconnect on the same button so the user
+                    # sees feedback even before the disconnect completes.
+                    # The confirm dialog can take seconds, during which the
+                    # auto-refresh timer may have rebuilt the list and the
+                    # original button is gone — _mark_button_busy returns
+                    # None in that case, and we fall back to status bar.
+                    token = None
+                    try:
+                        token = self._mark_button_busy(b, f"Disconnecting {s}")
+                    except RuntimeError:
+                        # Button was deleted; status bar still gives feedback.
+                        pass
+                    self.update_status(f"🔌 Disconnecting from {s}...")
                     self.disconnect_seat(e['seat'])
-            QTimer.singleShot(0, lambda: _do_disconnect_confirm(s=seat, g=gateway, e=entry))
+                    # Restore the button after a short grace period — the
+                    # list will be rebuilt shortly with the up-to-date state.
+                    if token is not None:
+                        QTimer.singleShot(2500, lambda t=token: self._unmark_button_busy(t))
+            QTimer.singleShot(0, lambda: _do_disconnect_confirm(s=seat, g=gateway, e=entry, b=source_button))
             return
         else:
+            # Immediate UI feedback: animate the clicked button itself so the
+            # user knows the click registered BEFORE any password prompt or
+            # background work begins. This is more reliable than the status
+            # bar because the button stays in the user's eyeline.
+            busy_token = self._mark_button_busy(source_button, f"Connecting {seat}")
+
             # Connect — fire `seat.sh auto-connect` internally without any
             # prompt dialog. Password must already be in Keychain for this
             # gateway; if not, prompt and save it so subsequent connections
@@ -1826,20 +2198,25 @@ class SeatMixin:
             # (all gateways share the same password).
             password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
             if not password:
+                self.update_status(f"🔑 Password required for {gateway_host}...")
                 # Prompt and automatically save since all gateway passwords are the same
                 password = self.credential_manager.prompt_password(
                     self, gateway_host, user,
                     auto_save=True  # Auto-save since all gateways share password
                 )
                 if not password:
+                    self._unmark_button_busy(busy_token)
+                    self.update_status(f"❌ Connection cancelled — no password for {seat}")
                     self.log("Password required to connect", "ERROR")
                     return
+            self.update_status(f"🔌 Connecting to seat {seat} via {gateway}...")
             self.connect_seat(
                 entry['seat'], entry['gateway'],
                 device_password=password, mtc_password=password,
+                _busy_token=busy_token,
             )
 
-    def _on_portforward_clicked(self, entry):
+    def _on_portforward_clicked(self, entry, source_button=None):
         """Handle port forward button click"""
         if not entry:
             return
@@ -1860,7 +2237,7 @@ class SeatMixin:
             # "active rack" button killed forwarding for everyone else
             # using that gateway.
             # Defer to avoid opening a modal inside a button-slot (macOS SIGSEGV).
-            def _do_pf_disconnect_confirm(e=entry):
+            def _do_pf_disconnect_confirm(e=entry, b=source_button):
                 from .safe_dialog import safe_question_multiline
                 confirmed = safe_question_multiline(
                     self,
@@ -1869,7 +2246,22 @@ class SeatMixin:
                     f"This tears down the ssh tunnels for every port on this rack.",
                 )
                 if confirmed:
+                    # Animate the disconnect on the same button.
+                    # Confirm dialog can take seconds during which the
+                    # auto-refresh may rebuild the list — guard against
+                    # the button being gone.
+                    rack_label = e.get('seat') or e.get('gateway', '')
+                    token = None
+                    try:
+                        token = self._mark_button_busy(b, f"Stopping {rack_label}")
+                    except RuntimeError:
+                        pass
+                    self.update_status(f"🔌 Stopping port forward for {rack_label}...")
                     self.disconnect_portforward()
+                    # Restore after a short grace period — list rebuild
+                    # happens shortly with the up-to-date state.
+                    if token is not None:
+                        QTimer.singleShot(2500, lambda t=token: self._unmark_button_busy(t))
             QTimer.singleShot(0, _do_pf_disconnect_confirm)
             return
         else:
@@ -1886,7 +2278,13 @@ class SeatMixin:
             if not partition:
                 partition = '172.17.4.4'
 
-            self.connect_portforward(gateway, partition, user_part)
+            # Animate the clicked button so the user sees their click
+            # registered before any password prompt or background port-
+            # forward setup begins.
+            busy_token = self._mark_button_busy(source_button, f"Setting up {gateway_host}")
+            self.update_status(f"⏳ Initiating port forward on {gateway_host}...")
+            self.log(f"Port forward clicked: gateway={gateway}, partition={partition}", "INFO")
+            self.connect_portforward(gateway, partition, user_part, _busy_token=busy_token)
 
     def _on_remove_seat_history_clicked(self, entry):
         """Handle the ✕ button on a seat history row.
@@ -2013,15 +2411,20 @@ class SeatMixin:
             self.log(f"Error checking port forward status: {e}", "ERROR")
 
     def connect_seat(self, seat, gateway, install_adb_key=False, adb_key=None,
-                  device_password=None, mtc_password=None):
+                  device_password=None, mtc_password=None, _busy_token=None):
         """Connect to a seat"""
         self.log(f"Connecting to seat {seat} via {gateway}...")
-        self.update_status(f"Connecting to {seat}...")
+        self.update_status(f"🔌 Connecting to seat {seat} via {gateway}...")
 
         # Store for use in do_connect closure
         self._pending_adb_key = adb_key if install_adb_key else None
         self._pending_device_password = device_password
         self._pending_mtc_password = mtc_password
+        # Pending button-busy token so the button-stays-busy animation
+        # outlives the click handler and is restored once the connect
+        # attempt finishes (success OR failure). Restored in the
+        # worker-thread finally block below.
+        self._pending_busy_token = _busy_token
 
         # Normalize gateway to ensure user@ prefix (fixes plain hostname inputs)
         gateway = gateway.strip()
@@ -2038,10 +2441,13 @@ class SeatMixin:
         # Only prompt if no password is stored and we weren't passed one already
         password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
         if not password and not any([device_password, mtc_password]):
+            self.update_status(f"🔑 Password required for {gateway_host}...")
             password = self.credential_manager.prompt_password(self, gateway_host, user)
             if not password:
                 self.log("Password required to connect", "ERROR")
+                self.update_status(f"❌ Connection cancelled — no password for {seat}")
                 return
+        self.update_status(f"🔌 Establishing SSH tunnel to seat {seat}...")
 
         def do_connect():
             try:
@@ -2200,7 +2606,6 @@ class SeatMixin:
                 # exits 0 when it got a working SSH tunnel and opened adb.
                 succeeded = (returncode == 0)
                 if succeeded:
-                    self.seat_port_manager.mark_seat_connected(seat, gateway)
                     # Pull the actual adb port from stdout for the seat-panel
                     # label and for the install-adbkey reconnect step below.
                     _port_match = re.search(
@@ -2209,6 +2614,34 @@ class SeatMixin:
                     )
                     actual_port = _port_match.group(1) if _port_match else '5555'
                     self._pending_seat_port = actual_port
+
+                    # CRITICAL: Check for seizure BEFORE marking as connected
+                    # The seat might already be connected from another instance/session
+                    # If there's an existing ADB device on the same port that's online,
+                    # we need to evict it before connecting
+                    seat_device_id = f"localhost:{actual_port}"
+                    needs_seizure = False
+                    if self.seat_port_manager.is_seat_connected(seat):
+                        # Check if there's an actual online ADB device for this seat
+                        # (might be from a previous session or another instance)
+                        devices = self.adb.get_devices(silent=True)
+                        existing_device = next((d for d in devices if d.get('id') == seat_device_id and d.get('status') == 'device'), None)
+
+                        if existing_device:
+                            needs_seizure = True
+                            self.log(f"Seat {seat} has an active device - will seize connection", "INFO")
+                        else:
+                            # Stale connection state (from previous session), clear it
+                            self.log(f"Clearing stale connection state for seat {seat}", "INFO")
+                            self.seat_port_manager.mark_seat_disconnected(seat)
+
+                    # Now mark as connected
+                    self.seat_port_manager.mark_seat_connected(seat, gateway)
+
+                    # Perform seizure if needed (disconnect existing device)
+                    if needs_seizure:
+                        self.log(f"Seizing seat {seat} from another user - disconnecting their ADB device", "INFO")
+                        self.run_on_main_thread(lambda: self._force_disconnect_seat_device(seat_device_id))
 
                     # Install ADB key if requested. Only needs gateway + mtc
                     # passwords (mtc is reused for SSH login and sudo on the seat).
@@ -2232,11 +2665,12 @@ class SeatMixin:
                     else:
                         self.log(f"Connected to seat {seat} (defaulting to port {actual_port})", "INFO")
                     self.update_status(f"Connected to {seat}")
-                    # Marshal to GUI thread — PyQt6 silently drops
-                    # QTimer.singleShot() from worker threads (see
-                    # pyqt6-singleshot-worker-thread-dropped.md).
-                    self.run_on_main_thread(self.refresh_seat_port_lists)
-                    self.run_on_main_thread(lambda: self.refresh_devices())
+                    # Force both panels to refresh together so they stay in
+                    # sync — the device list shows the freshly-connected
+                    # phone, the seat list shows the new connection state.
+                    self.run_on_main_thread(self._sync_refresh_panels)
+                    # Restore the clicked button now that we're done.
+                    self.run_on_main_thread(self._finalize_seat_connect_busy)
 
                     # Watch for the seat's device to finish the adb-key
                     # authorization handshake. After a fresh seat connect, the
@@ -2261,9 +2695,9 @@ class SeatMixin:
                     # silently dropped on PyQt6, so we use the _ui_caller
                     # emitter (run_on_main_thread) instead.
                     self.run_on_main_thread(
-                        lambda s=seat, p=actual_port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g)
+                        lambda s=seat, p=actual_port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, seizure_mode=False)
                     )
-                    self.log(f"Seat connection flow complete for {seat} on port {actual_port}; watcher will start on GUI thread", "INFO")
+                    self.log(f"Connected to {seat}", "INFO")
                 else:
                     error = stderr.strip() or stdout.strip() or f"Script exited with code {returncode}"
                     self.log(f"Failed to connect to seat: {error}", "ERROR")
@@ -2296,10 +2730,12 @@ class SeatMixin:
                                             adb_key=getattr(self, '_pending_adb_key', None),
                                             device_password=getattr(self, '_pending_device_password', None),
                                             mtc_password=getattr(self, '_pending_mtc_password', None))
+                    self.run_on_main_thread(self._sync_refresh_panels)
+                    self.run_on_main_thread(self._finalize_seat_connect_busy)
                     self.run_on_main_thread(show_error)
             except TimeoutExpired as te:
                 # Command timed out - show specific message and disconnect
-                error = f"Connection timed out after {te.timeout} seconds. The seat.sh command is taking too long. Check your network connection or credentials."
+                error = f"Connection timed out after {math.ceil(te.timeout)} seconds. The seat.sh command is taking too long. Check your network connection or credentials."
                 self.log(f"Failed to connect to seat (timeout): {error}", "ERROR")
                 self.log("Not installing ADB key (connection failed)", "ERROR")
                 self.update_status("Failed: Connection timeout")
@@ -2312,7 +2748,8 @@ class SeatMixin:
                                    capture_output=True, text=True, timeout=15, env=env)
                 except Exception:
                     pass
-                self.run_on_main_thread(self.refresh_seat_port_lists)
+                self.run_on_main_thread(self._sync_refresh_panels)
+                self.run_on_main_thread(self._finalize_seat_connect_busy)
                 def show_timeout_error():
                     from .safe_dialog import safe_question
                     retry = safe_question(
@@ -2339,7 +2776,8 @@ class SeatMixin:
                                    capture_output=True, text=True, timeout=15, env=env)
                 except Exception:
                     pass
-                self.run_on_main_thread(self.refresh_seat_port_lists)
+                self.run_on_main_thread(self._sync_refresh_panels)
+                self.run_on_main_thread(self._finalize_seat_connect_busy)
                 def show_error():
                     from .safe_dialog import safe_question
                     retry = safe_question(
@@ -2632,6 +3070,10 @@ class SeatMixin:
                         self.log("Takeover aborted: missing mtc password.", "ERROR")
                         return
 
+            # Warn the user that this is a disruptive action
+            if not silent:
+                self.run_on_main_thread(lambda: self._warn_user_before_takeover(seat, gateway_norm))
+
             self.log(f"⚡ Vysor Mode: Resetting adbd on {seat} via {gateway_norm} to sever competing sessions...", "INFO")
             self.update_status(f"⚡ Resetting adbd on {seat}...")
 
@@ -2672,11 +3114,7 @@ class SeatMixin:
             # that one of our connect attempts wins the race — empirically
             # this can take several seconds when the other side has a
             # watchdog that reconnects within ~1s of the restart.
-            self.log(
-                f"Racing for {seat_dev} — adbd is restarting and another "
-                "client may auto-reconnect.",
-                "INFO",
-            )
+            self.log(f"Racing for {seat_dev} — adbd restarting", "INFO")
             connected = False
             # 20 attempts × ~0.5s = up to 10s of racing.
             for attempt in range(20):
@@ -2694,25 +3132,18 @@ class SeatMixin:
                     devs = self.adb.get_devices(silent=True)
                     if any(d.get('id') == seat_dev and d.get('status') == 'device' for d in devs):
                         connected = True
-                        self.log(
-                            f"✅ Won the race for {seat_dev} on attempt {attempt + 1}.",
-                            "INFO",
-                        )
                         break
                 except Exception:
                     pass
 
             if connected:
-                self.log(f"✅ Seat {seat} acquired! Device online.", "INFO")
-                self.update_status(f"Seat {seat} acquired (exclusive connection active)")
+                self.update_status(f"Seat {seat} acquired")
+                # Notify the previously connected user that their connection was seized
+                self._notify_device_of_seizure(seat_dev)
+                # Mark this seat as seized
+                self._seat_was_seized[seat] = True
             else:
-                self.log(
-                    f"⚠ adbd restarted on {seat} but device still not online after "
-                    f"10s of racing — another client is reconnecting faster than us. "
-                    "Will not retry automatically.",
-                    "WARNING",
-                )
-                self.update_status(f"⚡ Takeover race lost for {seat} — click ⚡ to retry.")
+                self.update_status(f"Takeover failed for {seat} — retry")
 
             self.run_on_main_thread(lambda: self.refresh_devices())
             self.run_on_main_thread(self.refresh_seat_port_lists)
@@ -2725,7 +3156,7 @@ class SeatMixin:
                 # instead of looping takeovers forever.
                 if connected:
                     self.run_on_main_thread(
-                        lambda s=seat, p=port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, vysor_mode=False)
+                        lambda s=seat, p=port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, seizure_mode=True)
                     )
                 else:
                     self.log(
@@ -2735,6 +3166,106 @@ class SeatMixin:
                     )
 
         threading.Thread(target=do_takeover, daemon=True).start()
+
+    def _force_disconnect_seat_device(self, device_id):
+        """Force disconnect an ADB device (used when seizing a seat from another user).
+
+        This runs `adb disconnect` on the given device ID, which evicts any
+        existing connection to that device. This is called on the GUI thread
+        before establishing a new connection to a seat that's already connected.
+
+        Args:
+            device_id: The ADB device ID to disconnect (e.g., 'localhost:5555')
+        """
+        if not device_id:
+            return
+        self.log(f"Force disconnecting device {device_id} (seizure)", "INFO")
+        try:
+            result = self.adb.run_command(f"disconnect {device_id}")
+            if result['success']:
+                self.log(f"Force disconnected {device_id}", "INFO")
+            else:
+                # Device may already be disconnected, which is fine
+                self.log(f"Force disconnect {device_id}: {result.get('stderr', 'no output')}", "DEBUG")
+        except Exception as e:
+            self.log(f"Force disconnect error for {device_id}: {e}", "DEBUG")
+
+    def _fast_seize_device(self, device_id):
+        """Vysor-style fast seizure: force reconnect to an offline device.
+
+        When a device shows as 'offline' (connected but not authorized), this:
+        1. Asks user for confirmation
+        2. Disconnects the device
+        3. Reconnects it
+        4. This forces adbd to re-handshake and request authorization
+
+        Args:
+            device_id: The ADB device ID to seize (e.g., 'localhost:50453')
+        """
+        if not device_id:
+            return
+
+        # Ask user for confirmation first - this needs to block until response
+        # because seizure is a disruptive action affecting other users
+        confirmed = {'result': None}
+
+        def ask_and_seize():
+            from .safe_dialog import safe_question_multiline
+            response = safe_question_multiline(
+                self,
+                "Device Connection Transfer",
+                f"The device {device_id} appears offline.\n"
+                "This may mean it's being used by another user.\n\n"
+                "Transfer control to this session?\n"
+                "This will disconnect the other user immediately.",
+            )
+
+            if not response:
+                confirmed['result'] = False
+                self.log(f"Seizure cancelled for {device_id}", "DEBUG")
+                return
+
+            confirmed['result'] = True
+            self.log(f"Seizing {device_id}", "INFO")
+            try:
+                self.adb.run_command(f"disconnect {device_id}")
+                time.sleep(0.2)
+                result = self.adb.run_command(f"connect {device_id}")
+                if result['success']:
+                    self._notify_device_of_seizure(device_id)
+            except Exception as e:
+                self.log(f"Seize error for {device_id}: {e}", "DEBUG")
+
+        # Run in GUI thread to block until dialog closes
+        self.run_on_main_thread(ask_and_seize)
+
+        # Give the UI thread a moment to process the dialog
+        time.sleep(0.2)
+
+        # If user didn't confirm, abort
+        if confirmed['result'] is False:
+            return
+
+    def _notify_device_of_seizure(self, device_id):
+        """Send a notification to the device that its ADB connection was seized."""
+        try:
+            # Use am broadcast to send a system notification that's visible in the notification shade
+            # First try the modern cmd notification approach (Android 4.4+)
+            msg = "ADB connection seized by another user. Your screen mirroring or ADB access has been interrupted."
+            safe_msg = msg.replace("'", "'\\'")
+            result = self.adb.run_command(f"-s {device_id} shell su -c \"cmd notification post -S adb_seizure -t 'ADB Connection Seized' '{safe_msg}'\"")
+            if result['success']:
+                self.log(f"Sent seizure notification to {device_id}", "DEBUG")
+                return
+
+            # Fallback: Try using toast message (visible briefly)
+            result2 = self.adb.run_command(f"-s {device_id} shell \"su -c 'cmd notification post -S adb_seizure -t \\'ADB Connection Seized\\' \\'Connection taken by another user\\' </dev/null >/dev/null 2>&1'\"")
+            if result2['success']:
+                self.log(f"Sent seizure notification (fallback) to {device_id}", "DEBUG")
+            else:
+                self.log(f"Could not send seizure notification to {device_id}: Toast/notification failed", "DEBUG")
+        except Exception as e:
+            self.log(f"Could not send seizure notification to {device_id}: {e}", "DEBUG")
 
     def disconnect_seat(self, seat):
         """Disconnect from a seat"""
@@ -2789,10 +3320,13 @@ class SeatMixin:
 
         threading.Thread(target=do_disconnect, daemon=True).start()
 
-    def connect_portforward(self, gateway, partition, user):
+    def connect_portforward(self, gateway, partition, user, _busy_token=None):
         """Connect port forward using the configured portforward_script_path."""
         self.log(f"Setting up port forward for {gateway}...")
-        self.update_status(f"Setting up port forward for {gateway}...")
+        self.update_status(f"🔌 Setting up port forward for {gateway}...")
+        # Stash the busy-state token so the click handler's spinner is
+        # restored once the background setup finishes (success or failure).
+        self._pending_busy_token_pf = _busy_token
 
         # Strip any user@ prefix from the gateway so the script sees a bare
         # hostname. The user is passed separately.
@@ -2813,12 +3347,15 @@ class SeatMixin:
         # (with global fallback so any saved entry unblocks this lookup)
         password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
         if not password:
+            self.update_status(f"🔑 Password required for {gateway_host}...")
             password = self.credential_manager.prompt_password(
                 self, gateway_host, user, auto_save=True
             )
             if not password:
                 self.log("Password required to connect", "ERROR")
+                self.update_status(f"❌ Port forward cancelled — no password for {gateway_host}")
                 return
+        self.update_status(f"🔌 Establishing port forward tunnels to {gateway_host}...")
 
         def do_connect():
             askpass_file = None
@@ -2928,19 +3465,22 @@ class SeatMixin:
                     self.seat_port_manager.mark_portforward_connected(gateway)
                     self.log(f"Port forward connected for {gateway} (headend: {partition})", "INFO")
                     self.update_status(f"Port forward connected")
-                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                    self.run_on_main_thread(self._sync_refresh_panels)
+                    self.run_on_main_thread(self._finalize_portforward_busy)
                 else:
                     self.seat_port_manager.mark_portforward_disconnected()
                     error = stderr.strip() or stdout.strip() or f"Port forward failed to become active (script code {returncode})"
                     self.log(f"Failed to set up port forward: {error}", "ERROR")
                     self.update_status("Failed to set up port forward")
-                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                    self.run_on_main_thread(self._sync_refresh_panels)
+                    self.run_on_main_thread(self._finalize_portforward_busy)
             except Exception as e:
                 self.seat_port_manager.mark_portforward_disconnected()
                 self._cached_pf_status = None
                 self.log(f"Error setting up port forward: {str(e)}", "ERROR")
                 self.update_status("Error setting up port forward")
-                self.run_on_main_thread(self.refresh_seat_port_lists)
+                self.run_on_main_thread(self._sync_refresh_panels)
+                self.run_on_main_thread(self._finalize_portforward_busy)
             finally:
                 if askpass_file:
                     try:

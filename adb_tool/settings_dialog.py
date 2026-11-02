@@ -164,11 +164,14 @@ class SettingsDialog(QDialog):
 
             content_layout.addWidget(pf_group)
 
-        # Screenshots section
-        screenshots_group = QGroupBox("📸 Screenshots")
+        # Screenshots & Recordings section — both the device-mirror
+        # screenshot button (📷) and the screen-record button (⏺) save
+        # to this single configured folder, so the user only has to set
+        # one path for both.
+        screenshots_group = QGroupBox("📸 Screenshots & Recordings")
         screenshots_layout = QVBoxLayout(screenshots_group)
 
-        screenshots_label = QLabel("Screenshot Save Location:")
+        screenshots_label = QLabel("Save Location (Screenshots & Recordings):")
         screenshots_layout.addWidget(screenshots_label)
 
         screenshots_row = QHBoxLayout()
@@ -189,8 +192,7 @@ class SettingsDialog(QDialog):
         screenshots_layout.addLayout(screenshots_row)
 
         screenshot_info = QLabel(
-            "Screenshots will be saved to this folder as PNG files with timestamps.\n"
-            "If left empty, screenshots go to ~/Desktop (if it exists)."
+            "Screenshots and recordings are saved here with timestamped filenames. If left empty, files go to ~/Desktop."
         )
         screenshot_info.setStyleSheet("color: #666; font-size: 9pt;")
         screenshot_info.setWordWrap(True)
@@ -258,8 +260,8 @@ class SettingsDialog(QDialog):
         history_layout = QVBoxLayout(history_group)
 
         history_info = QLabel(
-            "Import seat and portforward connections previously used in terminal.\n"
-            "Scans ~/.bash_history, ~/.zsh_history, and Fish Shell history for seat.sh/portforwardRack.sh commands."
+            "Import previously used seat and portforward terminal connections.\n"
+            "Scans Bash, Zsh, Fish shell histories for seat.sh and portforwardRack.sh."
         )
         history_info.setStyleSheet("color: #666; font-size: 9pt;")
         history_info.setWordWrap(True)

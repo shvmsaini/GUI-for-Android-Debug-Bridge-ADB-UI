@@ -160,6 +160,8 @@ class DeviceFileTableWidget(QTableWidget):
         super().resizeEvent(event)
 
     def dropEvent(self, event):
+        # Qt doesn't send dragLeave after a successful drop, so clear the overlay here
+        self._hide_drop_overlay()
         if event.mimeData().hasUrls():
             # Handle local file drops (upload to device)
             paths = []

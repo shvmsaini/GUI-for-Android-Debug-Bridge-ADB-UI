@@ -200,7 +200,8 @@ class DeviceMixin:
 
         offline_devices = [
             d for d in devices
-            if d.get('status') == 'offline' and self._device_ever_online.get(d.get('id'))
+            if d.get('status') == 'offline'
+            and self._device_ever_online.get(d.get('id'))
         ]
         if offline_devices:
             self.log(f"Found {len(offline_devices)} offline device(s) that were previously online, auto-disconnecting", "INFO")
@@ -231,9 +232,16 @@ class DeviceMixin:
                     # so without this the saved port stays bound and the
                     # next reconnect attempt fails with "Address already in use".
                     self.seat_port_manager.kill_seat_tunnel(seat_to_disconnect, seat_gateway)
+                    # Clear the 'ever online' flag so a reconnect isn't immediately auto-disconnected
+                    if dev_id and dev_id in self._device_ever_online:
+                        del self._device_ever_online[dev_id]
                     self.log(f"Auto-disconnected offline seat: {seat_to_disconnect}", "INFO")
                 else:
                     self.log(f"Auto-disconnected offline device: {dev_id}", "INFO")
+                    # For devices that aren't associated with a seat, also clear ever-online flag
+                    # after 30 seconds to allow re-connection without immediate auto-disconnect
+                    if dev_id.startswith('localhost:') and dev_id in self._device_ever_online:
+                        self._device_ever_online[dev_id] = False
 
         # Reconcile seat connection state against actual adb devices.
         # A seat whose device (e.g. localhost:64491) is no longer in

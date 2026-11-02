@@ -430,10 +430,14 @@ class ScrcpyMixin:
         self.auto_refresh_timer.timeout.connect(lambda: self.refresh_devices(silent=True))
         self.auto_refresh_timer.start(5000)
 
-        # Auto-refresh seat/port lists every 10 seconds
+        # Auto-refresh seat/port lists every 5 seconds — must match the
+        # device refresh interval so the two panels never drift out of
+        # sync. With a 10s interval here and 5s above, a freshly
+        # connected seat would show up in the devices panel up to 10s
+        # before the seat management panel, making the UI look broken.
         self.seat_port_refresh_timer = QTimer()
         self.seat_port_refresh_timer.timeout.connect(self.refresh_seat_port_lists_async)
-        self.seat_port_refresh_timer.start(10000)
+        self.seat_port_refresh_timer.start(5000)
 
         # Check port forward status every 10 seconds to detect if it died
         self.pf_status_timer = QTimer()
@@ -528,8 +532,14 @@ class ScrcpyMixin:
             return
 
         # Check if a mirror window is already open for this device
-        if hasattr(self, '_active_mirror_windows') and device_id in self._active_mirror_windows:
-            mirror_window = self._active_mirror_windows[device_id]
+        # Use gateway+seat+device_id as key to avoid collisions between seats from same gateway
+        mirror_key = device_id
+        if seat_context:
+            # Combine device_id with seat context to create unique key
+            mirror_key = f"{device_id}|{seat_context}"
+
+        if hasattr(self, '_active_mirror_windows') and mirror_key in self._active_mirror_windows:
+            mirror_window = self._active_mirror_windows[mirror_key]
             try:
                 mirror_window.raise_()
                 mirror_window.activateWindow()
@@ -538,6 +548,11 @@ class ScrcpyMixin:
                 return
             except Exception as e:
                 self.log(f"Error focusing existing mirror window for {device_id}: {str(e)}", "ERROR")
+                # Remove dead reference
+                try:
+                    del self._active_mirror_windows[mirror_key]
+                except Exception:
+                    pass
 
         if ScrcpyMirrorWindow is None:
             # Defer + safe dialog (see requirements.txt pin comment for
@@ -681,8 +696,12 @@ class ScrcpyMixin:
             win.show()
             if not hasattr(self, '_active_mirror_windows'):
                 self._active_mirror_windows = {}
-            self._active_mirror_windows[device_id] = win
-            win.destroyed.connect(lambda _, did=device_id: getattr(self, '_active_mirror_windows', {}).pop(did, None))
+            # Use same key as lookup (device_id + seat_context if available)
+            mirror_key = device_id
+            if seat_context:
+                mirror_key = f"{device_id}|{seat_context}"
+            self._active_mirror_windows[mirror_key] = win
+            win.destroyed.connect(lambda _, mk=mirror_key: getattr(self, '_active_mirror_windows', {}).pop(mk, None))
             self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate})")
         except Exception as e:
             next_attempt = _attempt + 1
@@ -714,55 +733,116 @@ class ScrcpyMixin:
                     f"Failed to open mirror window after {max_attempts} attempts: {err}"
                 ))
 
-    def _scrcpy_via_seat(self, seat):
+    def _scrcpy_via_seat(self, seat, gateway=None, source_button=None):
         """Open mirror window for a seat. Connects the seat first if needed."""
+        # Immediate UI feedback — animate the play button so the user
+        # sees their click registered even before the mirror window opens.
+        # The button stays in the user's eyeline, so the spinner is much
+        # more discoverable than the status bar (which can scroll off).
+        busy_token = None
+        if source_button is not None:
+            busy_token = self._mark_button_busy(source_button, f"Mirroring {seat}")
+            # Keep a reference so we can finalize once the mirror window
+            # is up (success) or the operation gives up (failure).
+            self._pending_mirror_busy_token = busy_token
+
+        self.update_status(f"📺 Starting screen mirror for seat {seat}...")
+        self.log(f"Mirror (▶) clicked: seat={seat}, gateway={gateway}", "INFO")
+
         # Check if seat is connected, if not connect first
         is_connected = self.seat_port_manager.is_seat_connected(seat)
 
         if not is_connected:
+            self.update_status(f"⏳ Seat {seat} not connected — connecting first, then mirroring...")
             self.log(f"Seat {seat} not connected, connecting first...")
-            # Find the seat entry to get gateway
-            for entry in self.seat_port_manager.load_history():
-                if entry['seat'] == seat:
-                    # Connect first, then open mirror window after a delay
-                    # All work happens on the main thread via QTimer.singleShot
-                    self.connect_seat(seat, entry['gateway'])
-                    QTimer.singleShot(
-                        2000,
-                        lambda s=seat: self._open_mirror_for_seat(s)
-                    )
-                    return
-            self.log(f"Seat {seat} not found in history", "ERROR")
+            # Use provided gateway or find it in history
+            if not gateway:
+                for entry in self.seat_port_manager.load_history():
+                    if entry['seat'] == seat:
+                        gateway = entry['gateway']
+                        break
+
+            if gateway:
+                # Connect first, then open mirror window after a delay
+                # All work happens on the main thread via QTimer.singleShot
+                self.connect_seat(seat, gateway)
+                # Use the mirror-busy token for the connect's seat-busy
+                # slot too — we want ONE consistent spinner across the
+                # "connect → mirror" sequence, not two stacked animations.
+                QTimer.singleShot(
+                    2000,
+                    lambda s=seat, gw=gateway, t=busy_token: self._open_mirror_for_seat(s, gateway=gw, _busy_token=t)
+                )
+                return
+
+            self.log(f"Seat {seat} gateway not found in history", "ERROR")
+            self.update_status(f"❌ Cannot mirror {seat} — gateway not found")
+            self._unmark_button_busy(busy_token)
             return
 
         # Already connected, open mirror window directly
-        self._open_mirror_for_seat(seat)
+        self._open_mirror_for_seat(seat, gateway=gateway, _busy_token=busy_token)
 
-    def _open_mirror_for_seat(self, seat, attempt=0, max_attempts=5):
+    def _open_mirror_for_seat(self, seat, gateway=None, _busy_token=None, attempt=0, max_attempts=5):
         """Find the device for a seat and open the mirror window.
+
+        Uses seat.sh devices output to find the correct device for the specific
+        seat/gateway pair - essential when multiple seats are connected via
+        the same gateway.
 
         Runs asynchronously on the main thread via QTimer retries to avoid
         blocking the UI thread with sleep() loops.
         """
-        self.log(f"Opening mirror window for seat {seat} (attempt {attempt + 1}/{max_attempts})...")
+        self.log(f"Opening mirror window for seat {seat} via {gateway or 'unknown'} (attempt {attempt + 1}/{max_attempts})...")
+        # Progress feedback: the user clicked ▶ and is watching for the
+        # mirror window. Tell them what we're doing while we hunt for
+        # the right device.
+        if attempt == 0:
+            self.update_status(f"📺 Opening mirror window for seat {seat}...")
+        else:
+            self.update_status(f"⏳ Waiting for seat {seat} device (attempt {attempt + 1}/{max_attempts})...")
 
         try:
-            # Get current devices
+            # Get current devices from adb
             devices = self.adb.get_devices(silent=True)
             device_id = None
+            seat_context = seat  # For window title
 
-            # Fallback 1: try to match by name/IP
-            for device in devices:
-                if device['id'] == seat or seat in device['id']:
-                    device_id = device['id']
-                    break
+            # PRIMARY: Query seat.sh for the authoritative device mapping
+            # This is the only reliable way when multiple seats connect via
+            # the same gateway (all appear as localhost:PORT in adb devices)
+            if gateway:
+                seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+                for dev_info in seat_sh_devices:
+                    if dev_info.get('seat') == seat and dev_info.get('gateway') == gateway:
+                        # Found the device for this specific seat
+                        device_id = dev_info.get('device', '')
+                        if device_id:
+                            self.log(f"Found device for seat {seat} from seat.sh: {device_id}")
+                            break
 
-            # Fallback 2: look for localhost connections (most common for seats)
+            # Fallback: if still no device, try port matching from history
+            if not device_id:
+                # Try to find the port from seat history
+                seat_history = self.seat_port_manager.load_history('seat')
+                for entry in seat_history:
+                    if entry['seat'] == seat and entry.get('port'):
+                        # Look for device with matching port
+                        target_port = entry['port']
+                        for dev in devices:
+                            if ':' + target_port in dev['id']:
+                                device_id = dev['id']
+                                self.log(f"Found device by port match: {device_id}")
+                                break
+                        if device_id:
+                            break
+
+            # Fallback 2: look for localhost connections (only if we have a port to prefer)
             if not device_id:
                 for device in devices:
                     if 'localhost:' in device['id'] or '127.0.0.1:' in device['id']:
                         device_id = device['id']
-                        self.log(f"Using localhost device for seat {seat}: {device_id}")
+                        self.log(f"Using first localhost device for seat {seat}: {device_id}")
                         break
 
             if device_id:
@@ -771,35 +851,53 @@ class ScrcpyMixin:
                     self.log(f"Seat {seat} ({device_id}) is offline. Default takeover on mirror engaged...", "INFO")
                     self.update_status(f"⚡ Taking over {seat} for screen mirror...")
                     if hasattr(self, 'takeover_seat'):
+                        # Keep the play-button spinner alive across the
+                        # takeover — same token, just keep it going.
                         self.takeover_seat(
                             seat,
                             silent=True,
-                            on_ready=lambda did: self._open_mirror_window(
-                                device_id=did, bitrate=1_000_000,
-                                max_fps=24, max_size=800, seat_context=seat
+                            on_ready=lambda did, t=_busy_token: (
+                                self._open_mirror_window(
+                                    device_id=did, bitrate=1_000_000,
+                                    max_fps=24, max_size=800, seat_context=seat
+                                ),
+                                self._unmark_button_busy(t),
                             )
                         )
                         return
 
-                self.log(f"Opening mirror window for device {device_id} (seat: {seat})")
+                # Build descriptive seat context for window title
+                title_seat = seat
+                if gateway:
+                    # Include gateway in title when available
+                    gw_short = gateway.split('@')[-1] if '@' in gateway else gateway
+                    title_seat = f"{seat} ({gw_short})"
+
+                self.log(f"Opening mirror window for device {device_id} (seat: {title_seat})")
+                self.update_status(f"📺 Launching mirror window for {title_seat} ({device_id})...")
                 self._open_mirror_window(device_id=device_id, bitrate=1_000_000,
                                          max_fps=24, max_size=800,
-                                         seat_context=seat)
+                                         seat_context=title_seat)
+                self.update_status(f"✅ Mirror window opened for {title_seat}")
+                # Mirror window is up — restore the play button.
+                self._unmark_button_busy(_busy_token)
                 return
 
             if attempt < max_attempts - 1:
                 # Retry asynchronously after 500ms without freezing the UI
-                QTimer.singleShot(500, lambda: self._open_mirror_for_seat(seat, attempt + 1, max_attempts))
+                QTimer.singleShot(500, lambda: self._open_mirror_for_seat(seat, gateway, _busy_token, attempt + 1, max_attempts))
             else:
                 avail = [d['id'] for d in devices]
                 self.log(f"No device found for seat {seat} after {max_attempts} attempts. Available: {avail}", "ERROR")
-                self.update_status("Failed to open mirror")
+                self.update_status(f"❌ Failed to find device for seat {seat}")
+                self._unmark_button_busy(_busy_token)
         except Exception as e:
             if attempt < max_attempts - 1:
-                QTimer.singleShot(500, lambda: self._open_mirror_for_seat(seat, attempt + 1, max_attempts))
+                QTimer.singleShot(500, lambda: self._open_mirror_for_seat(seat, gateway, _busy_token, attempt + 1, max_attempts))
             else:
                 self.log(f"Error opening mirror window for seat {seat}: {e}", "ERROR")
-                self.update_status("Failed to open mirror")
+                self.update_status(f"❌ Mirror error for seat {seat}")
+                self._unmark_button_busy(_busy_token)
 
     def _launch_scrcpy_for_device(self, device_id):
         """Open mirror window for a specific device (local — uses defaults)."""

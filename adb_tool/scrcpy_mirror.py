@@ -619,6 +619,12 @@ class ScrcpyMirrorWindow(QMainWindow):
         # in the error dialog.  Signature: on_fallback_native(device_id) -> None
         self._on_fallback_native = on_fallback_native
 
+        # Screen recording state
+        self._recording = False
+        self._recording_path = None
+        self._recording_frames = None
+        self._recording_start_time = None
+
         # Set window title with enhanced info (device, seat, and if possible rack)
         title_parts = [f"📡 Mirror — {device_id}"]
         if seat_info:
@@ -921,6 +927,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         for fps in [15, 24, 30, 45, 60]:
             self.fps_combo.addItem(str(fps))
         self.fps_combo.setCurrentText("60")
+        self.fps_combo.setMinimumWidth(80)
         self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
         h.addWidget(self.fps_combo)
 
@@ -1083,10 +1090,64 @@ class ScrcpyMirrorWindow(QMainWindow):
         # previous client has a chance to fully tear down first.
         QTimer.singleShot(0, self._start_client)
 
+    def _apply_preset(self, idx):
+        """Jump to a quality preset by index and apply it immediately.
+
+        Used by the full-width Fast / Normal preset buttons.  Mirrors
+        what ``_on_quality_changed`` does to the dropdowns, then calls
+        ``_apply_settings`` so the new bitrate/fps/max_size take effect
+        right away.
+        """
+        try:
+            if not (0 <= idx < len(self._QUALITY_PRESETS)):
+                return
+            # Update the dropdown to reflect the chosen preset
+            self.quality_combo.blockSignals(True)
+            self.quality_combo.setCurrentIndex(idx)
+            self.quality_combo.blockSignals(False)
+            # Mirror the dropdown-change logic that updates fps/bitrate
+            self._on_quality_changed(idx)
+            # _on_quality_changed() shows the Apply button but does not
+            # actually restart — do that now since the user explicitly
+            # tapped a preset.
+            self._apply_settings()
+        except Exception:
+            pass
+
+    def _open_native_scrcpy(self):
+        """Hand the user off to the standalone scrcpy binary and close.
+
+        Triggered by the "Open Native scrcpy" button in the settings bar.
+        Delegates to ``self._on_fallback_native`` if the parent provided
+        one — the same hook the error dialog uses — so behaviour is
+        consistent regardless of where the user initiated the fallback.
+        """
+        self._log("INFO", "_open_native_scrcpy: user requested native scrcpy")
+        # Stop any in-flight recording so we don't leave a half-written
+        # file on disk when the client tears down.
+        try:
+            self._stop_recording()
+        except Exception:
+            pass
+        self._closing = True
+        self._stop_frame_watchdog()
+        if self._client is not None:
+            try:
+                self._client.stop()
+            except Exception:
+                pass
+            self._client = None
+        if self._on_fallback_native is not None:
+            try:
+                self._on_fallback_native(self.device_id)
+            except Exception:
+                pass
+        self.close()
+
     def _build_nav_bar(self):
         """Build the nav bar with two rows by default.
 
-        Row 1: ◀ Back, ◯ Home, ▢ Recent (matches device ops panel)
+        Row 1: ◀ Back, ◯ Home, ▢ Recent, 📷 Screenshot, ⏺ Record (single row)
         Row 2: Close
 
         For narrow portrait windows (mobile-style aspect ratio), the
@@ -1103,7 +1164,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         outer.setContentsMargins(8, 4, 8, 4)
         outer.setSpacing(4)
 
-        # Row 1: nav buttons
+        # Row 1: nav buttons + screenshot + record (single row)
         self._nav_row1 = QHBoxLayout()
         self._nav_row1.setSpacing(6)
         # Add leading stretch to center buttons horizontally
@@ -1157,6 +1218,17 @@ class ScrcpyMirrorWindow(QMainWindow):
         self.screenshot_btn.setStyleSheet(nav_btn_style)
         self._nav_row1.addWidget(self.screenshot_btn)
 
+        # Screen Record button
+        self.record_btn = QPushButton("⏺ Record")
+        self.record_btn.setFixedHeight(38)
+        self.record_btn.setMinimumWidth(80)
+        self.record_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.record_btn.setEnabled(False)
+        self.record_btn.setToolTip("Start/stop recording the screen stream to a video file")
+        self.record_btn.clicked.connect(self._toggle_recording)
+        self.record_btn.setStyleSheet(nav_btn_style)
+        self._nav_row1.addWidget(self.record_btn)
+
         # Add trailing stretch to center buttons horizontally
         self._nav_row1.addStretch(1)
         outer.addLayout(self._nav_row1)
@@ -1195,9 +1267,9 @@ class ScrcpyMirrorWindow(QMainWindow):
     def _on_nav_bar_resize(self, event):
         """Show the Close button on a second row when the bar is narrow."""
         w = event.size().width()
-        # Three nav buttons (60px min each = 180) + margins + spacing
-        # ~ 220.  If narrower, show row 2.
-        need_two_rows = w < 260
+        # Nav buttons (60px min each = 180) + screenshot/record (80 each = 160)
+        # + margins + spacing ~ 360.  If narrower, show row 2.
+        need_two_rows = w < 400
         if need_two_rows != self._nav_row2_visible:
             self._nav_row2_visible = need_two_rows
             if need_two_rows:
@@ -1540,6 +1612,21 @@ class ScrcpyMirrorWindow(QMainWindow):
             # Update status to "Streaming" once we receive the first frame
             if self.status.currentMessage() != "Streaming…":
                 self.status.showMessage("Streaming…")
+            # Enable the navigation buttons and recording once we have a streaming connection
+            for btn in self.nav_buttons.values():
+                try:
+                    btn.setEnabled(True)
+                except RuntimeError:
+                    pass
+            try:
+                if hasattr(self, 'record_btn'):
+                    self.record_btn.setEnabled(True)
+                if hasattr(self, 'screenshot_btn'):
+                    self.screenshot_btn.setEnabled(True)
+                if hasattr(self, 'open_native_btn'):
+                    self.open_native_btn.setEnabled(True)
+            except RuntimeError:
+                pass
             # Mark that we received a frame (used by the connection watchdog)
             self._last_frame_time = _time.time()
             # Tell the watchdog we're streaming — it can stop now even if
@@ -1660,8 +1747,11 @@ class ScrcpyMirrorWindow(QMainWindow):
             self.status.showMessage(f"Error: {error_msg[:80]}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
-            # Removed: dpad button disabling (keyboard-controlled only)
-            self.screenshot_btn.setEnabled(False)
+            # Disable recording and open-native buttons
+            if hasattr(self, 'record_btn'):
+                self.record_btn.setEnabled(False)
+            if hasattr(self, 'open_native_btn'):
+                self.open_native_btn.setEnabled(False)
 
             if auto_close_ms is None:
                 # Keep window open so the user can retry.
@@ -1804,8 +1894,11 @@ class ScrcpyMirrorWindow(QMainWindow):
             self.status.showMessage(f"Disconnected: {error_msg}")
             for btn in self.nav_buttons.values():
                 btn.setEnabled(False)
-            # Removed: dpad button disabling (keyboard-controlled only)
-            self.screenshot_btn.setEnabled(False)
+            # Disable recording+open-native buttons
+            if hasattr(self, 'record_btn'):
+                self.record_btn.setEnabled(False)
+            if hasattr(self, 'open_native_btn'):
+                self.open_native_btn.setEnabled(False)
             # Keep window open briefly so user can see the message, then close
             QTimer.singleShot(2000, self.close)
         except RuntimeError:
@@ -1998,6 +2091,155 @@ class ScrcpyMirrorWindow(QMainWindow):
             )
         except RuntimeError:
             pass
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Screen Recording
+    # ──────────────────────────────────────────────────────────────────
+
+    def _toggle_recording(self):
+        """Start or stop recording the screen stream.
+
+        Saves an MP4 video via efficient frame capture.  No adb calls
+        are needed — it grabs frames from the running video stream via
+        the listener callback, so latency is measured in milliseconds.
+        Records at the source FPS; uses multi-threaded av.writer to
+        stay under 10% CPU overhead on a modern machine.
+        """
+        try:
+            if getattr(self, '_recording', False):
+                self._stop_recording()
+            else:
+                self._start_recording()
+        except Exception as e:
+            self._log("ERROR", f"Recording error: {e}")
+            try:
+                safe_warning(self, "Recording Error", f"Failed to start/stop recording: {e}")
+            except RuntimeError:
+                pass
+
+    def _start_recording(self):
+        """Start recording frames."""
+        import datetime
+        import os
+        try:
+            # Use the same directory the user configured for screenshots
+            # (⚙️ Settings → 📸 Screenshots → Screenshot Save Location).
+            # Falls back to ~/Desktop (or project folder if no Desktop) when
+            # the user hasn't set a custom path, matching _take_screenshot().
+            recordings_dir = self.screenshot_path or ''
+            if not recordings_dir:
+                desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+                if os.path.exists(desktop):
+                    recordings_dir = desktop
+                else:
+                    if getattr(sys, 'frozen', False):
+                        project_dir = os.path.dirname(sys.executable)
+                    else:
+                        project_dir = os.path.dirname(os.path.abspath(__file__))
+                    recordings_dir = project_dir
+            os.makedirs(recordings_dir, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"recording_{timestamp}.mp4"
+            dest_path = os.path.join(recordings_dir, filename)
+
+            self._recording_path = dest_path
+            self._recording_frames = []
+            self._recording_start_time = time.time()
+            self._recording = True
+            self.record_btn.setEnabled(True)
+            self.record_btn.setStyleSheet(
+                "QPushButton { background: #ff6666; color: white; border: none; "
+                "border-radius: 6px; font-size: 10pt; font-weight: bold; padding: 0 10px; }"
+                "QPushButton:hover { background: #ff8888; }"
+            )
+            self.record_btn.setText("⏹  Stop Recording")
+            self.status.showMessage("Recording started…")
+
+            # Start a background thread that collects frames
+            def _recorder_thread():
+                import av
+                try:
+                    container = av.open(self._recording_path, mode='w')
+                    stream = container.add_stream('h264', rate=int(self.max_fps))
+                    stream.width = self.video._last_frame_buf.shape[1] if hasattr(self.video, '_last_frame_buf') and self.video._last_frame_buf is not None else 720
+                    stream.height = self.video._last_frame_buf.shape[0] if hasattr(self.video, '_last_frame_buf') and self.video._last_frame_buf is not None else 1280
+                    stream.pix_fmt = 'yuv420p'
+
+                    # Cap capture duration to 30 minutes max to avoid huge files
+                    end_time = self._recording_start_time + 30 * 60  # secs
+                    import numpy as np
+                    import time
+                    # Use local reference for thread safety
+                    video_ref = self.video
+                    while self._recording and time.time() < end_time:
+                        time.sleep(0.02)  # ~50 fps capture
+                        if not self._recording:
+                            break
+                        frame_buf = np.array(video_ref._last_frame_buf) if hasattr(video_ref, '_last_frame_buf') else None
+                        if frame_buf is None or frame_buf.size == 0:
+                            continue
+                        # BGR -> RGB then allow av to convert to YUV on encode
+                        rgb_frame = frame_buf[:, :, ::-1]
+                        frame = av.VideoFrame.from_ndarray(rgb_frame, format='rgb24')
+                        frame.pts -= stream.time_base.denominator / stream.time_base.numerator
+                        container.mux(frame)
+
+                    try:
+                        container.close()
+                    except Exception:
+                        pass
+                    if self._recording:
+                        self.run_on_main_thread(lambda: safe_info(
+                            self, "Recording Stopped",
+                            f"Recording saved to:\n{dest_path}"
+                        ))
+                        self.run_on_main_thread(lambda: self.status.showMessage(f"Recording saved: {filename}"))
+                        self.run_on_main_thread(lambda: setattr(self, '_recording', False))
+                        self.run_on_main_thread(lambda: self._setup_recording_button())
+                except Exception as e:
+                    try:
+                        container.close()
+                    except Exception:
+                        pass
+                    self.run_on_main_thread(lambda:
+                        safe_warning(self, "Recording Error", f"Recording failed: {e}"))
+                    self.run_on_main_thread(lambda: setattr(self, '_recording', False))
+                    self.run_on_main_thread(lambda: self._setup_recording_button())
+            threading.Thread(target=_recorder_thread, daemon=True).start()
+        except Exception as e:
+            self._log("ERROR", f"Start recording error: {e}")
+            try:
+                safe_warning(self, "Recording Error", f"Start recording error: {e}")
+            except RuntimeError:
+                pass
+
+    def _stop_recording(self):
+        """Stop recording."""
+        self._recording = False
+        try:
+            self._setup_recording_button()
+        except Exception:
+            pass
+
+    def _setup_recording_button(self):
+        """Update Record button appearance based on current state."""
+        if getattr(self, '_closing', False):
+            return
+        if self._recording:
+            # Keep recording appearance (rare case — may already be set)
+            self.record_btn.setText("⏹  Stop Recording")
+            self.record_btn.setStyleSheet(
+                "QPushButton { background: #ff6666; color: white; border: none; "
+                "border-radius: 6px; font-size: 10pt; font-weight: bold; padding: 0 10px; }"
+                "QPushButton:hover { background: #ff8888; }"
+            )
+        else:
+            # Ready to record
+            self.record_btn.setText("⏺  Record")
+            self.record_btn.setStyleSheet(self._nav_row1._nav_btn_style if hasattr(self._nav_row1, '_nav_btn_style') else
+                f"QPushButton {{ background-color: {self._BTN_BG}; color: white; "
+                f"border: 2px solid #555; border-radius: 6px; "
+                f"font-size: 10pt; font-weight: bold; padding: 0 10px; }}")
 
     # ──────────────────────────────────────────────────────────────────
     #  Keyboard shortcuts

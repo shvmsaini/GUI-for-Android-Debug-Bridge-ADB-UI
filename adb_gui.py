@@ -93,6 +93,8 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         # Thread-safe UI caller (used to marshal UI updates from background threads)
         self._ui_caller = _UICaller(self)
         self._active_mirror_windows = {}
+        # Track which seats have been seized by other users
+        self._seat_was_seized = {}
 
         # Window title with debug indicator (ALWAYS show if DEBUG_MODE)
         title = f"ADB Tool v{APP_VERSION}"
@@ -534,24 +536,26 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         mirror_label_row.addWidget(QLabel("🪞 Mirror Screen:"))
         device_ops_group_layout.addLayout(mirror_label_row)
 
-        # Row: Open Scrcpy, Fast, Normal (all in one row)
-        # "Fast" → 2 Mbps / 30 fps / max_size 800, for bandwidth-sensitive
+        # Mirror buttons — all 3 on one row, equal width (1/3 each)
+        # "Fast" → 500 Kbps / 30 fps / 800px, for bandwidth-sensitive
         #           situations (seat/remote mirroring where the link is
         #           the bottleneck). Lowering the long-edge from 1024 to
         #           800 cuts bytes-per-frame by ~40%, the biggest single
         #           latency lever we have on network seats.
-        # "Normal" → 6 Mbps / 60 fps / max_size 1024, the recommended default for
-        #           local emulator or USB-connected device: crisp text/UI
+        # "Normal" → 2 Mbps / 60 fps / 1024px, the recommended default for
+        #           local emulator or USB-connected device: decent text/UI
         #           without H.264 macroblocking, and 60 fps matches the
         #           typical emulator refresh rate so taps feel immediate.
-        #           6 Mbps provides significantly better text readability
-        #           while still staying within typical local network limits.
-        scrcpy_row = QHBoxLayout()
+        mirror_row = QHBoxLayout()
+        mirror_row.setSpacing(10)
+        mirror_row.setStretch(0, 1)
+        mirror_row.setStretch(1, 1)
+        mirror_row.setStretch(2, 1)
 
         native_scrcpy_btn = QPushButton("🖥️ Open Scrcpy")
         native_scrcpy_btn.setToolTip("Launch native scrcpy for best quality (highest bitrate & resolution)")
         native_scrcpy_btn.clicked.connect(self.scrcpy_device)
-        scrcpy_row.addWidget(native_scrcpy_btn)
+        mirror_row.addWidget(native_scrcpy_btn)
 
         fast_btn = QPushButton("⚡ Fast")
         fast_btn.setToolTip("500 Kbps / 30 fps / 800px — for slow remote/seat connections (embedded)")
@@ -559,7 +563,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
             bitrate=500_000, max_fps=30, max_size=800,
             seat_context=self.seat_port_manager and self._device_to_seat_context(self.current_device or ""))
         )
-        scrcpy_row.addWidget(fast_btn)
+        mirror_row.addWidget(fast_btn)
 
         normal_btn = QPushButton("🎬 Normal")
         normal_btn.setToolTip("2 Mbps / 60 fps / 1024px — embedded mirror (decent quality)")
@@ -567,38 +571,38 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
             bitrate=2_000_000, max_fps=60, max_size=1024,
             seat_context=self.seat_port_manager and self._device_to_seat_context(self.current_device or ""))
         )
-        scrcpy_row.addWidget(normal_btn)
+        mirror_row.addWidget(normal_btn)
 
-        scrcpy_row.addStretch()
-        device_ops_group_layout.addLayout(scrcpy_row)
+        device_ops_group_layout.addLayout(mirror_row)
 
         # Row: 📱 Navigation: label
         nav_label_row = QHBoxLayout()
         nav_label_row.addWidget(QLabel("📱 Navigation:"))
         device_ops_group_layout.addLayout(nav_label_row)
 
-        # Navigation buttons for use during a scrcpy session
-        # These send keyevents over ADB so they work with the native
-        # scrcpy window on any Android version (no extra deps required).
-        nav_buttons_row = QHBoxLayout()
+        # Navigation buttons — all 3 on one row, equal width (1/3 each)
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(10)
+        nav_row.setStretch(0, 1)
+        nav_row.setStretch(1, 1)
+        nav_row.setStretch(2, 1)
 
         nav_back = QPushButton("◀ Back")
         nav_back.setToolTip("Send KEYCODE_BACK to the device (4)")
         nav_back.clicked.connect(lambda: self._send_keyevent(4, "Back"))
-        nav_buttons_row.addWidget(nav_back)
+        nav_row.addWidget(nav_back)
 
         nav_home = QPushButton("◯ Home")
         nav_home.setToolTip("Send KEYCODE_HOME to the device (3)")
         nav_home.clicked.connect(lambda: self._send_keyevent(3, "Home"))
-        nav_buttons_row.addWidget(nav_home)
+        nav_row.addWidget(nav_home)
 
         nav_recent = QPushButton("▢ Recent")
         nav_recent.setToolTip("Send KEYCODE_APP_SWITCH to the device (187)")
         nav_recent.clicked.connect(lambda: self._send_keyevent(187, "Recent"))
-        nav_buttons_row.addWidget(nav_recent)
+        nav_row.addWidget(nav_recent)
 
-        nav_buttons_row.addStretch()
-        device_ops_group_layout.addLayout(nav_buttons_row)
+        device_ops_group_layout.addLayout(nav_row)
 
         # Advanced section - Reboot options (collapsible, colored red)
         advanced_header = QPushButton("▶ ⚠️ Advanced")
@@ -878,16 +882,14 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
         log_controls.addWidget(clear_btn)
 
         # Export button — save current log to a file
-        export_btn = QPushButton("💾 Export")
-        export_btn.setToolTip("Export current log to a text file")
+        export_btn = QPushButton("💾 Export ADB Logs")
+        export_btn.setToolTip("Export the current app/logcat log to a text file")
         export_btn.clicked.connect(self.export_current_log)
         log_controls.addWidget(export_btn)
 
-        # Diagnostics button — save complete diagnostic bundle (logs, crash traces, sysinfo) as ZIP
-        diag_btn = QPushButton("📦 Diagnostics")
-        diag_btn.setToolTip("Export complete diagnostic package (logs, crash dumps, system info) as a ZIP")
-        diag_btn.clicked.connect(self.export_diagnostic_bundle)
-        log_controls.addWidget(diag_btn)
+        # Note: the "Diagnostics" bundle export and "Open Logs Folder" actions
+        # have moved to the Settings dialog (⚙️ Settings → Troubleshooting &
+        # Crash Logs) to keep the log controls bar uncluttered.
 
         # Show Screen button — toggles the in-window device mirror.
         # Visible by default so the user can enter screen view from any state.
