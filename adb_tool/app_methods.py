@@ -78,8 +78,8 @@ class AppMixin:
         layout.addWidget(browse_btn)
 
         # Gateway checkbox - enabled, will prompt for mtc password if needed
-        gateway_checkbox = QCheckBox("Deploy using gateway (for seat devices)")
-        gateway_checkbox.setToolTip("Uses SCP tunnel to copy APK directly to seat")
+        gateway_checkbox = QCheckBox("Deploy using seat device (scp + pm)")
+        gateway_checkbox.setToolTip("Uses SCP tunnel to copy APK directly to seat and pm install.")
         layout.addWidget(gateway_checkbox)
 
         # Buttons

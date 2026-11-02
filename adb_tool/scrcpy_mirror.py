@@ -14,6 +14,7 @@ Dependencies (lazy-imported so the rest of the app works without them):
 
 import sys
 import threading
+import time
 import traceback
 from typing import Optional
 
