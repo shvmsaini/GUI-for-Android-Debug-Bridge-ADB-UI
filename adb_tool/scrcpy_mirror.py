@@ -211,9 +211,17 @@ class VideoDisplayWidget(QWidget):
         except Exception:
             pass
 
-    def set_disconnected(self):
-        """Show disconnection message instead of frozen frame."""
+    def set_disconnected(self, title=None, subtitle=None):
+        """Show an overlay message instead of the frozen frame.
+
+        Args:
+            title: Optional main heading. Defaults to "Screen disconnected".
+            subtitle: Optional sub-line. Defaults to
+                "Auto-retrying… or use Retry in the dialog."
+        """
         self._disconnected = True
+        self._disconnected_title = title or "Screen disconnected"
+        self._disconnected_subtitle = subtitle or "Auto-retrying… or use Retry in the dialog."
         self._pixmap = None
         self._last_frame_buf = None
         try:
@@ -247,7 +255,7 @@ class VideoDisplayWidget(QWidget):
             # Center the message roughly mid-rect.
             title_rect = rect.adjusted(0, 0, 0, -(rect.height() // 4))
             painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter,
-                             "Screen disconnected")
+                             getattr(self, '_disconnected_title', "Screen disconnected"))
             # Subtitle in a softer color with a smaller font for context.
             sub_font = main_font
             sub_font.setBold(False)
@@ -256,7 +264,7 @@ class VideoDisplayWidget(QWidget):
             painter.setPen(QColor("#d0d0d0"))
             sub_rect = rect.adjusted(0, rect.height() // 3, 0, 0)
             painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter,
-                             "Auto-retrying… or use Retry in the dialog.")
+                             getattr(self, '_disconnected_subtitle', "Auto-retrying… or use Retry in the dialog."))
             return
 
         if self._pixmap is None or self._pixmap.isNull():
@@ -1807,6 +1815,25 @@ class ScrcpyMirrorWindow(QMainWindow):
             "DEBUG",
             f"_on_auto_retry ({reason}): restart {when} (attempt {self._retry_count})",
         )
+
+        # Visual feedback in the mirror window itself: while we wait
+        # between retries, replace the frozen frame with a "Reconnecting…"
+        # overlay so the user can see the window is still alive and
+        # working. update_frame() will clear this overlay automatically
+        # the moment a real frame arrives (line ~202: self._disconnected
+        # = False). The status bar is left alone — it's the wrong place
+        # for this info since it scrolls off and isn't visible on small
+        # mirror windows.
+        if hasattr(self, 'video') and self.video is not None:
+            try:
+                self.video.set_disconnected(
+                    title="Reconnecting…",
+                    subtitle=f"Attempt {self._retry_count} — {reason}",
+                )
+            except RuntimeError:
+                # Widget already torn down — keep going, the restart is
+                # what matters.
+                pass
 
         def _restart():
             # The auto-retry path uses QTimer.singleShot(..., _restart),
