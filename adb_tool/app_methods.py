@@ -417,6 +417,25 @@ class AppMixin:
                     mtc_password=mtc_password,
                     timeout=300
                 )
+            except _SeatSshError as e:
+                # Direct `ssh mtc@<seat>` rejected by this gateway? Fall
+                # back to the bct-mediated path (see
+                # [[bct-login-fallback-for-mtc-ssh]]).
+                msg = str(e).lower()
+                if "mtc" in msg and ("rejected" in msg or "denied" in msg or "password" in msg):
+                    self.log(
+                        f"Direct ssh mtc@ failed ({e!r}); trying bct-mediated copy "
+                        f"to {seat_name}.",
+                        "WARNING",
+                    )
+                    jump.run_scp_via_bct(
+                        local_path=apk_path,
+                        remote_path=remote_path,
+                        seat_host=seat_name,
+                        timeout=300,
+                    )
+                else:
+                    raise
             finally:
                 pass
 
@@ -431,7 +450,20 @@ class AppMixin:
                     timeout=30,
                 )
             except _SeatSshError as e:
-                self.log(f"chmod on seat failed: {e}", "WARNING")
+                msg = str(e).lower()
+                if "mtc" in msg and ("rejected" in msg or "denied" in msg or "password" in msg):
+                    self.log(
+                        f"Direct ssh mtc@ failed for chmod; trying bct-mediated "
+                        f"path on {seat_name}.",
+                        "WARNING",
+                    )
+                    jump.run_remote_command_via_bct(
+                        seat_host=seat_name,
+                        command=f"chmod 644 {shlex.quote(remote_path)}",
+                        timeout=30,
+                    )
+                else:
+                    self.log(f"chmod on seat failed: {e}", "WARNING")
 
         except _SeatSshError as e:
             # Extract the actual error message from SCP output (not SSH debug)

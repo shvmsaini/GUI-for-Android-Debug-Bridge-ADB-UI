@@ -664,6 +664,191 @@ class _SeatJumpHost:
                     try: os.unlink(f.name)
                     except: pass
 
+    def _probe_bct(self, shell=None):
+        """Return True iff ``bct`` is available on this gateway.
+
+        Probes via an interactive shell so PATH set in the user's login
+        profile (~/.zshrc / ~/.bashrc) is in scope — exec_command skips
+        those rc files. The result is cached on the instance so we don't
+        re-probe every call.
+        """
+        cached = getattr(self, "_has_bct", None)
+        if cached is not None:
+            return cached
+        own_shell = shell is None
+        try:
+            if own_shell:
+                shell = self.shell()
+                shell.drain(quiet=0.5, maxwait=4)
+            shell.buf = ""
+            shell.send_line("command -v bct >/dev/null 2>&1 && echo __ADB_GUI_BCT_YES__ || echo __ADB_GUI_BCT_NO__\n")
+            shell.wait_for(r"__ADB_GUI_BCT_(YES|NO)__", 6)
+            has_bct = "YES" in shell.buf
+        except Exception:
+            has_bct = False
+        try:
+            self._has_bct = has_bct
+        except Exception:
+            pass
+        if own_shell:
+            try:
+                shell.close()
+            except Exception:
+                pass
+        return has_bct
+
+    def run_remote_command_via_bct(self, seat_host, command, timeout=60):
+        """Run ``command`` on the seat via the gateway's ``bct`` helper.
+
+        Used as a fallback when the gateway blocks direct ``ssh mtc@<seat>``
+        (see [[bct-login-fallback-for-mtc-ssh]]). The gateway shell runs
+        ``bct login -h <seat>`` to land us at the seat's mtc prompt, then
+        we pipe the command through that interactive session.
+
+        No mtc password is needed (bct authenticates to the seat on its
+        own). The command output is captured and returned as a string.
+        Raises ``_SeatSshError`` on any failure.
+        """
+        shell = None
+        try:
+            shell = self.shell()
+            shell.drain(quiet=0.5, maxwait=4)
+            if not self._probe_bct(shell):
+                raise _SeatSshError(
+                    f"bct is not available on {self._user}@{self._host}; "
+                    "cannot run command on seat via bct path."
+                )
+
+            self._log(f"BCT: bct login -h {seat_host} (run: {command!r})")
+            shell.buf = ""
+            shell.send_line(f"bct login -h {shlex.quote(seat_host)}\n")
+            if not shell.wait_for(r"\[?mtc@[^\s\]]+[^\n]*[\]#$] ?", 20):
+                tail = _clean(shell.buf)[-300:].strip()
+                raise _SeatSshError(
+                    f"`bct login -h {seat_host}` did not reach an mtc prompt. "
+                    f"Last output: {tail}"
+                )
+
+            # Run the command on the seat via the bct-mediated shell.
+            # Use a unique end marker so we can extract just the command's
+            # output without prompt / bct login chatter.
+            tag = uuid.uuid4().hex[:8]
+            shell.buf = ""
+            shell.send_line(f"{command}\necho __ADB_GUI_BCT_{tag}_END__\n")
+            if not shell.wait_for(rf"__ADB_GUI_BCT_{tag}_END__", timeout):
+                tail = _clean(shell.buf)[-300:].strip()
+                raise _SeatSshError(
+                    f"Command on seat (via bct) timed out after {timeout}s. "
+                    f"Tail: {tail}"
+                )
+            out = _clean(shell.buf.split(f"__ADB_GUI_BCT_{tag}_END__")[0])
+            return out
+        finally:
+            if shell:
+                try:
+                    shell.close()
+                except Exception:
+                    pass
+
+    def run_scp_via_bct(self, local_path, remote_path, seat_host, timeout=600,
+                        progress_callback=None):
+        """Copy a local file to the seat via the gateway's ``bct`` helper.
+
+        Two-stage hop:
+          1. ``scp local user@gateway:/tmp/...``  (local → gateway)
+          2. ``bct login -h <seat>`` then ``cp /tmp/... <remote>``
+             (gateway → seat, no mtc password needed)
+
+        Used as a fallback when the gateway blocks direct ``ssh mtc@<seat>``.
+        The gateway ssh is invoked locally with SSH_ASKPASS for passwordless
+        authentication; the seat-side hop is driven by the gateway's
+        interactive shell.
+
+        Raises ``_SeatSshError`` on failure. Calls ``progress_callback`` (if
+        given) with ``(bytes_transferred, total_bytes)`` between stages.
+        """
+        import uuid as _uuid
+        # Stage 1: copy the local file to the gateway. The gateway ssh
+        # uses our existing SSH_ASKPASS plumbing (no mtc password needed
+        # because we're only talking to user@gateway).
+        gw_pw_file = None
+        askpass_file = None
+        try:
+            gw_basename = os.path.basename(local_path)
+            gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex}-{gw_basename}"
+
+            gw_pw_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_gw_pw_")
+            gw_pw_file.write(self._password)
+            gw_pw_file.close()
+            os.chmod(gw_pw_file.name, 0o600)
+
+            askpass_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_ssh_ap_", suffix=".sh")
+            askpass_file.write(
+                "#!/bin/sh\n"
+                f"case \"$1\" in\n"
+                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
+                "  *) echo \"yes\" ;;\n"
+                "esac\n"
+            )
+            askpass_file.close()
+            os.chmod(askpass_file.name, 0o700)
+
+            proxy_cmd = (
+                f"ssh -o StrictHostKeyChecking=no "
+                f"-o UserKnownHostsFile=/dev/null "
+                f"-p {self._port} "
+                f"-W %h:%p {self._user}@{self._host}"
+            ) if self._port != 22 else (
+                f"ssh -o StrictHostKeyChecking=no "
+                f"-o UserKnownHostsFile=/dev/null "
+                f"-W %h:%p {self._user}@{self._host}"
+            )
+
+            cmd = [
+                "scp", "-O",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+                "-o", f"ProxyCommand={proxy_cmd}",
+                local_path,
+                f"{self._user}@{self._host}:{gw_staging}",
+            ]
+
+            env = os.environ.copy()
+            env["SSH_ASKPASS"] = askpass_file.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = ":0"
+            env.pop("SSHPASS", None)
+
+            self._log(f"BCT-SCP: stage 1 (local → gateway): {' '.join(cmd)}")
+            res = subprocess.run(cmd, env=env, capture_output=True,
+                                 text=True, timeout=timeout)
+            if res.returncode != 0:
+                raise _SeatSshError(
+                    f"scp to gateway failed (code {res.returncode}): "
+                    f"{(res.stderr or res.stdout or '').strip()[:300]}"
+                )
+            if progress_callback:
+                total = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+                progress_callback(total // 2, total)
+
+            # Stage 2: hop the staged file from the gateway to the seat
+            # via `bct login -h <seat>`.
+            self._log(f"BCT-SCP: stage 2 (gateway → seat): cp {gw_staging} → {remote_path}")
+            cp_cmd = f"cp {shlex.quote(gw_staging)} {shlex.quote(remote_path)} && rm -f {shlex.quote(gw_staging)}"
+            self.run_remote_command_via_bct(seat_host, cp_cmd, timeout=timeout)
+            if progress_callback:
+                total = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+                progress_callback(total, total)
+            self._log(f"BCT-SCP: transfer complete ({gw_basename})")
+        finally:
+            for f in (gw_pw_file, askpass_file):
+                if f:
+                    try: os.unlink(f.name)
+                    except: pass
+
 
 class _ProcChannel:
     """Adapter that lets ``_SeatShell`` drive a subprocess as if it were
@@ -806,12 +991,23 @@ def _clean_adb_key_line(raw_lines):
 
 
 def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
-    """From the jump host, run `ssh -t mtc@<seat> 'sudo -S su -'` and
-    return the resulting root shell.
+    """From the jump host, reach a root shell on the seat and return it.
 
-    The mtc password is fed twice:
-      1. SSH to mtc@<seat> (login)
-      2. sudo prompt (when sudo reads its password from the remote tty)
+    Two paths are supported, picked at runtime based on whether the
+    gateway has ``bct`` available:
+
+      1. ``bct login -h <seat>`` — passwordless helper on gateways that
+         block direct ``ssh mtc@<seat>``. After login we land at an
+         ``[mtc@...]$`` prompt on the seat itself; then we run
+         ``sudo -S su -`` from there. The mtc password is only needed
+         for the sudo prompt.
+      2. ``ssh -t mtc@<seat> 'sudo -S su -'`` — classic ProxyJump. The
+         mtc password is fed twice: once for the SSH login, once for the
+         sudo prompt on the seat.
+
+    ``bct`` is preferred when present because the direct ``ssh mtc@``
+    path is rejected by some gateways (e.g. ``172.17.124.56``), even
+    with the correct password. See ``[[bct-login-fallback-for-mtc-ssh]]``.
 
     Raises ``_SeatSshError`` if any step fails.
     """
@@ -820,73 +1016,184 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
         sh = jump.shell()
         sh.drain(quiet=1.0, maxwait=8)
 
-        # Build the SSH-to-seat command. -t forces a tty allocation so sudo
-        # reads its password from the remote tty (the only place our shell
-        # can write to).
-        #
-        # We use `sudo -S su -` rather than `sudo -i` because on some seat
-        # images `sudo -i` initialises a PAM session that mounts /data as
-        # read-only or otherwise blocks writing to /data/misc/adb — even
-        # though `id -u` still returns 0. `sudo -S su -` matches the working
-        # bundled-script path and lands us in a true root login shell.
-        ssh_seat_cmd = (
-            f"ssh -o StrictHostKeyChecking=accept-new "
-            f"-o UserKnownHostsFile=/dev/null "
-            f"-tt mtc@{seat} 'sudo -S su -'"
-        )
-        log(f"SEAT: {ssh_seat_cmd}")
-        sh.buf = ""
-        sh.send_line(ssh_seat_cmd + "\n")
-
-        # First password prompt: SSH login for mtc@<seat>.
-        if not sh.wait_for(r"(?i)password[^\n]*:", 15):
-            tail = _clean(sh.buf)[-200:].strip()
-            raise _SeatSshError(
-                f"Did not get an SSH password prompt from mtc@{seat}. "
-                f"Last output: {tail}"
-            )
-        log(f"SEAT: sending mtc password for SSH login ({len(mtc_password)} chars)")
-        time.sleep(0.2)
-        sh.buf = ""
-        sh.send_line(mtc_password + "\n")
-
-        # Wait for either a second password prompt (sudo on the seat) OR
-        # an auth failure ("Permission denied") from the inner ssh.
-        end_at = time.time() + 12
-        outcome = None  # 'sudo' | 'auth_fail'
-        while time.time() < end_at and outcome is None:
-            sh._pull()
-            low = sh.buf.lower()
-            if "permission denied" in low:
-                outcome = 'auth_fail'
-            elif re.search(r"(?i)password[^\n]*:", sh.buf):
-                outcome = 'sudo'
+        # Probe for `bct` on the gateway. The probe uses an interactive
+        # shell so PATH set up in the user's login profile (e.g. an
+        # alias or wrapper installed via ~/.zshrc) is in scope — a bare
+        # `command -v bct` in exec_command would skip those rc files.
+        # The result is cached per-jump-host so we don't re-probe on
+        # every call into a seat from the same gateway.
+        has_bct = getattr(jump, "_has_bct", None)
+        if has_bct is None:
+            sh.buf = ""
+            sh.send_line("command -v bct >/dev/null 2>&1 && echo __ADB_GUI_BCT_YES__ || echo __ADB_GUI_BCT_NO__\n")
+            if not sh.wait_for(r"__ADB_GUI_BCT_(YES|NO)__", 6):
+                tail = _clean(sh.buf)[-200:].strip()
+                log(f"SEAT: bct probe timed out (tail: {tail}) — assuming absent", "DEBUG")
+                has_bct = False
             else:
-                time.sleep(0.1)
-
-        if outcome == 'auth_fail':
-            raise _SeatAuthError(
-                f"mtc@{seat} rejected the SSH password."
-            )
-
-        if outcome is None:
-            # No second prompt and no auth failure — either NOPASSWD sudo
-            # or the shell never came back. Let sudo-password branch decide.
-            log("SEAT: no second password prompt — assuming NOPASSWD sudo", "DEBUG")
+                has_bct = "YES" in sh.buf
+            try:
+                jump._has_bct = has_bct
+            except Exception:
+                pass
+            log(f"SEAT: bct probe on gateway → {has_bct}", "DEBUG")
         else:
-            log("SEAT: sending mtc password for sudo")
+            log(f"SEAT: reusing cached bct availability ({has_bct})", "DEBUG")
+
+        if has_bct:
+            # Path 1: bct login -h <seat> (no mtc password needed).
+            # `bct login` lands us at the seat's mtc prompt directly,
+            # bypassing the gateway-level block on `ssh mtc@<seat>`.
+            bct_cmd = f"bct login -h {shlex.quote(seat)}"
+            log(f"SEAT: {bct_cmd} (gateway has bct — skipping ssh mtc@)")
+            sh.buf = ""
+            sh.send_line(bct_cmd + "\n")
+
+            # bct may print a couple of informational lines (motd,
+            # "Connecting to ..."), then drop us at an mtc prompt like
+            # `[mtc@nc1 ~]$`. We allow up to 20s — bct's handshake on a
+            # slow seat can be that long.
+            if not sh.wait_for(r"\[?mtc@[^\s\]]+[^\n]*[\]#$] ?", 20):
+                tail = _clean(sh.buf)[-300:].strip()
+                raise _SeatSshError(
+                    f"`bct login -h {seat}` did not reach an mtc prompt. "
+                    f"Last output: {tail}"
+                )
+            log(f"SEAT: bct login reached mtc prompt on {seat}")
+
+            # Now escalate to root from the mtc shell. Same sudo dance
+            # as the classic path, just driven from a different parent
+            # shell.
+            time.sleep(0.2)
+            sh.buf = ""
+            sh.send_line("sudo -S su -\n")
+
+            outcome = None  # 'sudo' | 'auth_fail'
+            end_at = time.time() + 12
+            while time.time() < end_at and outcome is None:
+                sh._pull()
+                low = sh.buf.lower()
+                if "permission denied" in low or "incorrect password" in low:
+                    outcome = 'auth_fail'
+                elif re.search(r"(?i)password[^\n]*:", sh.buf):
+                    outcome = 'sudo'
+                else:
+                    time.sleep(0.1)
+
+            if outcome == 'auth_fail':
+                raise _SeatAuthError(
+                    "sudo rejected the password on this seat. The seat's "
+                    "sudo password must match the mtc password."
+                )
+
+            if outcome is None:
+                log("SEAT: bct path: no sudo prompt — assuming NOPASSWD sudo", "DEBUG")
+            else:
+                log("SEAT: bct path: sending mtc password for sudo")
+                time.sleep(0.2)
+                sh.buf = ""
+                sh.send_line(mtc_password + "\n")
+                if sh.wait_for(
+                    r"(?i)try again|incorrect password|authentication fail|"
+                    r"not in the sudoers|may not run sudo",
+                    3,
+                ):
+                    raise _SeatAuthError(
+                        "sudo rejected the password on this seat. The seat's "
+                        "sudo password must match the mtc password."
+                    )
+        else:
+            # Path 2: classic ssh -t mtc@<seat> 'sudo -S su -'.
+            #
+            # We use `sudo -S su -` rather than `sudo -i` because on some
+            # seat images `sudo -i` initialises a PAM session that mounts
+            # /data as read-only or otherwise blocks writing to
+            # /data/misc/adb — even though `id -u` still returns 0.
+            # `sudo -S su -` matches the working bundled-script path and
+            # lands us in a true root login shell.
+            ssh_seat_cmd = (
+                f"ssh -o StrictHostKeyChecking=accept-new "
+                f"-o UserKnownHostsFile=/dev/null "
+                f"-tt mtc@{seat} 'sudo -S su -'"
+            )
+            log(f"SEAT: {ssh_seat_cmd}")
+            sh.buf = ""
+            sh.send_line(ssh_seat_cmd + "\n")
+
+            # First password prompt: SSH login for mtc@<seat>.
+            if not sh.wait_for(r"(?i)password[^\n]*:", 15):
+                tail = _clean(sh.buf)[-200:].strip()
+                raise _SeatSshError(
+                    f"Did not get an SSH password prompt from mtc@{seat}. "
+                    f"Last output: {tail}"
+                )
+            log(f"SEAT: sending mtc password for SSH login ({len(mtc_password)} chars)")
             time.sleep(0.2)
             sh.buf = ""
             sh.send_line(mtc_password + "\n")
-            if sh.wait_for(
-                r"(?i)try again|incorrect password|authentication fail|"
-                r"not in the sudoers|may not run sudo",
-                3,
-            ):
-                raise _SeatAuthError(
-                    "sudo rejected the password on this seat. The seat's sudo "
-                    "password must match the mtc password."
-                )
+
+            # Wait for either a second password prompt (sudo on the seat)
+            # OR an auth failure ("Permission denied") from the inner ssh.
+            end_at = time.time() + 12
+            outcome = None  # 'sudo' | 'auth_fail'
+            while time.time() < end_at and outcome is None:
+                sh._pull()
+                low = sh.buf.lower()
+                if "permission denied" in low:
+                    outcome = 'auth_fail'
+                elif re.search(r"(?i)password[^\n]*:", sh.buf):
+                    outcome = 'sudo'
+                else:
+                    time.sleep(0.1)
+
+            if outcome == 'auth_fail':
+                # The gateway might be one of those that rejects
+                # `ssh mtc@` outright. Try bct as a one-shot fallback
+                # before giving up — this lets the user reach seats on
+                # gateways they didn't know had bct installed.
+                log(f"SEAT: mtc@{seat} rejected SSH password — retrying with `bct login -h`", "WARNING")
+                # Discard the failed ssh session by sending Ctrl-C / exit,
+                # then probe bct and walk the bct path.
+                try:
+                    sh.send_line("\x03\n")
+                    time.sleep(0.2)
+                    sh.send_line("\n")
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+                # Force a re-probe (in case the cache said "no bct" but
+                # the gateway actually had bct).
+                try:
+                    del jump._has_bct
+                except Exception:
+                    pass
+                sh.close()
+                sh = jump.shell()
+                sh.drain(quiet=1.0, maxwait=8)
+                # Recurse through the bct path by calling ourselves
+                # with the cache cleared. This avoids duplicating the
+                # bct/sudo logic above.
+                return _seat_root_shell_via_mtc(jump, seat, mtc_password, log)
+
+            if outcome is None:
+                # No second prompt and no auth failure — either
+                # NOPASSWD sudo or the shell never came back. Let
+                # sudo-password branch decide.
+                log("SEAT: no second password prompt — assuming NOPASSWD sudo", "DEBUG")
+            else:
+                log("SEAT: sending mtc password for sudo")
+                time.sleep(0.2)
+                sh.buf = ""
+                sh.send_line(mtc_password + "\n")
+                if sh.wait_for(
+                    r"(?i)try again|incorrect password|authentication fail|"
+                    r"not in the sudoers|may not run sudo",
+                    3,
+                ):
+                    raise _SeatAuthError(
+                        "sudo rejected the password on this seat. The seat's "
+                        "sudo password must match the mtc password."
+                    )
 
         time.sleep(0.5)
 
@@ -898,11 +1205,12 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
                 "Check the mtc password."
             )
 
-        # Sanity check: confirm we're on a seat shell. `/data/misc/adb` is
-        # created by adbd on first start, but on a freshly-imaged seat (or
-        # one where adbd hasn't run yet) the directory may not exist yet.
-        # Create it as root — that's safe on a seat — and bail only if even
-        # that fails, which means we landed on the jump host instead.
+        # Sanity check: confirm we're on a seat shell. `/data/misc/adb`
+        # is created by adbd on first start, but on a freshly-imaged
+        # seat (or one where adbd hasn't run yet) the directory may not
+        # exist yet. Create it as root — that's safe on a seat — and
+        # bail only if even that fails, which means we landed on the
+        # jump host instead.
         mkdir_out, mkdir_code = sh.run(
             "mkdir -p /data/misc/adb && ls -ld /data/misc/adb", timeout=10)
         if mkdir_code != 0:
@@ -2617,6 +2925,19 @@ class SeatMixin:
         self.log(f"Connecting to seat {seat} via {gateway}...")
         self.update_status(f"🔌 Connecting to seat {seat} via {gateway}...")
 
+        # Mark this seat as a user-initiated connect in progress so the
+        # auto-disconnect logic in ``_apply_device_refresh`` doesn't tear down
+        # the half-state ``localhost:<port>`` binding while ``seat.sh
+        # auto-connect`` is still running and the watcher hasn't started yet.
+        # The watcher (started in ``_finish_seat_connect_after_seizure_decision``)
+        # is what triggers the user-facing seizure prompt at 1s — the
+        # auto-disconnect logic has no concept of "ask first" and would
+        # silently kill the connection before the user sees anything.
+        # Cleared in the success/failure paths below.
+        if not hasattr(self, '_connecting_seats'):
+            self._connecting_seats = set()
+        self._connecting_seats.add(seat)
+
         # Store for use in do_connect closure
         self._pending_adb_key = adb_key if install_adb_key else None
         self._pending_device_password = device_password
@@ -2651,6 +2972,19 @@ class SeatMixin:
         self.update_status(f"🔌 Establishing SSH tunnel to seat {seat}...")
 
         def do_connect():
+            # Outer try/finally so we ALWAYS release the connecting-set lock —
+            # even on exception paths. Otherwise the auto-disconnect logic in
+            # _apply_device_refresh would keep treating this seat as
+            # user-initiated and skip tearing it down on real failures.
+            try:
+                do_connect_inner()
+            finally:
+                try:
+                    self._connecting_seats.discard(seat)
+                except Exception:
+                    pass
+
+        def do_connect_inner():
             try:
                 # Kill any stale SSH tunnels for this seat before connecting.
                 # `seat.sh auto-connect` runs `ssh -f -N -L <port>:<seat>:5555 <gw>`
@@ -3706,6 +4040,23 @@ class SeatMixin:
 
         def do_disconnect():
             try:
+                # Capture the seat's current localhost:<port> BEFORE we run
+                # `seat.sh disconnect` — once the SSH tunnel goes down the
+                # device entry disappears from `adb devices` and we can't
+                # tell which port was ours. We use this to clear the
+                # _device_ever_online flag below so the next manual
+                # reconnect isn't flagged as a stale connection and killed
+                # by auto-disconnect before the user even sees the
+                # seizure prompt. (The flag persists across app restarts
+                # via the adb-side state, not via this dict — but during
+                # the current session it would still trigger.)
+                seat_sh_devices_pre = self.seat_port_manager.get_devices_from_seat_sh()
+                device_id_pre = None
+                for dev_info in seat_sh_devices_pre:
+                    if dev_info.get('seat') == seat:
+                        device_id_pre = dev_info.get('device')
+                        break
+
                 # Resolve script path (custom override or bundled fallback)
                 script_path = self.seat_port_manager._get_seat_script_path()
 
@@ -3722,6 +4073,17 @@ class SeatMixin:
 
                 if result.returncode == 0:
                     self.seat_port_manager.mark_seat_disconnected(seat)
+                    # Clear the ever-online flag for this seat's port so a
+                    # fresh reconnect won't be auto-disconnected on its first
+                    # refresh tick (the device will report `offline` for a
+                    # few seconds while the phone completes the adb-key
+                    # handshake, and we don't want the auto-disconnect logic
+                    # to treat that as "previously online, now offline → tear
+                    # it down"). Without this, the manual-reconnect flow hits
+                    # the same false-positive auto-disconnect that the seat
+                    # watcher code was supposed to guard against.
+                    if device_id_pre and hasattr(self, '_device_ever_online'):
+                        self._device_ever_online.pop(device_id_pre, None)
                     # Drop any mirror auto-resume snapshot for this seat —
                     # a deliberate disconnect shouldn't auto-reopen the
                     # mirror when the user reconnects.
@@ -3730,14 +4092,7 @@ class SeatMixin:
                     self.update_status(f"Disconnected from {seat}")
 
                     # Close any associated mirror window for this device
-                    device_id = None
-                    # Try to find the device_id associated with this seat
-                    seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
-                    for dev_info in seat_sh_devices:
-                        if dev_info.get('seat') == seat:
-                            device_id = dev_info.get('device')
-                            break
-
+                    device_id = device_id_pre
                     # Close the mirror window if found
                     if device_id:
                         self.run_on_main_thread(lambda did=device_id: self._close_mirror_window_if_exists(did))
