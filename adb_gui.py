@@ -554,7 +554,7 @@ class ADBGUI(LoggingMixin, ScrcpyMixin, DeviceMixin, AppMixin, SeatMixin, FileMi
 
         native_scrcpy_btn = QPushButton("🖥️ Open Scrcpy")
         native_scrcpy_btn.setToolTip("Launch native scrcpy for best quality (highest bitrate & resolution)")
-        native_scrcpy_btn.clicked.connect(self.scrcpy_device)
+        native_scrcpy_btn.clicked.connect(lambda: self.scrcpy_device())
         mirror_row.addWidget(native_scrcpy_btn)
 
         fast_btn = QPushButton("⚡ Fast")

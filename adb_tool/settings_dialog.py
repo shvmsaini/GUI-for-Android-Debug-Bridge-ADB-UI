@@ -122,8 +122,8 @@ class SettingsDialog(QDialog):
             seat_info.setWordWrap(True)
             seat_layout.addWidget(seat_info)
 
-            # Vysor Mode / Aggressive Takeover checkbox
-            self.vysor_takeover_cb = QCheckBox("⚡ Aggressive Seat Takeover (Vysor Mode)")
+            # Sieze Mode / Aggressive Takeover checkbox
+            self.vysor_takeover_cb = QCheckBox("⚡ Aggressive Seat Takeover (Sieze Mode)")
             self.vysor_takeover_cb.setChecked(self.current_settings.get('vysor_takeover_enabled', True))
             self.vysor_takeover_cb.setToolTip(
                 "When enabled, connecting to a seat that is offline or occupied by another remote user\n"

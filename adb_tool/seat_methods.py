@@ -1465,6 +1465,15 @@ class SeatMixin:
             # Since we don't have cross-process state to know which, we always
             # show a dialog indicating the connection was lost.
             # The user should reconnect manually.
+            #
+            # We intentionally do NOT fire a device-side notification here:
+            # the device's adbd is now held by whoever seized us, so a
+            # "connection terminated" notification would land on their
+            # session and tell them their (newly-won) connection was lost —
+            # which is wrong/confusing. The seizer's own dialog path
+            # (_confirm_and_seize_during_connect → _force_disconnect_seat_device
+            # → _notify_device_of_seizure) handles notifying the previous
+            # owner; we only need to tell *our* user to reconnect.
             if seat_status in (None, 'offline') and first_device_seen['value']:
                 # Device went offline after being online - this could be:
                 # 1. Seizure by another user (most likely when seat.sh still shows as connected)
@@ -1472,8 +1481,6 @@ class SeatMixin:
                 # Since we can't distinguish, we show a general disconnect dialog.
                 # The seat.sh devices output will show whether the seat is still connected.
                 if elapsed['secs'] >= 2:  # Give a moment to confirm it's really disconnected
-                    # Notify the device that its connection was terminated
-                    self._notify_device_disconnect(seat, seat_device_id)
                     self.run_on_main_thread(lambda: self._show_seat_disconnected_dialog(seat))
                     watcher.stop()
                     self.seat_port_manager.mark_seat_disconnected(seat)
@@ -2638,64 +2645,18 @@ class SeatMixin:
                     # Now mark as connected
                     self.seat_port_manager.mark_seat_connected(seat, gateway)
 
-                    # Perform seizure if needed (disconnect existing device)
-                    if needs_seizure:
-                        self.log(f"Seizing seat {seat} from another user - disconnecting their ADB device", "INFO")
-                        self.run_on_main_thread(lambda: self._force_disconnect_seat_device(seat_device_id))
-
-                    # Install ADB key if requested. Only needs gateway + mtc
-                    # passwords (mtc is reused for SSH login and sudo on the seat).
-                    adb_key = getattr(self, '_pending_adb_key', None)
-                    device_password = getattr(self, '_pending_device_password', None)
-                    mtc_password = getattr(self, '_pending_mtc_password', None)
-                    if adb_key and device_password and mtc_password:
-                        # Wait for the seat port forward (5555) to become available
-                        # so adb devices shows the device IP
-                        time.sleep(2)
-                        threading.Thread(target=self._install_adb_key_on_seat,
-                                       args=(seat, gateway, adb_key,
-                                             device_password, mtc_password),
-                                       daemon=True).start()
-                        self.log("ADB key installation thread started", "INFO")
-                    else:
-                        self.log("Not installing ADB key (missing credentials or flag)", "INFO")
-
-                    if _port_match:
-                        self.log(f"Seat connected on port {actual_port}", "INFO")
-                    else:
-                        self.log(f"Connected to seat {seat} (defaulting to port {actual_port})", "INFO")
-                    self.update_status(f"Connected to {seat}")
-                    # Force both panels to refresh together so they stay in
-                    # sync — the device list shows the freshly-connected
-                    # phone, the seat list shows the new connection state.
-                    self.run_on_main_thread(self._sync_refresh_panels)
-                    # Restore the clicked button now that we're done.
-                    self.run_on_main_thread(self._finalize_seat_connect_busy)
-
-                    # Watch for the seat's device to finish the adb-key
-                    # authorization handshake. After a fresh seat connect, the
-                    # device shows up as `offline` in `adb devices` for a few
-                    # seconds while the phone completes the handshake (or waits
-                    # for the user to tap "Allow USB debugging?"). The 5s
-                    # auto-refresh eventually picks this up, but that's slow
-                    # feedback for the user — and if they DON'T tap Allow, the
-                    # device stays `offline` forever with no hint why. Polling
-                    # every 2s for up to 30s gives us a quick "device online"
-                    # confirmation when the phone authorizes, plus a clear
-                    # timeout warning pointing at the phone prompt when it
-                    # doesn't. The watcher keys on the seat's actual adb
-                    # port so it doesn't get confused by *other* seat tunnels
-                    # that happen to be online.
-                    #
-                    # IMPORTANT: the watcher is a QTimer(parent=self), and Qt
-                    # forbids creating QObjects with a GUI-thread parent from
-                    # a background thread. do_connect runs in a worker
-                    # thread, so we must defer watcher creation to the GUI
-                    # thread. QTimer.singleShot from a worker thread is
-                    # silently dropped on PyQt6, so we use the _ui_caller
-                    # emitter (run_on_main_thread) instead.
+                    # Seizure decision is deferred to the GUI thread because it
+                    # requires a confirmation modal (see _confirm_and_seize_during_connect).
+                    # The remaining connect continuation (install_adb_key,
+                    # watcher, status update) is also deferred to the GUI
+                    # thread and gated on the user's answer — declining the
+                    # seizure cleanly tears down the half-state connection.
                     self.run_on_main_thread(
-                        lambda s=seat, p=actual_port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, seizure_mode=False)
+                        lambda s=seat, p=actual_port, g=gateway, ns=needs_seizure, sid=seat_device_id:
+                            self._confirm_and_seize_during_connect(
+                                seat=s, gateway=g, port=p, device_id=sid,
+                                needs_seizure=ns,
+                            )
                     )
                     self.log(f"Connected to {seat}", "INFO")
                 else:
@@ -3074,7 +3035,7 @@ class SeatMixin:
             if not silent:
                 self.run_on_main_thread(lambda: self._warn_user_before_takeover(seat, gateway_norm))
 
-            self.log(f"⚡ Vysor Mode: Resetting adbd on {seat} via {gateway_norm} to sever competing sessions...", "INFO")
+            self.log(f"⚡ Sieze Mode: Resetting adbd on {seat} via {gateway_norm} to sever competing sessions...", "INFO")
             self.update_status(f"⚡ Resetting adbd on {seat}...")
 
             jump = None
@@ -3174,6 +3135,11 @@ class SeatMixin:
         existing connection to that device. This is called on the GUI thread
         before establishing a new connection to a seat that's already connected.
 
+        Also fires an Android system notification on the device so the
+        previous user can see their connection was interrupted and is told to
+        reconnect. Without this they were silently dropped and would only
+        notice when their screen mirroring stalled.
+
         Args:
             device_id: The ADB device ID to disconnect (e.g., 'localhost:5555')
         """
@@ -3189,6 +3155,157 @@ class SeatMixin:
                 self.log(f"Force disconnect {device_id}: {result.get('stderr', 'no output')}", "DEBUG")
         except Exception as e:
             self.log(f"Force disconnect error for {device_id}: {e}", "DEBUG")
+
+        # Always notify the device that its connection was seized — the
+        # previous user needs a hint to reconnect, otherwise their mirroring
+        # / ADB session just silently dies and they don't know why.
+        try:
+            self._notify_device_of_seizure(device_id)
+        except Exception as e:
+            self.log(f"Could not send seizure notification to {device_id}: {e}", "DEBUG")
+
+    def _confirm_and_seize_during_connect(self, seat, gateway, port, device_id, needs_seizure):
+        """GUI-thread continuation of ``connect_seat``'s connect path.
+
+        Called after ``seat.sh auto-connect`` succeeded but BEFORE we install
+        the ADB key / start the watcher. If ``needs_seizure`` is True (an
+        active ADB device is already on ``localhost:<port>`` — held by
+        another user), prompt the user before kicking them off. If they
+        decline, tear down the half-state connection cleanly so they don't
+        end up with a "connected" seat panel but a working device held by
+        someone else.
+
+        This consolidates the post-connect logic that used to live inline in
+        ``do_connect``: install_adb_key thread, watcher start, status
+        update, panel refresh, and busy-token release.
+        """
+        if needs_seizure:
+            from .safe_dialog import safe_question_multiline
+            self.log(
+                f"Seat {seat} has an active ADB device ({device_id}) — asking "
+                "user whether to seize it",
+                "INFO",
+            )
+            confirmed = safe_question_multiline(
+                self,
+                "Device Connection Transfer",
+                f"The seat {seat} is currently in use by another ADB client.\n"
+                f"The device {device_id} is online and connected.\n\n"
+                "Transfer control to this session?\n"
+                "This will disconnect the other user immediately "
+                "(they will receive an Android notification).\n\n"
+                "Click 'No' to abort this connection.",
+            )
+            if not confirmed:
+                self.log(f"Seizure declined for seat {seat}; tearing down connection", "INFO")
+                # Tear down the half-state connection so we don't leak the
+                # SSH tunnel or leave the seat panel showing as connected.
+                self._abort_seat_connect_after_seizure_decline(seat, gateway, port, device_id)
+                return
+
+            self.log(f"Seizing seat {seat} from another user - disconnecting their ADB device", "INFO")
+            # _force_disconnect_seat_device now also fires an Android
+            # notification so the seized user knows to retry.
+            self._force_disconnect_seat_device(device_id)
+
+        # Common continuation: install ADB key, start watcher, refresh UI,
+        # release the busy-token. Same flow that used to live inline in
+        # do_connect.
+        self._finish_seat_connect_after_seizure_decision(seat, gateway, port)
+
+    def _abort_seat_connect_after_seizure_decline(self, seat, gateway, port, device_id):
+        """Tear down the half-state seat connection when the user declines a seizure.
+
+        ``seat.sh auto-connect`` already opened the SSH tunnel and bound
+        ``localhost:<port>``; without cleanup we'd be left with a "connected"
+        seat panel but a device held by another user. Run seat.sh disconnect
+        and reap any leftover tunnel, then refresh the UI.
+        """
+        try:
+            script_path = self.seat_port_manager._get_seat_script_path()
+            subprocess.run(
+                [script_path, 'disconnect', seat],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            self.log(f"seat.sh disconnect during seizure-decline cleanup failed: {e}", "DEBUG")
+        try:
+            self.seat_port_manager.kill_seat_tunnel(seat, gateway)
+        except Exception as e:
+            self.log(f"kill_seat_tunnel during seizure-decline cleanup failed: {e}", "DEBUG")
+        self.seat_port_manager.mark_seat_disconnected(seat)
+        # Best-effort: also disconnect our half-bound adb device so we don't
+        # leave a zombie entry on localhost:<port>.
+        try:
+            self.adb.run_command(f"disconnect {device_id}")
+        except Exception:
+            pass
+
+        self.update_status(f"❌ Connection cancelled — left seat {seat} for the other user")
+        try:
+            self._sync_refresh_panels()
+        except Exception:
+            pass
+        try:
+            self._finalize_seat_connect_busy()
+        except Exception:
+            pass
+
+    def _finish_seat_connect_after_seizure_decision(self, seat, gateway, port):
+        """Continuation after the seizure prompt has been resolved.
+
+        Runs on the GUI thread (deferred from the connect_seat worker thread).
+        Installs the ADB key if requested, starts the device watcher, and
+        updates the UI panels + busy-token release.
+        """
+        # Install ADB key if requested. Only needs gateway + mtc passwords
+        # (mtc is reused for SSH login and sudo on the seat).
+        adb_key = getattr(self, '_pending_adb_key', None)
+        device_password = getattr(self, '_pending_device_password', None)
+        mtc_password = getattr(self, '_pending_mtc_password', None)
+        if adb_key and device_password and mtc_password:
+            # Wait for the seat port forward (5555) to become available so
+            # adb devices shows the device IP. The dialog may have eaten
+            # some of this delay, but the tunnel can take a moment to
+            # settle after a fresh auto-connect, so keep a short floor.
+            time.sleep(2)
+            threading.Thread(
+                target=self._install_adb_key_on_seat,
+                args=(seat, gateway, adb_key, device_password, mtc_password),
+                daemon=True,
+            ).start()
+            self.log("ADB key installation thread started", "INFO")
+        else:
+            self.log("Not installing ADB key (missing credentials or flag)", "INFO")
+
+        self.log(f"Seat connected on port {port}", "INFO")
+        self.update_status(f"Connected to {seat}")
+        # Force both panels to refresh together so they stay in sync — the
+        # device list shows the freshly-connected phone, the seat list shows
+        # the new connection state.
+        try:
+            self._sync_refresh_panels()
+        except Exception:
+            pass
+        # Restore the clicked button now that we're done.
+        try:
+            self._finalize_seat_connect_busy()
+        except Exception:
+            pass
+
+        # Watch for the seat's device to finish the adb-key authorization
+        # handshake. After a fresh seat connect, the device shows up as
+        # ``offline`` in ``adb devices`` for a few seconds while the phone
+        # completes the handshake (or waits for the user to tap "Allow USB
+        # debugging?"). Polling every 2s for up to 30s gives us a quick
+        # "device online" confirmation, plus a clear timeout warning pointing
+        # at the phone prompt when it doesn't. The watcher keys on the seat's
+        # actual adb port so it doesn't get confused by *other* seat tunnels
+        # that happen to be online.
+        try:
+            self._start_seat_device_watcher(seat, port=port, gateway=gateway, seizure_mode=False)
+        except Exception as e:
+            self.log(f"Failed to start seat device watcher for {seat}: {e}", "WARNING")
 
     def _fast_seize_device(self, device_id):
         """Vysor-style fast seizure: force reconnect to an offline device.

@@ -928,6 +928,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         for label, _, _, _ in self._QUALITY_PRESETS:
             self.quality_combo.addItem(label)
         self.quality_combo.setCurrentIndex(1)  # Medium by default
+        self.quality_combo.setMinimumWidth(100)
         self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
         h.addWidget(self.quality_combo)
 
@@ -954,6 +955,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         ]:
             self.bitrate_combo.addItem(label, br)
         self.bitrate_combo.setCurrentText("3 Mbps")
+        self.bitrate_combo.setMinimumWidth(100)
         self.bitrate_combo.currentTextChanged.connect(self._on_bitrate_changed)
         h.addWidget(self.bitrate_combo)
 
