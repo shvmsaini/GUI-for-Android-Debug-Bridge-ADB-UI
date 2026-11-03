@@ -1450,6 +1450,19 @@ class SeatMixin:
             self.log(f"Waiting for {seat_device_id} ({elapsed['secs']}/{max_wait}s, current: {seat_status or 'none'})...", "DEBUG")
 
             if seat_status == 'device':
+                # First time seeing device online for this seat — record
+                # the seat_device_id for later so the watcher can resume
+                # the mirror after a future disconnect/reconnect cycle.
+                # Update seat_device_id only if it's still correct (don't
+                # change a known port to None — that would break the
+                # next round of device matching).
+                if not first_device_seen['value']:
+                    self._seat_device_watcher_seat_device_id = seat_device_id
+                    # If the mirror was previously snapshotted for this
+                    # device, reopen it now.
+                    self.run_on_main_thread(
+                        lambda did=seat_device_id: self._try_auto_resume_mirror(did)
+                    )
                 watcher.stop()
                 self.update_status(f"Connected to {seat}")
                 # Clear seized state on successful connection
@@ -1461,40 +1474,58 @@ class SeatMixin:
                 return
 
             # If we've seen the device as 'device' before and it goes offline,
-            # this is either a seizure or a normal disconnect.
-            # Since we don't have cross-process state to know which, we always
-            # show a dialog indicating the connection was lost.
-            # The user should reconnect manually.
+            # this is either a seizure (someone else took over), a network blip,
+            # or the phone dropped the connection. Since we don't have cross-process
+            # state to know which, we always show a dialog indicating the
+            # connection was lost. The user should reconnect manually.
             #
-            # We intentionally do NOT fire a device-side notification here:
-            # the device's adbd is now held by whoever seized us, so a
-            # "connection terminated" notification would land on their
-            # session and tell them their (newly-won) connection was lost —
-            # which is wrong/confusing. The seizer's own dialog path
-            # (_confirm_and_seize_during_connect → _force_disconnect_seat_device
-            # → _notify_device_of_seizure) handles notifying the previous
-            # owner; we only need to tell *our* user to reconnect.
+            # We also fire a device-side Android notification. Whichever adb
+            # client currently holds the TCP socket (ours, theirs, or nobody)
+            # will be the carrier; if the device has no live adb session at
+            # all (truly offline), the notification silently no-ops, which is
+            # the right behavior — there's nothing to notify. The wording is
+            # deliberately neutral ("connection lost — reconnect if needed")
+            # rather than "you were kicked" because we can't tell from here
+            # whether the disconnect was a seizure or a network blip.
             if seat_status in (None, 'offline') and first_device_seen['value']:
                 # Device went offline after being online - this could be:
                 # 1. Seizure by another user (most likely when seat.sh still shows as connected)
-                # 2. Normal disconnect (network drop, user manually disconnected)
-                # Since we can't distinguish, we show a general disconnect dialog.
-                # The seat.sh devices output will show whether the seat is still connected.
+                # 2. Network blip / phone rebooted
+                # 3. User A manually disconnected seat.sh from a different session
+                # Since we can't distinguish, we show a general disconnect dialog
+                # and push a device-side notification.
                 if elapsed['secs'] >= 2:  # Give a moment to confirm it's really disconnected
+                    # Try to notify the device via whichever adb session
+                    # currently has it. Pass seat_device_id=None so the
+                    # helper re-looks-up the active holder from
+                    # `adb devices` — our stale seat_device_id may route
+                    # through a broken session.
+                    self._notify_device_disconnect(seat, seat_device_id=None)
+                    # Snapshot the open mirror (if any) so we can reopen
+                    # it after the user reconnects. Snapshot BEFORE the
+                    # dialog/dialog-flow so we capture the current state.
+                    self._capture_mirror_for_auto_resume(seat_device_id)
                     self.run_on_main_thread(lambda: self._show_seat_disconnected_dialog(seat))
                     watcher.stop()
                     self.seat_port_manager.mark_seat_disconnected(seat)
                     self.run_on_main_thread(self.refresh_seat_port_lists)
                 return
 
-            # Vysor-style fast siege: if device is offline, immediately ask user to take over
-            # Show prompt right away at 1s when user is likely waiting for the connection
-            if seat_status == 'offline' and not first_device_seen['value']:
+            # Vysor-style fast siege: if device is offline OR missing
+            # (None in `adb devices` because someone else holds the
+            # adbd TCP socket — see seat-watcher-none-status-takeover
+            # memory), immediately ask user to take over. Show prompt
+            # right away at 1s when user is likely waiting for the
+            # connection.
+            if seat_status in (None, 'offline') and not first_device_seen['value']:
                 if elapsed['secs'] == 1:  # Ask immediately
                     self.run_on_main_thread(lambda: self._fast_seize_device(seat_device_id))
 
-            # Fallback: If device is still offline after 3 seconds, escalate to adbd restart
-            if seat_status == 'offline' and elapsed['secs'] == 3 and not first_device_seen['value']:
+            # Fallback: If device is still offline / missing after 3
+            # seconds, escalate to adbd restart (full takeover path).
+            # None is included so we catch the "competing client holds
+            # the TCP socket" case — see the same memory.
+            if seat_status in (None, 'offline') and elapsed['secs'] == 3 and not first_device_seen['value']:
                 self.run_on_main_thread(lambda: self.takeover_seat(seat, gateway=gateway, silent=False))
 
             # Mark that we've seen the device as 'device'
@@ -1610,28 +1641,187 @@ class SeatMixin:
         )
 
     def _notify_device_disconnect(self, seat, seat_device_id=None):
-        """Notify the device that its ADB connection was terminated (the other user disconnected)."""
+        """Notify the device that its ADB connection was lost.
+
+        Called when our watcher detects the device went offline after being
+        online. We don't know whether the cause was a seizure by another
+        user, a network blip, or the phone rebooting — so the wording is
+        neutral: "your ADB connection was lost; reconnect if you want to
+        continue". The notification routes through whichever adb session
+        currently holds the device (passed in seat_device_id, or looked up
+        from `adb devices` if None); if nobody has the device, the
+        notification silently no-ops, which is the right outcome.
+        """
         try:
-            # Find the actual device ID from seat.sh devices if not provided
+            # Find the actual device ID from `adb devices` if not provided
+            # — passing the stale seat_device_id would route through a
+            # broken session after the disconnect.
             if not seat_device_id:
+                devices = self.adb.get_devices(silent=True)
+                # Pick the first device that matches this seat's port.
+                # `localhost:<port>` is the most likely; fall back to any
+                # localhost device (the seizer may be on a different port).
                 seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+                port = None
                 for dev_info in seat_sh_devices:
                     if dev_info.get('seat') == seat:
-                        seat_device_id = dev_info.get('device')
+                        port = dev_info.get('port') or dev_info.get('device', '').split(':')[-1]
                         break
+                if port:
+                    candidate = f"localhost:{port}"
+                    seat_device_id = next(
+                        (d['id'] for d in devices if d.get('id') == candidate),
+                        None,
+                    )
+                if not seat_device_id:
+                    # Last-resort fallback: any localhost device with status 'offline'
+                    seat_device_id = next(
+                        (d['id'] for d in devices
+                         if d.get('id', '').startswith('localhost:')
+                         and d.get('status') in ('offline', 'device')),
+                        None,
+                    )
 
             if not seat_device_id:
-                return  # No device to notify
+                self.log(
+                    f"No live adb session for {seat}; skipping device-side disconnect notification",
+                    "DEBUG",
+                )
+                return
 
-            # Send a system notification visible in the notification shade
-            # Uses cmd notification post on Android 4.4+ which requires no special permissions
-            msg = f"ADB connection to {seat} terminated by another user. Your screen mirroring or ADB access has been interrupted."
+            # Neutral wording — we can't tell from here whether the
+            # disconnect was a seizure or a network blip. The point is to
+            # tell the device owner "your connection is gone, reconnect if
+            # you want it back".
+            msg = f"ADB connection to {seat} was lost. Reconnect from the ADB GUI if you want to resume."
             safe_msg = msg.replace("'", "'\\'")
-            result = self.adb.run_command(f"-s {seat_device_id} shell su -c \"cmd notification post -S adb_disconnect -t 'ADB Connection Terminated' '{safe_msg}'\"")
+            result = self.adb.run_command(f"-s {seat_device_id} shell su -c \"cmd notification post -S adb_disconnect -t 'ADB Connection Lost' '{safe_msg}'\"")
             if result['success']:
                 self.log(f"Sent disconnect notification to {seat_device_id}", "DEBUG")
+            else:
+                self.log(
+                    f"Disconnect notification to {seat_device_id} failed "
+                    f"(likely no live session): {result.get('stderr', 'no output')[:200]}",
+                    "DEBUG",
+                )
         except Exception as e:
             self.log(f"Could not send disconnect notification: {e}", "DEBUG")
+
+    def _capture_mirror_for_auto_resume(self, device_id):
+        """Snapshot an open mirror window's params so we can reopen it after a reconnect.
+
+        Called from the watcher when the device transitions from online to
+        offline unexpectedly. Records the mirror's bitrate/fps/size/seat_context
+        into ``_mirror_auto_resume`` keyed by ``device_id``. The watcher then
+        reopens the mirror on the next time it sees ``status='device'``.
+
+        If the user manually closes the mirror window (no entry in
+        ``_active_mirror_windows``), nothing is recorded — auto-resume is a
+        no-op.
+
+        If the user manually disconnects the seat (``disconnect_seat``), we
+        clear any snapshot — auto-resume after a deliberate disconnect is
+        not desired.
+        """
+        if not hasattr(self, '_active_mirror_windows') or not self._active_mirror_windows:
+            return
+        if not hasattr(self, '_mirror_auto_resume'):
+            self._mirror_auto_resume = {}
+        # Find the mirror entry for this device. The mirror_key may be
+        # ``device_id`` alone or ``device_id|seat_context``. Search for any
+        # key whose device_id part matches.
+        for mirror_key, win in list(self._active_mirror_windows.items()):
+            key_device_id = mirror_key.split('|', 1)[0]
+            if key_device_id == device_id:
+                seat_context = mirror_key.split('|', 1)[1] if '|' in mirror_key else None
+                # Read params off the mirror window so we can re-open with
+                # the same quality. Fall back to the parent's defaults if
+                # the window doesn't expose them.
+                bitrate = getattr(win, 'bitrate', 3_000_000) or 3_000_000
+                max_fps = getattr(win, 'max_fps', 60) or 60
+                max_size = getattr(win, 'max_size', 1024) or 1024
+                self._mirror_auto_resume[device_id] = {
+                    'bitrate': bitrate,
+                    'max_fps': max_fps,
+                    'max_size': max_size,
+                    'seat_context': seat_context,
+                }
+                self.log(
+                    f"Snapshotted mirror for {device_id} "
+                    f"(bitrate={bitrate}, fps={max_fps}, size={max_size}, seat={seat_context}) "
+                    "for auto-resume on reconnect",
+                    "INFO",
+                )
+                return
+
+    def _clear_mirror_auto_resume(self, device_id):
+        """Drop any mirror auto-resume snapshot for ``device_id``.
+
+        Called when the user manually disconnects the seat (we don't want
+        to reopen the mirror on the next connect) or after we successfully
+        reopened it (so we don't loop forever).
+        """
+        if hasattr(self, '_mirror_auto_resume'):
+            self._mirror_auto_resume.pop(device_id, None)
+
+    def _clear_mirror_auto_resume_for_seat(self, seat):
+        """Drop any mirror auto-resume snapshot for the device behind ``seat``.
+
+        Resolves the seat's current adb device ID via ``seat.sh devices``
+        (or falls back to scanning ``_active_mirror_windows`` keys for any
+        entry tagged with this seat) and clears the matching snapshot.
+        Called from ``disconnect_seat`` so a deliberate disconnect doesn't
+        auto-reopen the mirror on the next reconnect.
+        """
+        if not hasattr(self, '_mirror_auto_resume') or not self._mirror_auto_resume:
+            return
+        # Resolve seat → device_id via seat.sh devices (most current)
+        device_id = None
+        try:
+            for dev_info in (self.seat_port_manager.get_devices_from_seat_sh() or []):
+                if dev_info.get('seat') == seat:
+                    device_id = dev_info.get('device')
+                    break
+        except Exception:
+            pass
+        if device_id:
+            self._clear_mirror_auto_resume(device_id)
+            return
+        # Fallback: scan mirror keys for any entry that mentions this seat
+        for k in list(self._mirror_auto_resume.keys()):
+            if seat in k:
+                self._mirror_auto_resume.pop(k, None)
+
+    def _try_auto_resume_mirror(self, device_id):
+        """Reopen a previously-open mirror window after the device comes back online.
+
+        Called from the watcher when ``seat_status == 'device'``. Pops the
+        snapshot from ``_mirror_auto_resume`` so the auto-resume happens
+        exactly once per disconnect/reconnect cycle.
+        """
+        if not hasattr(self, '_mirror_auto_resume'):
+            return
+        params = self._mirror_auto_resume.pop(device_id, None)
+        if not params:
+            return
+        # Don't reopen if the user already manually opened a mirror in the
+        # meantime (rare but possible).
+        if hasattr(self, '_active_mirror_windows'):
+            for k in self._active_mirror_windows:
+                if k.split('|', 1)[0] == device_id:
+                    return
+        self.log(f"Auto-resuming mirror for {device_id} after reconnect", "INFO")
+        self.update_status(f"Auto-resuming mirror for {device_id}...")
+        try:
+            self._open_mirror_window(
+                device_id=device_id,
+                bitrate=params.get('bitrate', 3_000_000),
+                max_fps=params.get('max_fps', 60),
+                max_size=params.get('max_size', 1024),
+                seat_context=params.get('seat_context'),
+            )
+        except Exception as e:
+            self.log(f"Auto-resume mirror for {device_id} failed: {e}", "WARNING")
 
     def refresh_seat_port_lists_async(self):
         """Timer entry point: run the seat.sh/portforward fetches off the GUI thread, then redraw."""
@@ -1916,8 +2106,12 @@ class SeatMixin:
             container_layout.addWidget(btn, 1)  # Button takes available space
             container_layout.addWidget(play_btn, 0)  # Play button stays fixed
 
-            # Add seizure button for offline devices - gives users explicit control to take over
-            if btn_connected and device_status == 'offline':
+            # Add seizure button for offline/missing devices - gives users
+            # explicit control to take over. ``None`` is included because a
+            # competing adb client holding the seat's adbd TCP socket makes
+            # the device disappear from ``adb devices`` entirely (see the
+            # seat-watcher-none-status-takeover memory).
+            if btn_connected and device_status in ('offline', None):
                 seizure_btn = QPushButton("⚡")
                 seizure_btn.setMaximumWidth(40)
                 seizure_btn.setMinimumWidth(40)
@@ -2622,25 +2816,66 @@ class SeatMixin:
                     actual_port = _port_match.group(1) if _port_match else '5555'
                     self._pending_seat_port = actual_port
 
-                    # CRITICAL: Check for seizure BEFORE marking as connected
-                    # The seat might already be connected from another instance/session
-                    # If there's an existing ADB device on the same port that's online,
-                    # we need to evict it before connecting
+                    # CRITICAL: Check for seizure BEFORE marking as connected.
+                    #
+                    # The user just clicked Connect on a seat whose device
+                    # may be in any of these states per `adb devices`:
+                    #   * 'device'   — connected, authorized, ours to use.
+                    #                 No prompt needed.
+                    #   * 'offline'  — connected at the adb layer but
+                    #                 unauthorized (could be our own
+                    #                 pending auth, OR someone else's
+                    #                 half-state). Worth a prompt.
+                    #   * 'None'     — TCP socket dropped from the device's
+                    #                 side (phone rebooted, adbd died,
+                    #                 network blip). Worth a prompt.
+                    #   * missing entirely — seat.sh auto-connect
+                    #                 succeeded but adb didn't even bind
+                    #                 the port (rare). Worth a prompt.
+                    #
+                    # We do NOT gate the check on `is_seat_connected()` —
+                    # that only reflects OUR app's connected_seats dict
+                    # and is False after any disconnect, even when the
+                    # device is still reachable. The check should be
+                    # against `adb devices` (and `seat.sh devices`)
+                    # directly, which is what we do here.
                     seat_device_id = f"localhost:{actual_port}"
                     needs_seizure = False
-                    if self.seat_port_manager.is_seat_connected(seat):
-                        # Check if there's an actual online ADB device for this seat
-                        # (might be from a previous session or another instance)
-                        devices = self.adb.get_devices(silent=True)
-                        existing_device = next((d for d in devices if d.get('id') == seat_device_id and d.get('status') == 'device'), None)
+                    device_status_for_prompt = None
+                    devices = self.adb.get_devices(silent=True)
+                    existing_device = next((d for d in devices if d.get('id') == seat_device_id), None)
+                    if existing_device is not None:
+                        device_status_for_prompt = existing_device.get('status')
 
-                        if existing_device:
-                            needs_seizure = True
-                            self.log(f"Seat {seat} has an active device - will seize connection", "INFO")
-                        else:
-                            # Stale connection state (from previous session), clear it
-                            self.log(f"Clearing stale connection state for seat {seat}", "INFO")
-                            self.seat_port_manager.mark_seat_disconnected(seat)
+                    # Prompt if the device exists but isn't fully online.
+                    # 'device' = good, anything else (offline / None) = prompt.
+                    if existing_device is not None and existing_device.get('status') != 'device':
+                        needs_seizure = True
+                        self.log(
+                            f"Seat {seat} device status={device_status_for_prompt!r} "
+                            "— asking user whether to attempt takeover",
+                            "INFO",
+                        )
+                    elif existing_device is None:
+                        # No entry in `adb devices` at all — device
+                        # genuinely unreachable. Worth asking the user
+                        # anyway: takeover_seat may bring it back via
+                        # adbd restart, or it may fail (phone dead /
+                        # network down). Letting the user decide is
+                        # better than silently sitting until timeout.
+                        needs_seizure = True
+                        device_status_for_prompt = 'missing'
+                        self.log(
+                            f"Seat {seat} has no device entry in `adb devices` "
+                            "— asking user whether to attempt takeover "
+                            "(may fail if device is dead)",
+                            "INFO",
+                        )
+                    else:
+                        self.log(
+                            f"Seat {seat} device status='device' — no seizure needed",
+                            "DEBUG",
+                        )
 
                     # Now mark as connected
                     self.seat_port_manager.mark_seat_connected(seat, gateway)
@@ -3035,7 +3270,7 @@ class SeatMixin:
             if not silent:
                 self.run_on_main_thread(lambda: self._warn_user_before_takeover(seat, gateway_norm))
 
-            self.log(f"⚡ Sieze Mode: Resetting adbd on {seat} via {gateway_norm} to sever competing sessions...", "INFO")
+            self.log(f"⚡ Vysor Mode: Resetting adbd on {seat} via {gateway_norm} to sever competing sessions...", "INFO")
             self.update_status(f"⚡ Resetting adbd on {seat}...")
 
             jump = None
@@ -3101,7 +3336,9 @@ class SeatMixin:
                 self.update_status(f"Seat {seat} acquired")
                 # Notify the previously connected user that their connection was seized
                 self._notify_device_of_seizure(seat_dev)
-                # Mark this seat as seized
+                # Mark this seat as seized (init dict if missing)
+                if not hasattr(self, '_seat_was_seized'):
+                    self._seat_was_seized = {}
                 self._seat_was_seized[seat] = True
             else:
                 self.update_status(f"Takeover failed for {seat} — retry")
@@ -3175,9 +3412,19 @@ class SeatMixin:
         end up with a "connected" seat panel but a working device held by
         someone else.
 
-        This consolidates the post-connect logic that used to live inline in
-        ``do_connect``: install_adb_key thread, watcher start, status
-        update, panel refresh, and busy-token release.
+        On Yes, we go straight to the FULL takeover path
+        (``takeover_seat``) — SSH into the gateway, restart adbd on the
+        device, race the local adb client for the freshly-restarted TCP
+        socket. The fast path (``adb disconnect`` alone) doesn't free the
+        remote adbd's accepted socket when someone else is connected, so
+        it never actually wins the seat. The user already confirmed at
+        this prompt, so we pass ``silent=True`` to skip takeover_seat's
+        own warning dialog and we don't start the watcher here —
+        takeover_seat restarts it on a successful race.
+
+        If ``needs_seizure`` is False (the device was offline / missing
+        from `adb devices` when we checked), just proceed with the normal
+        post-connect flow.
         """
         if needs_seizure:
             from .safe_dialog import safe_question_multiline
@@ -3189,28 +3436,96 @@ class SeatMixin:
             confirmed = safe_question_multiline(
                 self,
                 "Device Connection Transfer",
-                f"The seat {seat} is currently in use by another ADB client.\n"
-                f"The device {device_id} is online and connected.\n\n"
-                "Transfer control to this session?\n"
-                "This will disconnect the other user immediately "
+                f"The seat {seat} is not free — another session may have it.\n"
+                f"The device {device_id} was found in `adb devices` (status may be "
+                f"offline/missing — could be another user, or the device may be dead).\n\n"
+                "Attempt to take over this seat?\n"
+                "This will restart adbd on the device and disconnect any other user "
                 "(they will receive an Android notification).\n\n"
+                "Note: if the device is dead or powered off, this will fail.\n"
                 "Click 'No' to abort this connection.",
             )
             if not confirmed:
-                self.log(f"Seizure declined for seat {seat}; tearing down connection", "INFO")
+                # The user said No — but the device may have settled to
+                # 'device' status between the original check (in the worker
+                # thread, before this modal was queued) and now. The modal
+                # blocks the GUI thread for several seconds, plenty of
+                # time for the device-side handshake to finish on its own.
+                # Re-query `adb devices` before tearing down — if the seat
+                # port is now 'device', the user just answered a stale
+                # prompt defensively and the connection is actually fine.
+                # Only proceed with the tear-down if the device is still
+                # not fully online (offline / None / missing).
+                try:
+                    _devices_now = self.adb.get_devices(silent=True)
+                    _existing_now = next(
+                        (d for d in _devices_now if d.get('id') == device_id),
+                        None,
+                    )
+                    _now_status = (
+                        _existing_now.get('status') if _existing_now is not None
+                        else 'missing'
+                    )
+                except Exception as _check_err:
+                    _devices_now = None
+                    _now_status = 'unknown'
+                    self.log(
+                        f"Re-check of seat {seat} device status failed "
+                        f"after seizure decline: {_check_err}",
+                        "DEBUG",
+                    )
+
+                if _now_status == 'device':
+                    self.log(
+                        f"Seizure declined for seat {seat}, but device is now "
+                        f"online ({device_id} status='device') — proceeding "
+                        "with normal connect flow instead of tearing down",
+                        "INFO",
+                    )
+                    self.update_status(
+                        f"✅ Connected to {seat} (device online — prompt was stale)"
+                    )
+                    self._finish_seat_connect_after_seizure_decision(
+                        seat, gateway, port,
+                    )
+                    return
+
+                self.log(
+                    f"Seizure declined for seat {seat}; device status is "
+                    f"{_now_status!r} — tearing down connection",
+                    "INFO",
+                )
                 # Tear down the half-state connection so we don't leak the
                 # SSH tunnel or leave the seat panel showing as connected.
                 self._abort_seat_connect_after_seizure_decline(seat, gateway, port, device_id)
                 return
 
-            self.log(f"Seizing seat {seat} from another user - disconnecting their ADB device", "INFO")
-            # _force_disconnect_seat_device now also fires an Android
-            # notification so the seized user knows to retry.
-            self._force_disconnect_seat_device(device_id)
+            self.log(f"Seizing seat {seat} from another user — running full takeover", "INFO")
+            self.update_status(f"⚡ Seizing {seat} — restarting adbd on device")
+            # Run the full takeover path immediately. silent=True skips the
+            # takeover-warning dialog (the user already confirmed at this
+            # prompt). takeover_seat restarts the watcher on a successful
+            # race; on a failed race it logs a clear "click ⚡ to retry"
+            # message and surfaces the seat panel — we don't fall back to
+            # the watcher here because we want the user to see the ⚡
+            # button without a half-state watcher polling in the
+            # background.
+            self.takeover_seat(
+                seat,
+                gateway=gateway,
+                silent=True,
+            )
+            # Release the connect button busy token — takeover_seat will
+            # restart the watcher itself on a successful race. If the race
+            # loses, the watcher stays stopped and the user can hit ⚡.
+            try:
+                self._finalize_seat_connect_busy()
+            except Exception:
+                pass
+            return
 
-        # Common continuation: install ADB key, start watcher, refresh UI,
-        # release the busy-token. Same flow that used to live inline in
-        # do_connect.
+        # No seizure needed — proceed with the normal post-connect flow
+        # (install ADB key, start watcher, refresh UI).
         self._finish_seat_connect_after_seizure_decision(seat, gateway, port)
 
     def _abort_seat_connect_after_seizure_decline(self, seat, gateway, port, device_id):
@@ -3407,6 +3722,10 @@ class SeatMixin:
 
                 if result.returncode == 0:
                     self.seat_port_manager.mark_seat_disconnected(seat)
+                    # Drop any mirror auto-resume snapshot for this seat —
+                    # a deliberate disconnect shouldn't auto-reopen the
+                    # mirror when the user reconnects.
+                    self._clear_mirror_auto_resume_for_seat(seat)
                     self.log(f"Disconnected from seat {seat}", "INFO")
                     self.update_status(f"Disconnected from {seat}")
 

@@ -701,7 +701,13 @@ class ScrcpyMixin:
             if seat_context:
                 mirror_key = f"{device_id}|{seat_context}"
             self._active_mirror_windows[mirror_key] = win
-            win.destroyed.connect(lambda _, mk=mirror_key: getattr(self, '_active_mirror_windows', {}).pop(mk, None))
+            win.destroyed.connect(lambda _, mk=mirror_key: (
+                getattr(self, '_active_mirror_windows', {}).pop(mk, None),
+                # If the user closed the mirror manually, drop any
+                # auto-resume snapshot so the next reconnect doesn't
+                # reopen a window the user just dismissed.
+                getattr(self, '_mirror_auto_resume', {}).pop(mk.split('|', 1)[0], None),
+            ))
             self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate})")
         except Exception as e:
             next_attempt = _attempt + 1
