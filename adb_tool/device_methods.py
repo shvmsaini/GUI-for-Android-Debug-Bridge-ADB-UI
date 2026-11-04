@@ -228,17 +228,40 @@ class DeviceMixin:
                         seat_gateway = dev_info.get('gateway')
                         break
 
-                # Skip auto-disconnect if the user just clicked Connect on this
-                # seat — `connect_seat` adds the seat to ``_connecting_seats`` at
-                # the start of the SSH tunnel / adb handshake. Killing the device
-                # here would tear down the half-state authorization handshake and
-                # the user would never get a chance to see the seizure prompt.
-                # The watcher (started after connect_seat returns) handles the
-                # actual seizure flow, so this is purely defensive.
-                if seat_to_disconnect and seat_to_disconnect in getattr(self, '_connecting_seats', set()):
+                # Skip auto-disconnect + the offline-reconnect popup if the user
+                # is already in the middle of connecting to / recovering this seat.
+                # Two states can be active here:
+                #
+                #  1. ``_connecting_seats`` — connect_seat is running its SSH
+                #     tunnel / adb handshake on a worker thread. Killing the
+                #     device here would tear down the half-state authorization
+                #     handshake and the user would never get a chance to see
+                #     the seizure prompt. (The watcher, started after
+                #     connect_seat returns, handles the actual seizure flow.)
+                #
+                #  2. ``_seat_was_seized`` — the user just approved a seizure
+                #     via the connect-time prompt and the takeover is racing
+                #     for the freshly-restarted adbd. The device will report
+                #     ``offline`` for several seconds while adbd restarts and
+                #     the phone re-handshakes. Prompting again here stacks
+                #     modals and starts a SECOND connect_seat that races
+                #     against the in-flight takeover (the watcher will clear
+                #     ``_seat_was_seized`` once it sees ``status='device'``).
+                #
+                # Both states need the full ``continue`` — skipping only the
+                # disconnect would still show the popup, which is what the
+                # user is reporting as a duplicate seizure prompt.
+                seat_in_recovery = (
+                    seat_to_disconnect
+                    and (
+                        seat_to_disconnect in getattr(self, '_connecting_seats', set())
+                        or seat_to_disconnect in getattr(self, '_seat_was_seized', {})
+                    )
+                )
+                if seat_in_recovery:
                     self.log(
-                        f"Skipping auto-disconnect of {dev_id} ({seat_to_disconnect}) — "
-                        "user-initiated connect is in progress; watcher will handle seizure",
+                        f"Skipping offline-seat prompt for {dev_id} ({seat_to_disconnect}) — "
+                        "connect/recovery already in progress; watcher will handle seizure",
                         "DEBUG",
                     )
                     continue

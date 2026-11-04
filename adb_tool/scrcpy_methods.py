@@ -430,19 +430,15 @@ class ScrcpyMixin:
         self.auto_refresh_timer.timeout.connect(lambda: self.refresh_devices(silent=True))
         self.auto_refresh_timer.start(5000)
 
-        # Auto-refresh seat/port lists every 5 seconds — must match the
-        # device refresh interval so the two panels never drift out of
-        # sync. With a 10s interval here and 5s above, a freshly
-        # connected seat would show up in the devices panel up to 10s
-        # before the seat management panel, making the UI look broken.
+        # Auto-refresh seat/port lists every 5 seconds
         self.seat_port_refresh_timer = QTimer()
         self.seat_port_refresh_timer.timeout.connect(self.refresh_seat_port_lists_async)
         self.seat_port_refresh_timer.start(5000)
 
-        # Check port forward status every 10 seconds to detect if it died
+        # Check port forward status every 5 seconds to detect if it died
         self.pf_status_timer = QTimer()
         self.pf_status_timer.timeout.connect(self.check_portforward_alive)
-        self.pf_status_timer.start(10000)
+        self.pf_status_timer.start(5000)
         # Track previous state for comparison
         self.last_pf_active = False
         self.last_active_rack = None
