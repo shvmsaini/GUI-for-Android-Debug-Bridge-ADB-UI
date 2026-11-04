@@ -216,12 +216,22 @@ class VideoDisplayWidget(QWidget):
 
         Args:
             title: Optional main heading. Defaults to "Screen disconnected".
-            subtitle: Optional sub-line. Defaults to
-                "Auto-retrying… or use Retry in the dialog."
+            subtitle: Optional sub-line. Defaults to a brief "Reconnecting…"
+                hint; pass None explicitly to suppress the sub-line (the
+                auto-retry path does this so the overlay stays minimal).
         """
         self._disconnected = True
         self._disconnected_title = title or "Screen disconnected"
-        self._disconnected_subtitle = subtitle or "Auto-retrying… or use Retry in the dialog."
+        # Default to None for subtitle if not explicitly provided. The
+        # old "Auto-retrying… or use Retry in the dialog" defaulted to
+        # that string which was misleading for the standalone mirror
+        # window (no Retry button) and noisy. paintEvent treats
+        # _disconnected_subtitle=None as "skip the sub-line".
+        self._disconnected_subtitle = subtitle
+        if subtitle is None and title is None:
+            # Caller passed nothing — fall back to the brief default
+            # so the overlay isn't completely blank.
+            self._disconnected_subtitle = "Reconnecting…"
         self._pixmap = None
         self._last_frame_buf = None
         try:
@@ -257,14 +267,17 @@ class VideoDisplayWidget(QWidget):
             painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter,
                              getattr(self, '_disconnected_title', "Screen disconnected"))
             # Subtitle in a softer color with a smaller font for context.
-            sub_font = main_font
-            sub_font.setBold(False)
-            sub_font.setPointSize(max(10, main_font.pointSize() - 4))
-            painter.setFont(sub_font)
-            painter.setPen(QColor("#d0d0d0"))
-            sub_rect = rect.adjusted(0, rect.height() // 3, 0, 0)
-            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter,
-                             getattr(self, '_disconnected_subtitle', "Auto-retrying… or use Retry in the dialog."))
+            # Skip if the caller passed subtitle=None (auto-retry path
+            # wants a minimal overlay; just the "Reconnecting…" title).
+            sub = getattr(self, '_disconnected_subtitle', None)
+            if sub:
+                sub_font = main_font
+                sub_font.setBold(False)
+                sub_font.setPointSize(max(10, main_font.pointSize() - 4))
+                painter.setFont(sub_font)
+                painter.setPen(QColor("#d0d0d0"))
+                sub_rect = rect.adjusted(0, rect.height() // 3, 0, 0)
+                painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, sub)
             return
 
         if self._pixmap is None or self._pixmap.isNull():
@@ -1498,8 +1511,16 @@ class ScrcpyMirrorWindow(QMainWindow):
                         _t.sleep(0.5)
                 else:
                     if last_exc is not None:
+                        # Demoted to DEBUG: the wrapping ERROR at the
+                        # caller (scrcpy_methods.py:_open_mirror_window
+                        # _impl) already surfaces a final ERROR + dialog
+                        # when all retries are exhausted. Logging an
+                        # internal "All start attempts failed" at ERROR
+                        # here just dumps the SDK's raw adb command into
+                        # the log panel (e.g. "adb command failed: ...
+                        # scrcpy-server.jar") which is noise.
                         self._log(
-                            "ERROR",
+                            "DEBUG",
                             f"All start attempts failed for {self.device_id}: {last_exc}",
                         )
                         raise last_exc
@@ -1656,7 +1677,10 @@ class ScrcpyMirrorWindow(QMainWindow):
                 # Reset auto-retry budget on successful first frame so
                 # the user isn't punished for an early stall.
                 if self._retry_count > 0:
-                    self._log("INFO", f"Stream recovered — resetting retry counter (was {self._retry_count})")
+                    self._log(
+                        "DEBUG",
+                        f"Stream recovered — resetting retry counter (was {self._retry_count})",
+                    )
                 self._retry_count = 0
         except RuntimeError:
             # Widget was deleted between signal emission and delivery.
@@ -1824,11 +1848,17 @@ class ScrcpyMirrorWindow(QMainWindow):
         # = False). The status bar is left alone — it's the wrong place
         # for this info since it scrolls off and isn't visible on small
         # mirror windows.
+        #
+        # Keep the overlay minimal — no attempt counter, no reason
+        # string. The user doesn't need to know how many retries we've
+        # burned through; the mirror either resumes or the window stays
+        # in this overlay state. Verbose retry info is logged at DEBUG
+        # only.
         if hasattr(self, 'video') and self.video is not None:
             try:
                 self.video.set_disconnected(
                     title="Reconnecting…",
-                    subtitle=f"Attempt {self._retry_count} — {reason}",
+                    subtitle=None,
                 )
             except RuntimeError:
                 # Widget already torn down — keep going, the restart is
@@ -1862,6 +1892,65 @@ class ScrcpyMirrorWindow(QMainWindow):
             QTimer.singleShot(delay * 1000, _restart)
         else:
             _restart()
+
+    def notify_status_change(self, new_status):
+        """External hook: device status flipped — act immediately instead of waiting.
+
+        Called from the GUI thread (e.g. ``_apply_device_refresh``) when a
+        device transitions to a new status. For seat/remote connections
+        (``localhost:``) the per-frame listener waits up to 60s for a new
+        frame before raising ``ScrcpyTimeoutError``. If the device has
+        gone offline mid-session the listener waits the full 60s doing
+        nothing — and when the seat tunnel comes back, the listener is
+        still blocked waiting for the *previous* timeout to expire, so
+        the user sees a frozen frame for up to a minute after the seat
+        is reachable again. This method short-circuits that wait by
+        kicking ``_on_auto_retry`` the moment we see a status flip:
+
+        * ``'device'``  — the device is back. Trigger an immediate
+                          restart so the SDK reconnects against the
+                          fresh TCP socket and resumes streaming.
+        * ``'offline'`` — the device just dropped. Trigger an immediate
+                          restart too: the old socket is dead, no
+                          number of additional timeout waits will
+                          recover it. Auto-retry's backoff schedule
+                          handles the rare case the device flaps.
+
+        Any other status (e.g. ``'unauthorized'``) is ignored — the
+        auto-retry timeout will still fire and recheck.
+
+        Thread-safe: marshals to the Qt main thread before touching any
+        state. Safe to call when no listener is running (``_client is
+        None``) or the window is closing (``_closing=True``).
+        """
+        def _do():
+            if self._closing:
+                return
+            # Only react to the two statuses that justify an immediate
+            # restart. 'unknown' / 'unauthorized' / etc. — let the
+            # listener timeout handle them as before.
+            if new_status not in ('device', 'offline'):
+                return
+            # No active client: nothing to restart. The next frame or
+            # caller-initiated open will go through the normal path.
+            if self._client is None:
+                return
+            self._log(
+                "DEBUG",
+                f"Device status flipped to {new_status!r} — forcing "
+                "immediate mirror restart (skip 60s frame timeout)",
+            )
+            # Bypass the auto-retry backoff by emitting the signal
+            # directly; _on_auto_retry already handles _closing /
+            # _client is None checks, increments the retry counter,
+            # and shows the "Reconnecting…" overlay.
+            self.signal.auto_retry.emit(f"status-change: {new_status}")
+
+        # _on_auto_retry is a Qt slot — emit from the main thread.
+        try:
+            self.run_on_main_thread(_do)
+        except Exception:
+            pass
 
     def _show_error_with_retry(self, error_msg):
         """Show the error in a modal dialog with Retry / Native / Close buttons.

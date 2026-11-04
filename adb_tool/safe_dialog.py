@@ -140,8 +140,15 @@ def safe_critical(parent, title, message):
     return dlg.chosen_role()
 
 
-def safe_question(parent, title, message):
-    """Show a Yes/No question dialog. Returns True for Yes, False for No."""
+def safe_question(parent, title, message, auto_close_check=None, auto_close_poll_ms=1000):
+    """Show a Yes/No question dialog. Returns True for Yes, False for No.
+
+    Optional ``auto_close_check`` is a zero-arg callable that is polled
+    every ``auto_close_poll_ms`` (default 1000ms) while the dialog is
+    open. The moment it returns truthy, the dialog auto-closes with the
+    "Yes" outcome. See ``safe_question_multiline`` for the same
+    behavior; this variant is the short-message form.
+    """
     dlg = _SafeMessageDialog(
         parent, title, message, kind="question",
         buttons=[
@@ -149,17 +156,54 @@ def safe_question(parent, title, message):
             ("No", QDialogButtonBox.StandardButton.No),
         ],
     )
+
+    # Auto-close polling — same pattern as safe_question_multiline. We
+    # track the polling state on the dialog so the user can still click
+    # Yes/No and the timer doesn't race the click handlers (it stops
+    # the moment the dialog is no longer visible, which Qt does for us
+    # when accept()/reject() deletes the dialog and its child timer).
+    if auto_close_check is not None:
+        def _poll():
+            if not dlg.isVisible():
+                return
+            try:
+                should_close = bool(auto_close_check())
+            except Exception:
+                # A misbehaving callback shouldn't kill the dialog.
+                # Stop polling and let the user decide manually.
+                poll_timer.stop()
+                return
+            if should_close:
+                # Synthesize a Yes click — same path the user takes when
+                # they click Yes, so downstream callers see the same
+                # outcome (chosen_role == Yes, returns True).
+                dlg._on_button(QDialogButtonBox.StandardButton.Yes)
+
+        poll_timer = QTimer(dlg)
+        poll_timer.setInterval(max(100, int(auto_close_poll_ms)))
+        poll_timer.timeout.connect(_poll)
+        poll_timer.start()
+
     dlg.exec()
     role = dlg.chosen_role()
     return role == QDialogButtonBox.StandardButton.Yes
 
 
-def safe_question_multiline(parent, title, message, yes_label="Yes", no_label="No"):
+def safe_question_multiline(parent, title, message, yes_label="Yes", no_label="No",
+                         auto_close_check=None, auto_close_poll_ms=1000):
     """Show a Yes/No confirmation dialog with multi-line message body.
 
     Uses QPlainTextEdit instead of QLabel so arbitrary-length messages
     render without triggering QTextEngine::itemize() on the title/button
     text (which is kept short and plain).
+
+    Optional ``auto_close_check`` is a zero-arg callable that is polled
+    every ``auto_close_poll_ms`` (default 1000ms) while the dialog is
+    open. The moment it returns truthy, the dialog auto-closes with the
+    "Yes" outcome (treat the reconnect/fix as successful). Pass
+    ``None`` (default) to disable auto-close. The poll stops the moment
+    the user clicks a button or the dialog is otherwise closed, so it
+    cannot race the click handlers.
 
     Returns True for Yes, False for No/Cancel.
     """
@@ -193,6 +237,34 @@ def safe_question_multiline(parent, title, message, yes_label="Yes", no_label="N
     result = {"chosen": False}
     yes_btn.clicked.connect(lambda: (result.update({"chosen": True}), dlg.accept()))
     no_btn.clicked.connect(lambda: dlg.reject())
+
+    # Auto-close polling: if the caller supplied a check, poll it on the
+    # GUI thread until it returns truthy, then close the dialog with the
+    # "Yes" outcome. Keep a reference on the dialog so the timer isn't
+    # garbage-collected mid-flight. Stops automatically once the user
+    # clicks any button (dlg.accept/reject deletes the dialog and its
+    # children, including the timer).
+    poll_timer = None
+    if auto_close_check is not None:
+        def _poll():
+            if dlg is None or not dlg.isVisible():
+                return
+            try:
+                should_close = bool(auto_close_check())
+            except Exception:
+                # A misbehaving callback shouldn't kill the dialog.
+                # Stop polling and let the user decide manually.
+                if poll_timer is not None:
+                    poll_timer.stop()
+                return
+            if should_close:
+                result["chosen"] = True
+                dlg.accept()
+
+        poll_timer = QTimer(dlg)
+        poll_timer.setInterval(max(100, int(auto_close_poll_ms)))
+        poll_timer.timeout.connect(_poll)
+        poll_timer.start()
 
     dlg.exec()
     return result["chosen"]

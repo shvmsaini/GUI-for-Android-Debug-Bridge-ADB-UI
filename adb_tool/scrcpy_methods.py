@@ -707,9 +707,13 @@ class ScrcpyMixin:
             self.log(f"Opened standalone mirror window for {device_id} (bitrate={bitrate})")
         except Exception as e:
             next_attempt = _attempt + 1
+            # Per-attempt retry chatter — DEBUG only. The user sees the
+            # final outcome at ERROR (line below) and a modal dialog if
+            # all attempts are exhausted; the in-between noise doesn't
+            # help them.
             self.log(
                 f"Mirror window attempt {next_attempt}/{max_attempts} failed: {e}",
-                "WARNING"
+                "DEBUG",
             )
             if next_attempt < max_attempts:
                 # Retry after 500 ms — use QTimer so the event loop stays responsive
@@ -726,13 +730,20 @@ class ScrcpyMixin:
                     ),
                 )
             else:
-                # All retries failed — surface the last error to the user.
-                self.log(f"Failed to open mirror window after {max_attempts} attempts: {e}", "ERROR")
+                # All retries failed — surface the final outcome to the
+                # user. Keep the message terse; the per-attempt DEBUG
+                # lines above and the SDK's raw adb-command noise live
+                # in the DEBUG stream for anyone who turns on
+                # _debug_logging.
+                self.log(
+                    f"Failed to open mirror window for {device_id} after {max_attempts} attempts",
+                    "ERROR",
+                )
                 # Defer + safe dialog (Qt 6.11/macOS 26 QTextEngine crash —
                 # see safe_dialog.py for the full rationale).
                 QTimer.singleShot(0, lambda err=e: safe_critical(
                     self, "Mirror Error",
-                    f"Failed to open mirror window after {max_attempts} attempts: {err}"
+                    f"Failed to open mirror window after {max_attempts} attempts:\n\n{type(err).__name__}: {str(err)[:300]}"
                 ))
 
     def _scrcpy_via_seat(self, seat, gateway=None, source_button=None):
@@ -795,14 +806,19 @@ class ScrcpyMixin:
         Runs asynchronously on the main thread via QTimer retries to avoid
         blocking the UI thread with sleep() loops.
         """
-        self.log(f"Opening mirror window for seat {seat} via {gateway or 'unknown'} (attempt {attempt + 1}/{max_attempts})...")
+        # Single log line for the user — don't expose the retry
+        # counter. The status bar already shows attempt progress via
+        # the "📺 Opening / ⏳ Waiting" pattern, so logging the same
+        # info to the log panel is just noise. Verbose attempt info
+        # is at DEBUG for anyone who turns on _debug_logging.
+        self.log(f"Opening mirror window for seat {seat}...", "INFO")
         # Progress feedback: the user clicked ▶ and is watching for the
         # mirror window. Tell them what we're doing while we hunt for
         # the right device.
         if attempt == 0:
             self.update_status(f"📺 Opening mirror window for seat {seat}...")
         else:
-            self.update_status(f"⏳ Waiting for seat {seat} device (attempt {attempt + 1}/{max_attempts})...")
+            self.update_status(f"⏳ Waiting for seat {seat} device...")
 
         try:
             # Get current devices from adb

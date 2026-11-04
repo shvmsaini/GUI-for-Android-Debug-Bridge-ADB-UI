@@ -183,6 +183,51 @@ class DeviceMixin:
         # running `adb devices -l` again on every button click).
         self.cached_devices = list(devices)
 
+        # Notify any open mirror windows about device status transitions
+        # so they can restart their listener immediately instead of
+        # waiting out the full frame timeout (60s for localhost:). Without
+        # this, an offline→device flip is invisible to the mirror until
+        # the per-frame timeout fires — the user sees a frozen frame for
+        # up to a minute even though the seat is reachable again. See
+        # ``ScrcpyMirrorWindow.notify_status_change``.
+        #
+        # _cached_device_statuses is the previous-refresh status map
+        # (device_id -> status, populated by the UI rebuild below at
+        # line ~494). We diff it against the current status to find
+        # transitions; only ``'device'`` and ``'offline'`` transitions
+        # are forwarded to mirrors — other statuses don't justify an
+        # immediate restart.
+        current_status_by_id = {
+            d.get('id'): d.get('status') for d in devices if d.get('id')
+        }
+        previous_status_by_id = getattr(self, '_cached_device_statuses', None) or {}
+        transitions = []
+        for dev_id, new_status in current_status_by_id.items():
+            old_status = previous_status_by_id.get(dev_id)
+            if old_status != new_status and new_status in ('device', 'offline'):
+                transitions.append((dev_id, old_status, new_status))
+        if transitions:
+            active_mirrors = getattr(self, '_active_mirror_windows', {}) or {}
+            for dev_id, _old, new in transitions:
+                for mirror_key, win in list(active_mirrors.items()):
+                    key_device_id = mirror_key.split('|', 1)[0]
+                    if key_device_id != dev_id:
+                        continue
+                    try:
+                        notify = getattr(win, 'notify_status_change', None)
+                        if notify is not None:
+                            notify(new)
+                    except RuntimeError:
+                        # Mirror window destroyed between our list() and
+                        # this call — drop the stale entry and keep going.
+                        active_mirrors.pop(mirror_key, None)
+                    except Exception as _e:
+                        self.log(
+                            f"notify_status_change for mirror {mirror_key} "
+                            f"({dev_id} -> {new}) failed: {_e}",
+                            "DEBUG",
+                        )
+
         # Auto-disconnect offline devices that were *previously* online. We do
         # NOT disconnect a device on its very first observation as offline —
         # `adb` reports `offline` for a few seconds after a fresh
@@ -626,8 +671,36 @@ class DeviceMixin:
             f"Seat {seat} is offline (device {device_id} was previously online). "
             "Reconnect?"
         )
+        # Poll the cached device snapshot every second while the dialog
+        # is open. If the seat's device is back to status='device' (the
+        # auto-refresh saw it recover) — or if the device is gone from
+        # the cache entirely (treat as 'not our problem anymore') —
+        # auto-close the dialog with the Yes outcome so the user
+        # doesn't have to dismiss it themselves when the system has
+        # already self-healed. Returns False on any error so the dialog
+        # stays open and the user can decide.
+        def _auto_close_check():
+            try:
+                cached = getattr(self, 'cached_devices', None) or []
+                now_dev = next(
+                    (d for d in cached if d.get('id') == device_id),
+                    None,
+                )
+                if now_dev is None:
+                    # Device vanished from `adb devices` entirely
+                    # (rare: SSH tunnel torn down out from under us).
+                    # Don't auto-close — let the user decide whether
+                    # to reconnect through the regular path.
+                    return False
+                return now_dev.get('status') == 'device'
+            except Exception:
+                return False
+
         try:
-            reconnect = safe_question(self, title, message)
+            reconnect = safe_question(
+                self, title, message,
+                auto_close_check=_auto_close_check,
+            )
         except Exception as e:
             # Don't let a dialog failure block cleanup — fall back to the
             # old silent disconnect path so the seat doesn't sit forever
@@ -672,35 +745,29 @@ class DeviceMixin:
                 )
             return
 
-        # No (or dialog dismissed) — run the original silent teardown so
-        # the seat doesn't sit forever with a zombie SSH tunnel. We also
-        # drop any mirror auto-resume snapshot — auto-resuming after a
-        # deliberate disconnect is not desired.
-        self.log(f"User chose to disconnect offline seat {seat} ({device_id})", "INFO")
-        try:
-            self.adb.run_command(f'disconnect {device_id}')
-        except Exception:
-            pass
-        try:
-            self.seat_port_manager.mark_seat_disconnected(seat)
-        except Exception:
-            pass
-        # Reap the orphaned SSH tunnel — `adb disconnect` does not kill
-        # the `ssh -f -N -L <port>:<seat>:5555` process, so without this
-        # the saved port stays bound and the next reconnect attempt
-        # fails with "Address already in use".
-        try:
-            self.seat_port_manager.kill_seat_tunnel(seat, gateway)
-        except Exception:
-            pass
-        # Clear the ever-online flag so a manual reconnect later isn't
-        # immediately flagged as a stale connection and killed by the
-        # auto-disconnect logic on its first refresh.
+        # No (or dialog dismissed) — leave the seat as-is. We used to
+        # silently tear down the SSH tunnel + adb binding here, but the
+        # user explicitly asked us to stop doing that: dismissing the
+        # prompt should not destroy a working half-state connection that
+        # the user might still want to investigate. Clear the ever-
+        # online flag so the next refresh treats this as a fresh offline
+        # observation (won't auto-disconnect during the post-dismiss
+        # grace period) and drop any mirror auto-resume snapshot (the
+        # user explicitly dismissed the prompt, so we shouldn't reopen
+        # the mirror on the next reconnect without a clear action).
+        self.log(
+            f"User dismissed offline-seat prompt for {seat} ({device_id}) — "
+            "leaving seat untouched",
+            "INFO",
+        )
+        # Clear the ever-online flag so the auto-disconnect logic above
+        # doesn't immediately flag this device as a stale connection
+        # and tear it down on the *next* refresh.
         if device_id and device_id in self._device_ever_online:
             del self._device_ever_online[device_id]
-        # Drop the snapshot — the user explicitly chose to disconnect,
-        # we don't want a later reconnect to surprise them by reopening
-        # the mirror.
+        # Drop the snapshot — the user dismissed the prompt, we don't
+        # want a later reconnect to surprise them by reopening the
+        # mirror.
         if hasattr(self, '_clear_mirror_auto_resume'):
             try:
                 self._clear_mirror_auto_resume(device_id)

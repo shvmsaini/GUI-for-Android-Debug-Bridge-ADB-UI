@@ -221,7 +221,12 @@ class _SeatJumpHost:
         if cfg_port and port == 22:
             port = cfg_port
 
-        log(f"SSH: connecting to {user}@{host}:{port} (via system ssh)...")
+        # Demoted to DEBUG: SSH plumbing noise shouldn't appear in the
+        # log panel during normal connect/seizure flows. The outcome
+        # log ("⚡ Forcing connection to X..." / "Connected to X") is
+        # enough for the user; the per-step SSH subprocess chatter is
+        # only useful when diagnosing failures (turn on _debug_logging).
+        log(f"SSH: connecting to {user}@{host}:{port} (via system ssh)...", "DEBUG")
         self._user = user
         self._host = host
         self._port = port
@@ -278,7 +283,7 @@ class _SeatJumpHost:
             # Strip any sshpass-related vars that might confuse ssh.
             env.pop("SSHPASS", None)
 
-            log(f"SSH: launching: {' '.join(ssh_cmd)}")
+            log(f"SSH: launching: {' '.join(ssh_cmd)}", "DEBUG")
             proc = subprocess.Popen(
                 ssh_cmd,
                 stdin=subprocess.PIPE,
@@ -312,7 +317,7 @@ class _SeatJumpHost:
             self._askpass_file = askpass_file.name
             self._pw_file = pw_file.name
 
-            log(f"SSH: connected to {user}@{host} (subprocess pid={proc.pid})")
+            log(f"SSH: connected to {user}@{host} (subprocess pid={proc.pid})", "DEBUG")
         except _SeatSshError:
             self._cleanup_proc(proc, askpass_file, pw_file)
             raise
@@ -649,7 +654,7 @@ class _SeatJumpHost:
             env["DISPLAY"] = ":0"
             env.pop("SSHPASS", None)
 
-            self._log(f"SSH: running on {seat_host}: {command}")
+            self._log(f"SSH: running on {seat_host}: {command}", "DEBUG")
             res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
 
             if res.returncode != 0:
@@ -1903,10 +1908,10 @@ class SeatMixin:
         )
 
         if not confirmed:
-            self.log(f"Manual seizure cancelled by user for seat {seat}", "INFO")
+            self.log(f"Manual seizure cancelled by user for seat {seat}", "DEBUG")
             return
 
-        self.log(f"Starting manual seizure for seat {seat}", "INFO")
+        self.log(f"⚡ Forcing connection to {seat} (manual)...", "INFO")
         self.update_status(f"Seizing control of {seat}...")
 
         # Find the current device for this seat
@@ -3656,8 +3661,13 @@ class SeatMixin:
             if not silent:
                 self.run_on_main_thread(lambda: self._warn_user_before_takeover(seat, gateway_norm))
 
-            self.log(f"⚡ Vysor Mode: Resetting adbd on {seat} via {gateway_norm} to sever competing sessions...", "INFO")
-            self.update_status(f"⚡ Resetting adbd on {seat}...")
+            # Single log line for the whole takeover — the per-step
+            # "Stopping adbd / Starting adbd / Racing / etc." messages
+            # were too noisy and didn't add information beyond the
+            # outcome. Verbose steps are available at DEBUG for anyone
+            # who turns that on.
+            self.log(f"⚡ Forcing connection to {seat}...", "INFO")
+            self.update_status(f"⚡ Forcing connection to {seat}...")
 
             jump = None
             sh = None
@@ -3665,12 +3675,13 @@ class SeatMixin:
                 jump = _SeatJumpHost(gateway_norm, gateway_password, log=self.log)
                 sh = _seat_root_shell_via_mtc(jump, seat, mtc_password, log=self.log)
                 # Use stop + start sequence instead of restart for reliability
-                self.log(f"⚡ Stopping adbd on {seat}...", "INFO")
                 out1, code1 = sh.run("setprop ctl.stop adbd", timeout=8)
                 time.sleep(1)  # Give adbd moment to fully stop before restarting
-                self.log(f"⚡ Starting adbd on {seat}...", "INFO")
                 out2, code2 = sh.run("setprop ctl.start adbd", timeout=8)
-                self.log(f"⚡ adbd restarted on {seat} (stop exit code: {code1}, start exit code: {code2})", "INFO")
+                self.log(
+                    f"adbd restart on {seat} (stop rc={code1}, start rc={code2})",
+                    "DEBUG",
+                )
             except Exception as e:
                 self.log(f"Takeover SSH command failed: {e}", "ERROR")
                 return
@@ -3701,7 +3712,7 @@ class SeatMixin:
             # that one of our connect attempts wins the race — empirically
             # this can take several seconds when the other side has a
             # watchdog that reconnects within ~1s of the restart.
-            self.log(f"Racing for {seat_dev} — adbd restarting", "INFO")
+            self.log(f"Racing for {seat_dev} — adbd restarting", "DEBUG")
             connected = False
             # 20 attempts × ~0.5s = up to 10s of racing.
             for attempt in range(20):
@@ -3773,14 +3784,14 @@ class SeatMixin:
         """
         if not device_id:
             return
-        self.log(f"Force disconnecting device {device_id} (seizure)", "INFO")
         try:
             result = self.adb.run_command(f"disconnect {device_id}")
-            if result['success']:
-                self.log(f"Force disconnected {device_id}", "INFO")
-            else:
-                # Device may already be disconnected, which is fine
-                self.log(f"Force disconnect {device_id}: {result.get('stderr', 'no output')}", "DEBUG")
+            if not result['success']:
+                # Device may already be disconnected — that's fine.
+                self.log(
+                    f"Force disconnect {device_id}: {result.get('stderr', 'no output')}",
+                    "DEBUG",
+                )
         except Exception as e:
             self.log(f"Force disconnect error for {device_id}: {e}", "DEBUG")
 
@@ -3891,8 +3902,8 @@ class SeatMixin:
                 self._abort_seat_connect_after_seizure_decline(seat, gateway, port, device_id)
                 return
 
-            self.log(f"Seizing seat {seat} from another user — running full takeover", "INFO")
-            self.update_status(f"⚡ Seizing {seat} — restarting adbd on device")
+            self.log(f"⚡ Forcing connection to {seat}...", "INFO")
+            self.update_status(f"⚡ Seizing {seat}...")
             # Mark the seat as seized NOW (before kicking off takeover_seat) so
             # the offline-refresh loop in _apply_device_refresh doesn't see the
             # device report `offline` mid-takeover (which it will, for several
@@ -3993,7 +4004,11 @@ class SeatMixin:
             ).start()
             self.log("ADB key installation thread started", "INFO")
         else:
-            self.log("Not installing ADB key (missing credentials or flag)", "INFO")
+            # Demoted to DEBUG: the user explicitly asked to hide this.
+            # They want to see ONLY the "installing ADB key" log when an
+            # install is actually happening — not a constant
+            # "not installing" line on every normal seat connect.
+            self.log("Not installing ADB key (missing credentials or flag)", "DEBUG")
 
         self.log(f"Seat connected on port {port}", "INFO")
         self.update_status(f"Connected to {seat}")
@@ -4061,7 +4076,7 @@ class SeatMixin:
                 return
 
             confirmed['result'] = True
-            self.log(f"Seizing {device_id}", "INFO")
+            self.log(f"⚡ Forcing connection to {device_id}...", "INFO")
 
             # First try fast local disconnect/reconnect
             try:
@@ -4082,7 +4097,7 @@ class SeatMixin:
 
             # Fast path didn't work - escalate to full SSH takeover
             # This is the only way to sever a remote TCP session that we can't disconnect
-            self.log(f"Fast seize failed - escalating to full takeover for {device_id}", "INFO")
+            self.log(f"Fast seize failed - escalating to full takeover for {device_id}", "DEBUG")
             # Parse seat and port from device_id
             if device_id and device_id.startswith('localhost:'):
                 port = device_id.split(':', 1)[1]
