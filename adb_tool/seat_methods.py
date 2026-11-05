@@ -2822,20 +2822,12 @@ class SeatMixin:
             root_password = self.credential_manager.get_global_root_password()
             if not root_password:
                 self.update_status(f"🔑 Root password required for {seat}...")
-                root_password, ok = QInputDialog.getText(
-                    self,
-                    "Root Password Required",
-                    f"Enter the root password for seat {seat} (used for ``su -``):",
-                    QLineEdit.EchoMode.Password,
-                )
-                if not ok or not root_password:
+                root_password = self.credential_manager.prompt_root_password(self)
+                if not root_password:
                     self._unmark_button_busy(busy_token)
                     self.update_status(f"❌ Connection cancelled — no root password for {seat}")
                     self.log("Root password required to connect", "ERROR")
                     return
-                # Auto-save: all seats share the same root password.
-                self.credential_manager.set_global_root_password(root_password)
-                self.log("Cached root password saved to Keychain", "INFO")
             self.connect_seat(
                 entry['seat'], entry['gateway'],
                 device_password=password, mtc_password=password,
@@ -3749,13 +3741,8 @@ class SeatMixin:
         was wrong), update the cache, then re-spawn the install worker.
         """
         mtc_key = "mtc_global"
-        new_mtc, ok = QInputDialog.getText(
-            self, "Wrong MTC Password",
-            f"The cached mtc password was rejected by {seat}.\n\n"
-            "Enter the correct mtc password:",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok or not new_mtc:
+        new_mtc = self.credential_manager.prompt_mtc_password(self)
+        if not new_mtc:
             self.log("MTC password prompt cancelled — install aborted.", "ERROR")
             return
         # Update the cache so future installs use the new password without
@@ -3784,13 +3771,8 @@ class SeatMixin:
         was wrong on the ``su -`` prompt), update the cache, then re-spawn
         the install worker.
         """
-        new_root, ok = QInputDialog.getText(
-            self, "Wrong Root Password",
-            f"The cached root password was rejected by the ``su -`` prompt on {seat}.\n\n"
-            "Enter the correct root password:",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok or not new_root:
+        new_root = self.credential_manager.prompt_root_password(self)
+        if not new_root:
             self.log("Root password prompt cancelled — install aborted.", "ERROR")
             return
         # Persist to the global root keychain entry. All seats share the
@@ -5100,24 +5082,13 @@ class SeatMixin:
             # so subsequent gateways don't prompt either.
             gw_password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, gateway_user)
             if not gw_password:
-                gw_password, ok = QInputDialog.getText(
-                    dialog, "Gateway Password",
-                    f"Enter SSH password for {gateway_text} (cached for future scans):",
-                    QLineEdit.EchoMode.Password,
-                )
-                if not ok or not gw_password:
+                gw_password = self.credential_manager.prompt_password(dialog, gateway_host, gateway_user)
+                if not gw_password:
                     search_btn.setEnabled(True)
                     update_seat_combo([])
                     hint.setText("ⓘ Click 🔍 to SSH into the gateway and fetch seats via `arp -a`.")
                     hint.setStyleSheet(f"color: {self.colors['text_secondary']}; font-size: 9pt;")
                     return
-                try:
-                    self.credential_manager.set_password(gateway_host, gateway_user, gw_password)
-                    # Mirror to the global gateway key so other gateways
-                    # don't re-prompt next time.
-                    self.credential_manager.set_global_gateway_password(gw_password)
-                except Exception:
-                    pass
 
             def do_scan_worker():
                 """Run remote arp in background thread with bounded timeouts.
@@ -5280,17 +5251,9 @@ class SeatMixin:
             # password per the user's preference.
             gateway_password = self.credential_manager.get_gateway_password_with_fallback(gw_host, gw_user)
             if not gateway_password:
-                gateway_password, ok = QInputDialog.getText(
-                    dialog, "Gateway Password",
-                    f"Enter SSH password for {gateway}:",
-                    QLineEdit.EchoMode.Password
-                )
-                if not ok or not gateway_password:
+                gateway_password = self.credential_manager.prompt_password(dialog, gw_host, gw_user)
+                if not gateway_password:
                     return
-                self.credential_manager.set_password(gw_host, gw_user, gateway_password)
-                # Mirror to the global gateway key so any future gateway
-                # (different hostname) doesn't re-prompt.
-                self.credential_manager.set_global_gateway_password(gateway_password)
 
             mtc_password = None
             root_password = None
@@ -5299,36 +5262,21 @@ class SeatMixin:
                 # password (used by ``su -`` on the seat) is distinct from
                 # mtc — see [[separation-of-gateway-mtc-and-root-passwords]].
                 # Both are global (same across all seats/gateways).
-                mtc_key = "mtc_global"
                 mtc_password = self.credential_manager.get_mtc_password_with_fallback()
                 if not mtc_password:
-                    mtc_password, ok = QInputDialog.getText(
-                        dialog, "MTC Password",
-                        "Enter mtc password (used for SSH login to the seat):",
-                        QLineEdit.EchoMode.Password
-                    )
-                    if not ok or not mtc_password:
+                    mtc_password = self.credential_manager.prompt_mtc_password(dialog)
+                    if not mtc_password:
                         return
-                    # Save so future installs don't ask again — the user
-                    # said the mtc password is the same everywhere.
-                    self.credential_manager.set_password(mtc_key, "mtc", mtc_password)
-                    # Mirror to the canonical global mtc key too.
-                    self.credential_manager.set_global_mtc_password(mtc_password)
 
                 # Root password — only ask if not already cached. Falls back
                 # to mtc_password for backwards-compat seat images where
                 # root == mtc; the retry handler will catch real mismatches.
                 root_password = self.credential_manager.get_global_root_password()
                 if not root_password:
-                    root_password, ok = QInputDialog.getText(
-                        dialog, "Root Password",
-                        "Enter root password (used for ``su -`` on the seat — "
-                        "may be the same as mtc):",
-                        QLineEdit.EchoMode.Password
-                    )
-                    if not ok or not root_password:
-                        return
-                    self.credential_manager.set_global_root_password(root_password)
+                    root_password = self.credential_manager.prompt_root_password(dialog)
+                    if not root_password:
+                        # Fallback for old seats where root == mtc
+                        root_password = mtc_password
 
             # Use the existing connect_seat method. device_password is the
             # gateway SSH password; mtc_password is for SSH login to the
@@ -5421,17 +5369,9 @@ class SeatMixin:
             password = self.credential_manager.get_gateway_password_with_fallback(rack_host, user)
             if not password:
                 # Prompt and auto-save
-                password, ok = QInputDialog.getText(
-                    dialog,
-                    "Password Required",
-                    f"Enter password for {user}@{rack_host}:",
-                    QLineEdit.EchoMode.Password
-                )
-                if not ok or not password:
+                password = self.credential_manager.prompt_password(dialog, rack_host, user)
+                if not password:
                     return
-                # Set in credential manager (per-host + global mirror)
-                self.credential_manager.set_password(rack_host, user, password)
-                self.credential_manager.set_global_gateway_password(password)
 
             # Use the existing connect_portforward method
             self.connect_portforward(gateway, partition, user)

@@ -119,11 +119,9 @@ class AppMixin:
             # If not cached, prompt user
             if not mtc_password:
                 if hasattr(self, 'credential_manager'):
-                    mtc_password = self.credential_manager.prompt_password(
-                        self, "mtc_global", "mtc", auto_save=True
-                    )
+                    mtc_password = self.credential_manager.prompt_mtc_password(self)
                 else:
-                    # Fallback simple prompt (use fully-qualified import to avoid shadowing)
+                    # Fallback simple prompt
                     from PyQt6.QtWidgets import QInputDialog as _QInputDialog
                     from PyQt6.QtWidgets import QLineEdit as _QLineEdit
                     mtc_password, ok = _QInputDialog.getText(

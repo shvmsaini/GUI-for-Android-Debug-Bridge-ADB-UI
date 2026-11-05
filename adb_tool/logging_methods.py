@@ -340,24 +340,23 @@ class LoggingMixin:
                     logcat_filter = self.logcat_filter_entry.text().strip()
 
                     # Build logcat command.
-                    # `adb logcat` accepts filter specs (tag:priority) as positional
-                    # arguments, but options like `-t 100` / `-d` are real flags. We
-                    # detect if the user typed something starting with `-` and pass it
-                    # through as a flag instead of a positional filter spec.
-                    cmd = [self.adb.adb_path, '-s', device_id, 'logcat']
+                    # We add -v time to get timestamps, which is standard for logcat debugging.
+                    cmd = [self.adb.adb_path, '-s', device_id, 'logcat', '-v', 'time']
+                    
                     if logcat_filter:
                         if logcat_filter.startswith('-'):
                             # Looks like a flag (e.g. "-t 100", "-d"); split on whitespace
                             cmd.extend(shlex.split(logcat_filter))
                         else:
-                            # Treat as filter spec(s). Multiple specs are space- or
-                            # comma-separated; adb accepts them as separate args.
+                            # Treat as filter spec(s).
                             specs = [s for s in re.split(r'[\s,]+', logcat_filter) if s]
                             cmd.extend(specs)
 
                     self.log(f"Running logcat command: {' '.join(cmd)}")
                     self._ui_caller.call.emit(lambda: self.log_to_logcat(f"[COMMAND] {' '.join(cmd)}"))
 
+                    # Use a cross-platform way to make the pipes non-blocking or use a timeout
+                    # On Windows, we'll use a thread to read from the pipe to avoid blocking the main logcat loop
                     process = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -366,7 +365,7 @@ class LoggingMixin:
                         encoding='utf-8',
                         errors='replace',
                         universal_newlines=True,
-                        bufsize=1,  # Line-buffered for live output (text mode)
+                        bufsize=1,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                     )
 
@@ -379,7 +378,6 @@ class LoggingMixin:
                         if not pending_lines:
                             return
                         batch, pending_lines = pending_lines, []
-                        # Capture by value for the lambda
                         self._ui_caller.call.emit(lambda b=batch: self._append_logcat_batch(b))
 
                     def append_line(line_text):
@@ -390,53 +388,78 @@ class LoggingMixin:
                             last_flush = now
                             flush_batch()
 
-                    # Read output line by line using non-blocking approach
-                    while self.log_running:
+                    # Queue for thread-safe communication between reader thread and main loop
+                    from queue import Queue, Empty
+                    io_queue = Queue()
+
+                    def reader_thread(pipe, prefix=""):
                         try:
-                            # Check if process is still running
-                            if process.poll() is not None:
-                                self.log("Logcat process ended")
-                                break
-
-                            # Try to read with a non-blocking approach
-                            # On Unix, use select; on Windows, we need different approach
-                            if sys.platform != 'win32':
-                                import select
-                                # Also check stderr in case of errors
-                                readable, _, _ = select.select(
-                                    [process.stdout, process.stderr], [], [], 0.1
-                                )
-                                # Check stderr first
-                                if process.stderr in readable:
-                                    err_line = process.stderr.readline()
-                                    if err_line:
-                                        err_text = err_line.rstrip('\n\r')
-                                        if err_text:
-                                            self.log(f"Logcat stderr: {err_text}", "ERROR")
-                                            append_line(f"[STDERR] {err_text}")
-                                        continue
-
-                                if process.stdout not in readable:
-                                    # No data — flush whatever batch we have so the
-                                    # user still sees timely updates while idle.
-                                    flush_batch()
-                                    continue
-
-                            # Read a line
-                            line = process.stdout.readline()
-                            if line:
-                                line_text = line.rstrip('\n\r')
-                                if line_text:
-                                    append_line(line_text)
-                            else:
-                                # EOF or no data - check if process ended
-                                if process.poll() is not None:
-                                    self.log("Logcat process ended (no more output)")
+                            for line in iter(pipe.readline, ''):
+                                if not self.log_running:
                                     break
-                                time.sleep(0.05)  # Small sleep to prevent tight loop
-                        except Exception as read_err:
-                            self.log(f"Error reading logcat: {read_err}", "ERROR")
-                            time.sleep(0.1)  # Prevent tight loop on error
+                                io_queue.put((prefix, line.rstrip('\n\r')))
+                        except Exception as e:
+                            io_queue.put(("ERROR", str(e)))
+                        finally:
+                            pipe.close()
+
+                    # Start reader threads for both stdout and stderr
+                    threading.Thread(target=reader_thread, args=(process.stdout, ""), daemon=True).start()
+                    threading.Thread(target=reader_thread, args=(process.stderr, "STDERR"), daemon=True).start()
+
+                    # Main loop to process the queue
+                    while self.log_running:
+                        if process.poll() is not None and io_queue.empty():
+                            self.log("Logcat process ended")
+                            break
+
+                        try:
+                            # Wait for a line with a timeout so we can check self.log_running
+                            prefix, line_text = io_queue.get(timeout=0.1)
+                            if prefix == "ERROR":
+                                self.log(f"Logcat read error: {line_text}", "ERROR")
+                                break
+                            
+                            if prefix == "STDERR":
+                                if line_text:
+                                    # Some "errors" are just informational
+                                    level = "ERROR" if "error" in line_text.lower() else "INFO"
+                                    self.log(f"Logcat stderr: {line_text}", level)
+                                    append_line(f"[STDERR] {line_text}")
+                            elif line_text:
+                                append_line(line_text)
+                        except Empty:
+                            # Periodic flush even if no new lines arrived
+                            flush_batch()
+                            continue
+                        except Exception as e:
+                            self.log(f"Error in logcat loop: {e}", "ERROR")
+                            break
+
+                    # Flush any remaining lines before tearing down
+                    flush_batch()
+
+                    # Clean up process
+                    if process is not None:
+                        if process.poll() is None:
+                            self.log("Terminating logcat process...")
+                            process.terminate()
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                self.log("Force killing logcat process...")
+                                process.kill()
+                        
+                        # Close pipes just in case
+                        try:
+                            process.stdout.close()
+                            process.stderr.close()
+                        except:
+                            pass
+
+                    self.log_running = False
+                    self._ui_caller.call.emit(lambda: self.logcat_button.setText("▶️ Start"))
+                    self._ui_caller.call.emit(lambda: self.log_to_logcat("[STOPPED] Logcat stopped"))
 
                     # Flush any remaining lines before tearing down
                     flush_batch()

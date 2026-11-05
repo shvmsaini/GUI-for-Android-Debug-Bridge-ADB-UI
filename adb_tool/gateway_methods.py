@@ -1244,15 +1244,9 @@ class GatewayMixin:
             creds = CredentialManager()
             mtc_password = creds.get_mtc_password_with_fallback()
             if not mtc_password:
-                mtc_password, ok = QInputDialog.getText(
-                    explorer, "MTC Password",
-                    "Enter the mtc password (used for SSH to the seat):",
-                    QLineEdit.EchoMode.Password,
-                )
-                if not ok or not mtc_password:
+                mtc_password = creds.prompt_mtc_password(explorer)
+                if not mtc_password:
                     return
-                # Cache globally so we never ask again for any seat.
-                creds.set_global_mtc_password(mtc_password)
 
             self.log(f"Gateway: copying {raw_name} to seat {seat_host}:{dest_path} via SCP on gateway", "INFO")
             self.update_status(f"Copying to {seat_host}:{dest_path}…")
@@ -1486,6 +1480,8 @@ class GatewayMixin:
 
                 def ask():
                     if is_password:
+                        # For generic remote password prompts in the command runner,
+                        # we don't know if it's mtc or gateway, so we use a generic dialog.
                         ans, ok2 = QInputDialog.getText(
                             output_dlg, "Remote Prompt",
                             question_text,

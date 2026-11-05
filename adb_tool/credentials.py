@@ -8,9 +8,13 @@ import json
 import tempfile
 import shutil
 import re
-import pty
-import select
 from datetime import datetime
+try:
+    import pty
+    import select
+except ImportError:
+    pty = None
+    select = None
 from typing import Optional
 from subprocess import TimeoutExpired
 
@@ -18,8 +22,34 @@ from subprocess import TimeoutExpired
 if sys.platform == 'win32':
     try:
         import winreg
+        import ctypes
+        from ctypes import wintypes
     except ImportError:
         import _winreg as winreg
+        winreg = None
+        ctypes = None
+        wintypes = None
+
+    if ctypes:
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [
+                ('Flags', wintypes.DWORD),
+                ('Type', wintypes.DWORD),
+                ('TargetName', wintypes.LPWSTR),
+                ('Comment', wintypes.LPWSTR),
+                ('LastWritten', wintypes.FILETIME),
+                ('CredentialBlobSize', wintypes.DWORD),
+                ('CredentialBlob', ctypes.POINTER(ctypes.c_char)),
+                ('Persist', wintypes.DWORD),
+                ('AttributeCount', wintypes.DWORD),
+                ('Attributes', ctypes.c_void_p),
+                ('TargetAlias', wintypes.LPWSTR),
+                ('UserName', wintypes.LPWSTR)
+            ]
+        PCREDENTIAL = ctypes.POINTER(CREDENTIAL)
+else:
+    ctypes = None
+    wintypes = None
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -77,55 +107,105 @@ class CredentialManager:
     def _sync_index_from_keychain(self):
         """Scan the Keychain for existing ADB-GUI-UI entries and add to index.
 
-        Uses a pseudo-terminal to capture dump-keychain output (which only
-        emits when stdout is a TTY). Safe to call multiple times (idempotent).
+        Safe to call multiple times (idempotent).
         """
-        if sys.platform != 'darwin':
-            return
+        if sys.platform == 'darwin':
+            try:
+                if pty is None or select is None:
+                    return
 
-        try:
-            keychain_path = os.path.expanduser('~/Library/Keychains/login.keychain-db')
-            # Use PTY to provide a fake TTY for dump-keychain
-            master_fd, slave_fd = pty.openpty()
-            proc = subprocess.Popen(
-                ['security', 'dump-keychain', keychain_path],
-                stdout=slave_fd, stderr=slave_fd, close_fds=True
-            )
-            os.close(slave_fd)
-            # Read from master with timeout
-            output = b''
-            while True:
-                r, _, _ = select.select([master_fd], [], [], 2.0)
-                if not r:
-                    break
-                chunk = os.read(master_fd, 4096)
-                if not chunk:
-                    break
-                output += chunk
-            os.close(master_fd)
-            proc.wait(timeout=5)
-            text = output.decode('utf-8', errors='replace')
+                keychain_path = os.path.expanduser('~/Library/Keychains/login.keychain-db')
+                # Use PTY to provide a fake TTY for dump-keychain
+                master_fd, slave_fd = pty.openpty()
+                proc = subprocess.Popen(
+                    ['security', 'dump-keychain', keychain_path],
+                    stdout=slave_fd, stderr=slave_fd, close_fds=True
+                )
+                os.close(slave_fd)
+                # Read from master with timeout
+                output = b''
+                while True:
+                    r, _, _ = select.select([master_fd], [], [], 2.0)
+                    if not r:
+                        break
+                    chunk = os.read(master_fd, 4096)
+                    if not chunk:
+                        break
+                    output += chunk
+                os.close(master_fd)
+                proc.wait(timeout=5)
+                text = output.decode('utf-8', errors='replace')
 
-            # Parse accounts from dump format: each entry has
-            # `0x00000007 <blob>="ADB-GUI-UI"` and `"acct"<blob>="user@host"`
-            # separated by a `keychain:` header.
-            entries = text.split('keychain:')
-            index = self._load_index()
-            added = 0
-            for entry in entries:
-                if '0x00000007 <blob>="ADB-GUI-UI"' not in entry:
-                    continue
-                m = re.search(r'"acct"<blob>="([^"]*)"', entry)
-                if not m:
-                    continue
-                account = m.group(1)
-                if account not in index:
-                    index.add(account)
-                    added += 1
-            if added > 0:
-                self._save_index(index)
-        except Exception:
-            pass
+                # Parse accounts from dump format: each entry has
+                # `0x00000007 <blob>="ADB-GUI-UI"` and `"acct"<blob>="user@host"`
+                # separated by a `keychain:` header.
+                entries = text.split('keychain:')
+                index = self._load_index()
+                added = 0
+                for entry in entries:
+                    if '0x00000007 <blob>="ADB-GUI-UI"' not in entry:
+                        continue
+                    m = re.search(r'"acct"<blob>="([^"]*)"', entry)
+                    if not m:
+                        continue
+                    account = m.group(1)
+                    if account not in index:
+                        index.add(account)
+                        added += 1
+                if added > 0:
+                    self._save_index(index)
+            except Exception:
+                pass
+        elif sys.platform.startswith('linux'):
+            try:
+                # secret-tool search --all service ADB-GUI-UI
+                result = subprocess.run(
+                    ['secret-tool', 'search', '--all', 'service', self.service_name],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    index = self._load_index()
+                    added = 0
+                    for line in result.stdout.splitlines():
+                        if 'attribute.account =' in line:
+                            parts = line.split('=', 1)
+                            if len(parts) > 1:
+                                account = parts[1].strip().strip("'").strip('"')
+                                if account and account not in index:
+                                    index.add(account)
+                                    added += 1
+                    if added > 0:
+                        self._save_index(index)
+            except Exception:
+                pass
+        elif sys.platform == 'win32' and ctypes:
+            try:
+                advapi32 = ctypes.windll.advapi32
+                CredEnumerateW = advapi32.CredEnumerateW
+                CredEnumerateW.argtypes = [wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(ctypes.POINTER(PCREDENTIAL))]
+                CredEnumerateW.restype = wintypes.BOOL
+                
+                count = wintypes.DWORD()
+                p_creds = ctypes.POINTER(PCREDENTIAL)()
+                # Enumerate all generic credentials and filter by our service name
+                if CredEnumerateW(None, 0, ctypes.byref(count), ctypes.byref(p_creds)):
+                    index = self._load_index()
+                    added = 0
+                    try:
+                        for i in range(count.value):
+                            cred = p_creds[i].contents
+                            target = cred.TargetName or ""
+                            if target.startswith(f"{self.service_name}:"):
+                                account = target[len(self.service_name)+1:]
+                                if account and account not in index:
+                                    index.add(account)
+                                    added += 1
+                        if added > 0:
+                            self._save_index(index)
+                    finally:
+                        advapi32.CredFree(p_creds)
+            except Exception:
+                pass
 
     def _add_to_index(self, gateway, user):
         """Add an account to the index after successful save."""
@@ -158,13 +238,32 @@ class CredentialManager:
                 )
                 if result.returncode == 0:
                     return result.stdout.strip()
-            elif sys.platform == 'win32':
-                # Windows - use PowerShell credential manager
-                # For simplicity, use a fallback file-based approach
-                return None  # Will be implemented later
-            else:
-                # Linux - try keyring
-                return None  # Will be implemented later
+            elif sys.platform == 'win32' and ctypes:
+                # Windows Credential Manager using ctypes
+                target = f"{self.service_name}:{account}"
+                advapi32 = ctypes.windll.advapi32
+                CredReadW = advapi32.CredReadW
+                CredReadW.argtypes = [wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(PCREDENTIAL)]
+                CredReadW.restype = wintypes.BOOL
+                
+                p_cred = PCREDENTIAL()
+                if CredReadW(target, 1, 0, ctypes.byref(p_cred)):
+                    try:
+                        blob = ctypes.string_at(p_cred.contents.CredentialBlob, p_cred.contents.CredentialBlobSize)
+                        return blob.decode('utf-16le')
+                    finally:
+                        advapi32.CredFree(p_cred)
+                return None
+            elif sys.platform.startswith('linux'):
+                # Linux - try libsecret-tools (secret-tool)
+                result = subprocess.run(
+                    ['secret-tool', 'lookup',
+                     'service', self.service_name,
+                     'account', account],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout:
+                    return result.stdout.strip()
         except:
             pass
         return None
@@ -249,12 +348,33 @@ class CredentialManager:
                     capture_output=True, text=True, timeout=5
                 )
                 success = result.returncode == 0
-            elif sys.platform == 'win32':
-                # Windows implementation
-                success = False  # Will be implemented later
-            else:
-                # Linux implementation
-                success = False  # Will be implemented later
+            elif sys.platform == 'win32' and ctypes:
+                # Windows implementation using Credential Manager
+                target = f"{self.service_name}:{account}"
+                blob = password.encode('utf-16le')
+                
+                cred = CREDENTIAL()
+                cred.Type = 1 # CRED_TYPE_GENERIC
+                cred.TargetName = target
+                cred.UserName = account
+                cred.CredentialBlobSize = len(blob)
+                cred.CredentialBlob = ctypes.cast(ctypes.create_string_buffer(blob), ctypes.POINTER(ctypes.c_char))
+                cred.Persist = 2 # CRED_PERSIST_LOCAL_MACHINE
+                
+                advapi32 = ctypes.windll.advapi32
+                CredWriteW = advapi32.CredWriteW
+                CredWriteW.argtypes = [ctypes.POINTER(CREDENTIAL), wintypes.DWORD]
+                CredWriteW.restype = wintypes.BOOL
+                success = bool(CredWriteW(ctypes.byref(cred), 0))
+            elif sys.platform.startswith('linux'):
+                # Linux implementation using secret-tool
+                result = subprocess.run(
+                    ['secret-tool', 'store', '--label', f"ADB-GUI {account}",
+                     'service', self.service_name,
+                     'account', account],
+                    input=password, text=True, timeout=5, capture_output=True
+                )
+                success = result.returncode == 0
         except:
             success = False
 
@@ -276,10 +396,26 @@ class CredentialManager:
                 if result.returncode == 0:
                     self._remove_from_index(gateway, user)
                     return True
-            elif sys.platform == 'win32':
-                pass  # TODO: Windows implementation
-            else:
-                pass  # TODO: Linux implementation
+            elif sys.platform == 'win32' and ctypes:
+                target = f"{self.service_name}:{account}"
+                advapi32 = ctypes.windll.advapi32
+                CredDeleteW = advapi32.CredDeleteW
+                CredDeleteW.argtypes = [wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+                CredDeleteW.restype = wintypes.BOOL
+                # 1 = CRED_TYPE_GENERIC
+                if CredDeleteW(target, 1, 0):
+                    self._remove_from_index(gateway, user)
+                    return True
+            elif sys.platform.startswith('linux'):
+                result = subprocess.run(
+                    ['secret-tool', 'clear',
+                     'service', self.service_name,
+                     'account', account],
+                    capture_output=True, timeout=5
+                )
+                if result.returncode == 0:
+                    self._remove_from_index(gateway, user)
+                    return True
         except:
             pass
         return False
@@ -288,7 +424,7 @@ class CredentialManager:
         """Delete all tracked credentials from the Keychain.
 
         Returns (deleted_count, failed_count)."""
-        if sys.platform != 'darwin':
+        if sys.platform != 'darwin' and not sys.platform.startswith('linux'):
             return (0, 0)
 
         # Sync first to catch any pre-existing entries
@@ -309,7 +445,7 @@ class CredentialManager:
         return (deleted, failed)
 
     def prompt_password(self, parent, gateway, user, auto_save=False):
-        """Show password input dialog
+        """Show password input dialog for a gateway.
 
         Args:
             parent: Parent widget for the dialog
@@ -317,30 +453,49 @@ class CredentialManager:
             user: Username
             auto_save: If True, automatically save password without asking user
         """
-        from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
-
-        password, ok = QInputDialog.getText(
+        return self._do_prompt(
             parent,
             "Password Required",
             f"Enter password for {user}@{gateway}:",
+            lambda pw: self.set_password(gateway, user, pw),
+            lambda pw: self.set_global_gateway_password(pw),
+            auto_save=auto_save
+        )
+
+    def prompt_mtc_password(self, parent, auto_save=False):
+        """Show password input dialog for mtc account (global)."""
+        return self._do_prompt(
+            parent,
+            "mtc Password",
+            "Enter the mtc password (used for all seats):",
+            lambda pw: self.set_global_mtc_password(pw),
+            auto_save=auto_save
+        )
+
+    def prompt_root_password(self, parent, auto_save=False):
+        """Show password input dialog for root account (global)."""
+        return self._do_prompt(
+            parent,
+            "Root Password",
+            "Enter the root password for seats (if different from mtc):",
+            lambda pw: self.set_global_root_password(pw),
+            auto_save=auto_save
+        )
+
+    def _do_prompt(self, parent, title, label, save_func, extra_save_func=None, auto_save=False):
+        """Generic password prompter with 'Save' logic."""
+        password, ok = QInputDialog.getText(
+            parent,
+            title,
+            label,
             QLineEdit.EchoMode.Password
         )
         if ok and password:
-            # Auto-save or offer to save password
             if auto_save:
-                self.set_password(gateway, user, password)
-                # Mirror to the global gateway key — all gateways share
-                # the same password, so a successful save here should
-                # unblock every future gateway lookup too.
-                try:
-                    self.set_global_gateway_password(password)
-                except Exception:
-                    pass
+                save_func(password)
+                if extra_save_func:
+                    extra_save_func(password)
             else:
-                # QMessageBox.question makes one button the platform
-                # default — on macOS that's "No", so pressing Return
-                # discarded the password instead of saving. Build the
-                # dialog manually so Yes is unambiguously the default.
                 save_box = QMessageBox(parent)
                 save_box.setIcon(QMessageBox.Icon.Question)
                 save_box.setWindowTitle("Save Password")
@@ -350,11 +505,8 @@ class CredentialManager:
                 save_box.setDefaultButton(yes_btn)
                 save_box.exec()
                 if save_box.clickedButton() is yes_btn:
-                    self.set_password(gateway, user, password)
-                    # Mirror to the global key for the same reason.
-                    try:
-                        self.set_global_gateway_password(password)
-                    except Exception:
-                        pass
+                    save_func(password)
+                    if extra_save_func:
+                        extra_save_func(password)
             return password
         return None

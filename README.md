@@ -72,7 +72,12 @@ Works on **macOS, Linux, and Windows** (ADB + device drivers permitting).
 3. **ADB (Android Debug Bridge)**
    - Install via Android Studio Platform Tools or your package manager
    - Or download from: https://developer.android.com/studio/releases/platform-tools
-4. **Android Device** with USB debugging enabled
+4. **Credential Management (Linux only)**
+   - For saving SSH/Gateway passwords on Linux, `libsecret-tools` is required:
+     ```bash
+     sudo apt install libsecret-tools
+     ```
+5. **Android Device** with USB debugging enabled
 5. **scrcpy** (optional, for screen mirroring)
    - macOS (Homebrew): `brew install scrcpy`
 

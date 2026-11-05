@@ -1200,22 +1200,21 @@ def prompt_and_open_seat_root(parent):
     # mtc password is global (same across all seats) — same fallback story.
     mtc_pw = creds.get_mtc_password_with_fallback()
     if not mtc_pw:
-        mtc_pw, ok2 = QInputDialog.getText(parent, "mtc Password",
-                                            f"Enter the mtc password (used for all seats):",
-                                            QLineEdit.EchoMode.Password)
-        mtc_pw = mtc_pw if ok2 else None
+        mtc_pw = creds.prompt_mtc_password(parent)
         if not mtc_pw:
             return
-        # Cache globally so we never ask again for any seat.
-        try:
-            creds.set_global_mtc_password(mtc_pw)
-        except Exception:
-            pass
 
     # Root password is also global (one for all seats). Used by ``su -``
     # on the seat — distinct from the mtc password. Falls back to mtc
     # for backwards-compat seat images where root == mtc.
-    root_pw = creds.get_global_root_password() or mtc_pw
+    root_pw = creds.get_global_root_password()
+    if not root_pw:
+        root_pw = creds.prompt_root_password(parent)
+        # If user cancels root password prompt, we can try falling back to mtc_pw
+        # or just return. User said "make sure you ask the seat root password 
+        # in seat root explorer if not saved!".
+        if not root_pw:
+            root_pw = mtc_pw
 
     parent.update_status(f"Connecting to {seat} as root…")
     open_seat_root_window(parent, seat, gateway_host, gateway_user, gw_pw, seat, mtc_pw, parent.colors, root_password=root_pw)
