@@ -54,12 +54,15 @@ except ImportError:
 
 
 def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway_password,
-                          seat_hostname, mtc_password, colors):
+                          seat_hostname, mtc_password, colors, root_password=None):
     """Open a root-level SSH file explorer for a seat.
 
     seat_hostname: the actual seat device name (e.g., 'seat01')
     gateway_host, gateway_user, gateway_password: gateway SSH credentials
-    mtc_password: mtc account password on the seat (for SSH and sudo)
+    mtc_password: mtc account password on the seat (for SSH into the seat)
+    root_password: root password for ``su -`` on the seat (distinct from
+        mtc). If None, falls back to mtc_password for backwards-compat
+        seat images where root == mtc.
     """
     # Create signal emitters on the MAIN thread so they marshal calls
     # back to the GUI thread. Emitting from the background thread will
@@ -93,7 +96,10 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             try:
                 jump = _SeatJumpHost(f"{gateway_user}@{gateway_host}", gateway_password, parent.log)
                 parent.log("Seat Root: gateway hop done, opening mtc/root shell", "DEBUG")
-                shell = _seat_root_shell_via_mtc(jump, seat_hostname, mtc_password, parent.log)
+                shell = _seat_root_shell_via_mtc(
+                    jump, seat_hostname, mtc_password, parent.log,
+                    root_password=root_password,
+                )
                 parent.log(f"Seat Root: root shell active: {shell}", "INFO")
                 parent.update_status(f"Connected to {seat_hostname} (root)")
                 # Save mtc password globally (one for all seats/gateways)
@@ -1206,5 +1212,10 @@ def prompt_and_open_seat_root(parent):
         except Exception:
             pass
 
+    # Root password is also global (one for all seats). Used by ``su -``
+    # on the seat — distinct from the mtc password. Falls back to mtc
+    # for backwards-compat seat images where root == mtc.
+    root_pw = creds.get_global_root_password() or mtc_pw
+
     parent.update_status(f"Connecting to {seat} as root…")
-    open_seat_root_window(parent, seat, gateway_host, gateway_user, gw_pw, seat, mtc_pw, parent.colors)
+    open_seat_root_window(parent, seat, gateway_host, gateway_user, gw_pw, seat, mtc_pw, parent.colors, root_password=root_pw)

@@ -1137,7 +1137,8 @@ class AppMixin:
             self.log(f"Pulling base APK to {local_apk}...")
             # Use shlex.quote to properly handle paths with spaces
             cmd = f"{self.get_device_flag()} pull {shlex.quote(base_apk_path)} {shlex.quote(local_apk)}"
-            result = self.adb.run_command(cmd)
+            # No timeout for large APK files
+            result = self.adb.run_command(cmd, timeout=None)
 
             if result['success']:
                 file_size = os.path.getsize(local_apk) if os.path.exists(local_apk) else 0

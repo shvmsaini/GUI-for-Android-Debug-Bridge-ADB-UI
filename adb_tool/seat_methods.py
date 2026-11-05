@@ -60,7 +60,16 @@ class _SeatSshError(Exception):
 
 
 class _SeatAuthError(_SeatSshError):
-    """Raised when SSH or sudo authentication fails. Triggers re-prompt."""
+    """Raised when SSH or sudo/su authentication fails. Triggers re-prompt.
+
+    ``kind`` is one of ``"mtc"`` (mtc SSH login rejected) or ``"root"``
+    (``su -`` on the seat rejected the password). Callers use this to
+    pick the right re-prompt flow.
+    """
+
+    def __init__(self, message, kind="mtc"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def _lookup_ssh_config(host):
@@ -995,7 +1004,135 @@ def _clean_adb_key_line(raw_lines):
     return ""
 
 
-def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
+def _escalate_to_root(sh, root_pw, mtc_pw, log):
+    """Escalate an mtc shell on a seat to a root shell.
+
+    Seat images vary in which escalation primitive they accept:
+
+      1. ``su -`` — uses a separate root password (distinct from mtc).
+         Some seats are configured this way; ``su`` rejects the mtc
+         password and demands the dedicated root one.
+      2. ``sudo su -`` — ``sudo`` is set up to reuse the mtc password
+         (``mtc`` is in ``sudoers`` with ``NOPASSWD`` or with password =
+         mtc). ``sudo`` rejects ``su -`` with the same root password in
+         this configuration.
+
+    We try ``su -`` first (matches the working bundled-script path and
+    is the path the user told us is preferred). If the seat rejects the
+    root password, fall back to ``sudo su -`` with the mtc password —
+    silently, because the seat's sudoers configuration is seat-local
+    and the user shouldn't be pestered about it on every install.
+
+    ``su -`` is preferred over ``sudo -i`` because on some seat images
+    ``sudo -i`` initialises a PAM session that mounts ``/data`` as
+    read-only or otherwise blocks writing to ``/data/misc/adb`` — even
+    though ``id -u`` still returns 0.
+
+    Raises ``_SeatAuthError(kind="root")`` if BOTH attempts fail.
+
+    Does NOT verify ``id -u`` — the caller does that after this returns
+    so a single error path covers both escalation routes.
+    """
+    # ── Attempt 1: ``su -`` with the dedicated root password ─────────
+    sh.buf = ""
+    sh.send_line("su -\n")
+
+    outcome = None  # 'pwd' (we saw a password prompt) | 'auth_fail' | 'silent' (no prompt — root may already be active)
+    end_at = time.time() + 12
+    while time.time() < end_at and outcome is None:
+        sh._pull()
+        low = sh.buf.lower()
+        if (
+            "permission denied" in low
+            or "incorrect password" in low
+            or "authentication failure" in low
+            or "su: authentication failure" in low
+        ):
+            outcome = 'auth_fail'
+        elif re.search(r"(?i)password[^\n]*:", sh.buf):
+            outcome = 'pwd'
+        else:
+            time.sleep(0.1)
+
+    if outcome == 'auth_fail':
+        log("SEAT: su rejected root password — falling back to sudo su -", "INFO")
+    elif outcome is None:
+        # No prompt and no failure: root may already be active. Leave
+        # the helper and let id -u verify.
+        log("SEAT: no su password prompt — root may already be active", "DEBUG")
+        return
+    else:
+        log("SEAT: sending root password for su")
+        time.sleep(0.2)
+        sh.buf = ""
+        sh.send_line(root_pw + "\n")
+        if sh.wait_for(
+            r"(?i)su: authentication failure|incorrect password|"
+            r"authentication fail",
+            3,
+        ):
+            log("SEAT: su rejected root password — falling back to sudo su -", "INFO")
+        else:
+            return  # Either accepted or no failure indicator — let id -u verify.
+
+    # ── Attempt 2: ``sudo su -`` with the mtc password ───────────────
+    # Some seat images have ``mtc`` in sudoers with password = mtc (or
+    # NOPASSWD). ``su -`` is rejected in those configurations because
+    # root is locked behind a separate password; ``sudo su -`` reuses
+    # the mtc credential to land in root.
+    sh.buf = ""
+    sh.send_line("sudo su -\n")
+
+    outcome = None
+    end_at = time.time() + 12
+    while time.time() < end_at and outcome is None:
+        sh._pull()
+        low = sh.buf.lower()
+        if (
+            "permission denied" in low
+            or "incorrect password" in low
+            or "authentication failure" in low
+            or "not in the sudoers" in low
+            or "may not run sudo" in low
+            or "try again" in low
+        ):
+            outcome = 'auth_fail'
+        elif re.search(r"(?i)password[^\n]*:", sh.buf):
+            outcome = 'pwd'
+        else:
+            time.sleep(0.1)
+
+    if outcome == 'auth_fail':
+        raise _SeatAuthError(
+            "Neither ``su -`` (with the dedicated root password) nor "
+            "``sudo su -`` (with the mtc password) worked on this seat. "
+            "Verify the root password and that mtc is in sudoers.",
+            kind="root",
+        )
+
+    if outcome is None:
+        # No prompt — sudo may be NOPASSWD or we're already root.
+        log("SEAT: no sudo password prompt — sudo may be NOPASSWD", "DEBUG")
+        return
+
+    log("SEAT: sending mtc password for sudo su -")
+    time.sleep(0.2)
+    sh.buf = ""
+    sh.send_line(mtc_pw + "\n")
+    if sh.wait_for(
+        r"(?i)try again|incorrect password|authentication fail|"
+        r"not in the sudoers|may not run sudo|su: authentication failure",
+        3,
+    ):
+        raise _SeatAuthError(
+            "Neither ``su -`` (with the dedicated root password) nor "
+            "``sudo su -`` (with the mtc password) worked on this seat. "
+            "Verify the root password and that mtc is in sudoers.",
+            kind="root",
+        )
+
+
+def _seat_root_shell_via_mtc(jump, seat, mtc_password, log, root_password=None):
     """From the jump host, reach a root shell on the seat and return it.
 
     Two paths are supported, picked at runtime based on whether the
@@ -1003,19 +1140,33 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
 
       1. ``bct login -h <seat>`` — passwordless helper on gateways that
          block direct ``ssh mtc@<seat>``. After login we land at an
-         ``[mtc@...]$`` prompt on the seat itself; then we run
-         ``sudo -S su -`` from there. The mtc password is only needed
-         for the sudo prompt.
-      2. ``ssh -t mtc@<seat> 'sudo -S su -'`` — classic ProxyJump. The
-         mtc password is fed twice: once for the SSH login, once for the
-         sudo prompt on the seat.
+         ``[mtc@...]$`` prompt on the seat itself.
+      2. ``ssh -t mtc@<seat> 'su -'`` — classic ProxyJump.
 
     ``bct`` is preferred when present because the direct ``ssh mtc@``
     path is rejected by some gateways (e.g. ``172.17.124.56``), even
     with the correct password. See ``[[bct-login-fallback-for-mtc-ssh]]``.
 
+    Once we have an mtc shell on the seat (via either path), we hand off
+    to ``_escalate_to_root`` which tries ``su -`` with the dedicated
+    root password first and falls back to ``sudo su -`` with the mtc
+    password if the seat doesn't accept the root password. Seat images
+    differ on which escalation primitive they accept, so both attempts
+    happen on every connect — ``su -`` is the cheap path and ``sudo``
+    is the fallback that covers the rest.
+
+    If ``root_password`` is None, falls back to ``mtc_password`` for
+    backwards compatibility with older seat images where mtc and root
+    shared a credential. New flows should always pass an explicit
+    ``root_password``.
+
     Raises ``_SeatSshError`` if any step fails.
     """
+    # Back-compat: callers that pre-date the root/mtc split passed the
+    # same password twice (sudo reused mtc). When no explicit root
+    # password is supplied, reuse the mtc one — older seat images don't
+    # require a separate root credential.
+    root_pw = root_password if root_password is not None else mtc_password
     sh = None
     try:
         sh = jump.shell()
@@ -1066,60 +1217,22 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
                 )
             log(f"SEAT: bct login reached mtc prompt on {seat}")
 
-            # Now escalate to root from the mtc shell. Same sudo dance
-            # as the classic path, just driven from a different parent
-            # shell.
-            time.sleep(0.2)
-            sh.buf = ""
-            sh.send_line("sudo -S su -\n")
-
-            outcome = None  # 'sudo' | 'auth_fail'
-            end_at = time.time() + 12
-            while time.time() < end_at and outcome is None:
-                sh._pull()
-                low = sh.buf.lower()
-                if "permission denied" in low or "incorrect password" in low:
-                    outcome = 'auth_fail'
-                elif re.search(r"(?i)password[^\n]*:", sh.buf):
-                    outcome = 'sudo'
-                else:
-                    time.sleep(0.1)
-
-            if outcome == 'auth_fail':
-                raise _SeatAuthError(
-                    "sudo rejected the password on this seat. The seat's "
-                    "sudo password must match the mtc password."
-                )
-
-            if outcome is None:
-                log("SEAT: bct path: no sudo prompt — assuming NOPASSWD sudo", "DEBUG")
-            else:
-                log("SEAT: bct path: sending mtc password for sudo")
-                time.sleep(0.2)
-                sh.buf = ""
-                sh.send_line(mtc_password + "\n")
-                if sh.wait_for(
-                    r"(?i)try again|incorrect password|authentication fail|"
-                    r"not in the sudoers|may not run sudo",
-                    3,
-                ):
-                    raise _SeatAuthError(
-                        "sudo rejected the password on this seat. The seat's "
-                        "sudo password must match the mtc password."
-                    )
+            # Hand off to the dual-try escalation helper — ``su -``
+            # with the root password first, ``sudo su -`` with mtc as
+            # fallback. Seat images differ on which is accepted.
+            _escalate_to_root(sh, root_pw, mtc_password, log)
         else:
-            # Path 2: classic ssh -t mtc@<seat> 'sudo -S su -'.
+            # Path 2: classic ssh -tt mtc@<seat>.
             #
-            # We use `sudo -S su -` rather than `sudo -i` because on some
-            # seat images `sudo -i` initialises a PAM session that mounts
-            # /data as read-only or otherwise blocks writing to
-            # /data/misc/adb — even though `id -u` still returns 0.
-            # `sudo -S su -` matches the working bundled-script path and
-            # lands us in a true root login shell.
+            # We SSH into the seat as ``mtc`` (no inline ``su -`` here —
+            # ``_escalate_to_root`` drives ``su -``/``sudo su -`` on the
+            # resulting mtc shell). Keeping the inner command a bare shell
+            # lets the helper run multiple escalation attempts
+            # interactively, which the inner ``su -`` form couldn't do.
             ssh_seat_cmd = (
                 f"ssh -o StrictHostKeyChecking=accept-new "
                 f"-o UserKnownHostsFile=/dev/null "
-                f"-tt mtc@{seat} 'sudo -S su -'"
+                f"-tt mtc@{seat}"
             )
             log(f"SEAT: {ssh_seat_cmd}")
             sh.buf = ""
@@ -1137,28 +1250,26 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
             sh.buf = ""
             sh.send_line(mtc_password + "\n")
 
-            # Wait for either a second password prompt (sudo on the seat)
-            # OR an auth failure ("Permission denied") from the inner ssh.
-            end_at = time.time() + 12
-            outcome = None  # 'sudo' | 'auth_fail'
+            # Wait for either an mtc shell prompt OR an auth failure
+            # from the inner ssh. Auth failure triggers a one-shot
+            # fallback to the bct path (the gateway might be one of
+            # those that rejects ``ssh mtc@`` outright).
+            end_at = time.time() + 15
+            outcome = None  # 'mtc' | 'auth_fail'
             while time.time() < end_at and outcome is None:
                 sh._pull()
                 low = sh.buf.lower()
                 if "permission denied" in low:
                     outcome = 'auth_fail'
-                elif re.search(r"(?i)password[^\n]*:", sh.buf):
-                    outcome = 'sudo'
+                elif re.search(r"\[?mtc@[^\s\]]+[^\n]*[\]#$] ?", sh.buf):
+                    outcome = 'mtc'
                 else:
                     time.sleep(0.1)
 
             if outcome == 'auth_fail':
-                # The gateway might be one of those that rejects
-                # `ssh mtc@` outright. Try bct as a one-shot fallback
-                # before giving up — this lets the user reach seats on
-                # gateways they didn't know had bct installed.
+                # Discard the failed ssh session and retry through bct
+                # — same fallback path as before.
                 log(f"SEAT: mtc@{seat} rejected SSH password — retrying with `bct login -h`", "WARNING")
-                # Discard the failed ssh session by sending Ctrl-C / exit,
-                # then probe bct and walk the bct path.
                 try:
                     sh.send_line("\x03\n")
                     time.sleep(0.2)
@@ -1166,8 +1277,6 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
                     time.sleep(0.2)
                 except Exception:
                     pass
-                # Force a re-probe (in case the cache said "no bct" but
-                # the gateway actually had bct).
                 try:
                     del jump._has_bct
                 except Exception:
@@ -1176,29 +1285,21 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
                 sh = jump.shell()
                 sh.drain(quiet=1.0, maxwait=8)
                 # Recurse through the bct path by calling ourselves
-                # with the cache cleared. This avoids duplicating the
-                # bct/sudo logic above.
-                return _seat_root_shell_via_mtc(jump, seat, mtc_password, log)
+                # with the cache cleared.
+                return _seat_root_shell_via_mtc(jump, seat, mtc_password, log, root_password=root_pw)
 
             if outcome is None:
-                # No second prompt and no auth failure — either
-                # NOPASSWD sudo or the shell never came back. Let
-                # sudo-password branch decide.
-                log("SEAT: no second password prompt — assuming NOPASSWD sudo", "DEBUG")
-            else:
-                log("SEAT: sending mtc password for sudo")
-                time.sleep(0.2)
-                sh.buf = ""
-                sh.send_line(mtc_password + "\n")
-                if sh.wait_for(
-                    r"(?i)try again|incorrect password|authentication fail|"
-                    r"not in the sudoers|may not run sudo",
-                    3,
-                ):
-                    raise _SeatAuthError(
-                        "sudo rejected the password on this seat. The seat's "
-                        "sudo password must match the mtc password."
-                    )
+                raise _SeatSshError(
+                    f"ssh mtc@{seat} did not return an mtc prompt after "
+                    f"SSH login. Last output: {_clean(sh.buf)[-200:].strip()}"
+                )
+
+            log(f"SEAT: ssh mtc@{seat} reached mtc prompt")
+
+            # Hand off to the dual-try escalation helper — ``su -``
+            # with the root password first, ``sudo su -`` with mtc as
+            # fallback. Seat images differ on which is accepted.
+            _escalate_to_root(sh, root_pw, mtc_password, log)
 
         time.sleep(0.5)
 
@@ -1206,8 +1307,8 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log):
         out, _ = sh.run("id -u", timeout=10)
         if not re.search(r"^\s*0\s*$", out, re.M):
             raise _SeatSshError(
-                f"sudo -S su - did not land in root (id -u output: {out.strip()!r}). "
-                "Check the mtc password."
+                f"escalation did not land in root (id -u output: {out.strip()!r}). "
+                "Check the root password and the seat's sudoers configuration."
             )
 
         # Sanity check: confirm we're on a seat shell. `/data/misc/adb`
@@ -1776,6 +1877,17 @@ class SeatMixin:
                     self.run_on_main_thread(
                         lambda did=seat_device_id: self._try_auto_resume_mirror(did)
                     )
+                    # Also auto-open the mirror on a fresh click-to-connect
+                    # when no snapshot exists (or even when one does — the
+                    # resume path no-ops if the user already has a window).
+                    # See _finish_seat_connect_after_seizure_decision for
+                    # the flag's lifecycle.
+                    if (hasattr(self, '_pending_auto_mirror_seats')
+                            and seat in self._pending_auto_mirror_seats):
+                        self._pending_auto_mirror_seats.discard(seat)
+                        self.run_on_main_thread(
+                            lambda s=seat, g=gateway: self._open_mirror_for_seat(s, gateway=g)
+                        )
                 watcher.stop()
                 self.update_status(f"Connected to {seat}")
                 # Clear seized state on successful connection
@@ -1879,16 +1991,6 @@ class SeatMixin:
             "Click the seat button again to reconnect."
         )
 
-    def _warn_user_before_takeover(self, seat, gateway):
-        """Warn user that takeover is disruptive."""
-        from .safe_dialog import safe_multiline_dialog
-        safe_multiline_dialog(
-            self,
-            "Seat Takeover in Progress",
-            f"Seizing seat {seat} via {gateway}.\n\n"
-            "This will disconnect any other user currently using this device."
-        )
-
     def _on_manual_seizure_clicked(self, entry):
         """Handle manual seizure button click - explicitly attempt to take over a seat"""
         seat = entry.get('seat', '')
@@ -1902,9 +2004,8 @@ class SeatMixin:
         confirmed = safe_question_multiline(
             self,
             "Confirm Seat Takeover",
-            f"Manually seize control of {seat} via {gateway}?\n"
+            f"Manually take control of {seat} via {gateway}?\n"
             "This will forcibly disconnect any other user currently using this device.\n"
-            "The other user will receive a notification that their connection was seized."
         )
 
         if not confirmed:
@@ -2380,19 +2481,6 @@ class SeatMixin:
                     tooltip_text += f"\n\nFull gateway: {entry['gateway']}"
                 btn.setToolTip(tooltip_text)
 
-            # Play button for opening the embedded mirror window (tightly attached, no gap, no border)
-            play_btn = QPushButton("▶")
-            play_btn.setMaximumWidth(40)
-            play_btn.setMinimumWidth(40)
-            play_btn.setMaximumHeight(50)
-            play_btn.setMinimumHeight(50)
-            play_btn.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
-            play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            # Pass both seat and gateway to ensure correct device selection
-            play_btn.clicked.connect(lambda checked=False, seat=entry['seat'], gw=entry['gateway'], b=play_btn: self._scrcpy_via_seat(seat, gateway=gw, source_button=b))
-            play_btn.setToolTip("Open mirror window")
-            play_btn.setStyleSheet("QPushButton { border: none; padding: 0px; margin: 0px; } QPushButton:hover { background-color: #888; }")
-
             # Remove-from-history button (✕).  Same compact styling as the
             # play button so the row stays uniform; red on hover to signal
             # destructive action without a separate confirmation (we *do*
@@ -2421,7 +2509,6 @@ class SeatMixin:
             )
 
             container_layout.addWidget(btn, 1)  # Button takes available space
-            container_layout.addWidget(play_btn, 0)  # Play button stays fixed
 
             # Add seizure button for offline/missing devices - gives users
             # explicit control to take over. ``None`` is included because a
@@ -2728,9 +2815,31 @@ class SeatMixin:
                     self.log("Password required to connect", "ERROR")
                     return
             self.update_status(f"🔌 Connecting to seat {seat} via {gateway}...")
+            # Root password (used by ``su -`` on the seat) is distinct
+            # from the gateway/mtc passwords. All seats share one root
+            # password (mirrors the gateway/mtc model). If the user
+            # hasn't saved one yet, prompt and auto-save it.
+            root_password = self.credential_manager.get_global_root_password()
+            if not root_password:
+                self.update_status(f"🔑 Root password required for {seat}...")
+                root_password, ok = QInputDialog.getText(
+                    self,
+                    "Root Password Required",
+                    f"Enter the root password for seat {seat} (used for ``su -``):",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok or not root_password:
+                    self._unmark_button_busy(busy_token)
+                    self.update_status(f"❌ Connection cancelled — no root password for {seat}")
+                    self.log("Root password required to connect", "ERROR")
+                    return
+                # Auto-save: all seats share the same root password.
+                self.credential_manager.set_global_root_password(root_password)
+                self.log("Cached root password saved to Keychain", "INFO")
             self.connect_seat(
                 entry['seat'], entry['gateway'],
                 device_password=password, mtc_password=password,
+                root_password=root_password,
                 _busy_token=busy_token,
             )
 
@@ -2810,6 +2919,11 @@ class SeatMixin:
         Removes the entry from the on-disk history file and rebuilds the
         list.  Called from the GUI thread so the QMessageBox.question() and
         the post-delete refresh are both safe.
+
+        If the seat is currently connected via this same gateway, disconnect
+        it first — otherwise removing the history entry would leave a live
+        SSH tunnel + adb port-forward behind with no UI trail to disconnect
+        it from.
         """
         if not entry:
             return
@@ -2819,15 +2933,46 @@ class SeatMixin:
         if not seat or not gateway:
             return
 
+        # Same-gateway check as _on_seat_clicked: a seat can be in history
+        # under multiple gateways, and we only want to tear down the tunnel
+        # that the current entry points to. Using the same predicate keeps
+        # this code consistent with what the seat button itself shows as
+        # connected.
+        is_live = (
+            self.seat_port_manager.is_seat_connected(seat)
+            and self.seat_port_manager.connected_seats.get(seat) == gateway
+        )
+
         from .safe_dialog import safe_question_multiline
+        if is_live:
+            msg = (
+                f"Remove '{seat}' (port {port or 'auto'}) via {gateway} from seat history?\n\n"
+                f"This seat is currently CONNECTED — it will be disconnected and "
+                f"the SSH tunnel torn down before the entry is removed."
+            )
+        else:
+            msg = (
+                f"Remove '{seat}' (port {port or 'auto'}) via {gateway} from seat history?\n\n"
+                f"This only removes the entry from the list — it does not disconnect anything."
+            )
         confirmed = safe_question_multiline(
             self,
             "Remove seat from history?",
-            f"Remove '{seat}' (port {port or 'auto'}) via {gateway} from seat history?\n\n"
-            f"This only removes the entry from the list — it does not disconnect anything.",
+            msg,
         )
         if not confirmed:
             return
+
+        if is_live:
+            # Disconnect the seat first so we don't leave a live SSH tunnel
+            # + adb reverse port-forward pointing at a history entry that's
+            # about to disappear. disconnect_seat also closes any open
+            # mirror window for this seat via the watcher flow.
+            self.update_status(f"🔌 Disconnecting {seat} before removing history...")
+            try:
+                self.disconnect_seat(seat)
+            except Exception as e:
+                self.log(f"Failed to disconnect seat {seat} before removing history: {e}", "WARNING")
 
         removed = self.seat_port_manager.remove_history_entry(
             entry_type='seat',
@@ -2852,6 +2997,11 @@ class SeatMixin:
         Removes the entry from the on-disk history file and rebuilds the
         list.  Same shape as _on_remove_seat_history_clicked but matches
         the portforward file's column layout.
+
+        If the port forward matching this entry's gateway is currently
+        active, stop it before removing the history entry — otherwise
+        the SSH tunnels for every port on that rack keep running with no
+        UI trail to tear them down.
         """
         if not entry:
             return
@@ -2862,15 +3012,57 @@ class SeatMixin:
         if not rack or not user_at_rack:
             return
 
+        is_live = self.seat_port_manager.is_portforward_connected(user_at_rack)
+
+        # Same active-rack check as _on_portforward_clicked: the
+        # script-side "active" status is the authoritative source of truth
+        # (the internal ``connected_portforward`` state is keyed on the
+        # bare hostname, but the history entries we get from disk have
+        # ``user@rack``). Without this secondary check the remove button
+        # would only notice live forwards when the internal cache happens
+        # to match the entry's gateway string.
+        if not is_live:
+            try:
+                pf_status = self.seat_port_manager.get_portforward_status()
+                if pf_status and pf_status.get('active'):
+                    active_rack = (
+                        (pf_status.get('rack') or '')
+                        .split('@')[-1].strip()
+                    )
+                    if active_rack and active_rack in user_at_rack:
+                        is_live = True
+            except Exception:
+                pass
+
         from .safe_dialog import safe_question_multiline
+        if is_live:
+            msg = (
+                f"Remove rack '{rack}' ({user_at_rack}) from port-forward history?\n\n"
+                f"This port forward is currently ACTIVE — the SSH tunnels for "
+                f"every port on this rack will be torn down before the entry is removed."
+            )
+        else:
+            msg = (
+                f"Remove rack '{rack}' ({user_at_rack}) from port-forward history?\n\n"
+                f"This only removes the entry from the list — it does not stop anything."
+            )
         confirmed = safe_question_multiline(
             self,
             "Remove port forward from history?",
-            f"Remove rack '{rack}' ({user_at_rack}) from port-forward history?\n\n"
-            f"This only removes the entry from the list — it does not stop anything.",
+            msg,
         )
         if not confirmed:
             return
+
+        if is_live:
+            # Stop the active port forward first so we don't leave a live
+            # set of SSH tunnels pointing at a history entry that's about
+            # to disappear.
+            self.update_status(f"🔌 Stopping port forward for {rack} before removing history...")
+            try:
+                self.disconnect_portforward()
+            except Exception as e:
+                self.log(f"Failed to stop port forward {rack} before removing history: {e}", "WARNING")
 
         removed = self.seat_port_manager.remove_history_entry(
             entry_type='portforward',
@@ -2929,7 +3121,8 @@ class SeatMixin:
             self.log(f"Error checking port forward status: {e}", "ERROR")
 
     def connect_seat(self, seat, gateway, install_adb_key=False, adb_key=None,
-                  device_password=None, mtc_password=None, _busy_token=None):
+                  device_password=None, mtc_password=None, root_password=None,
+                  _busy_token=None):
         """Connect to a seat"""
         self.log(f"Connecting to seat {seat} via {gateway}...")
         self.update_status(f"🔌 Connecting to seat {seat} via {gateway}...")
@@ -2951,6 +3144,7 @@ class SeatMixin:
         self._pending_adb_key = adb_key if install_adb_key else None
         self._pending_device_password = device_password
         self._pending_mtc_password = mtc_password
+        self._pending_root_password = root_password
         # Pending button-busy token so the button-stays-busy animation
         # outlives the click handler and is restored once the connect
         # attempt finishes (success OR failure). Restored in the
@@ -2978,6 +3172,15 @@ class SeatMixin:
                 self.log("Password required to connect", "ERROR")
                 self.update_status(f"❌ Connection cancelled — no password for {seat}")
                 return
+
+        # If the caller didn't pass an explicit root password (used by
+        # ``su -``), look it up in Keychain. Falls back to None — the
+        # install path then falls back to mtc_password for backwards
+        # compatibility.
+        if root_password is None:
+            root_password = self.credential_manager.get_global_root_password()
+        self._pending_root_password = root_password
+
         self.update_status(f"🔌 Establishing SSH tunnel to seat {seat}...")
 
         def do_connect():
@@ -3316,7 +3519,8 @@ class SeatMixin:
                                             install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                             adb_key=getattr(self, '_pending_adb_key', None),
                                             device_password=getattr(self, '_pending_device_password', None),
-                                            mtc_password=getattr(self, '_pending_mtc_password', None))
+                                            mtc_password=getattr(self, '_pending_mtc_password', None),
+                                            root_password=getattr(self, '_pending_root_password', None))
                     self.run_on_main_thread(self._sync_refresh_panels)
                     self.run_on_main_thread(self._finalize_seat_connect_busy)
                     self.run_on_main_thread(show_error)
@@ -3348,7 +3552,8 @@ class SeatMixin:
                                         install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                         adb_key=getattr(self, '_pending_adb_key', None),
                                         device_password=getattr(self, '_pending_device_password', None),
-                                        mtc_password=getattr(self, '_pending_mtc_password', None))
+                                        mtc_password=getattr(self, '_pending_mtc_password', None),
+                                        root_password=getattr(self, '_pending_root_password', None))
                 self.run_on_main_thread(show_timeout_error)
             except Exception as e:
                 self.log(f"Error connecting to seat: {str(e)}", "ERROR")
@@ -3376,34 +3581,35 @@ class SeatMixin:
                                         install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                         adb_key=getattr(self, '_pending_adb_key', None),
                                         device_password=getattr(self, '_pending_device_password', None),
-                                        mtc_password=getattr(self, '_pending_mtc_password', None))
+                                        mtc_password=getattr(self, '_pending_mtc_password', None),
+                                        root_password=getattr(self, '_pending_root_password', None))
                 self.run_on_main_thread(show_error)
 
         threading.Thread(target=do_connect, daemon=True).start()
 
     def _install_adb_key_on_seat(self, seat, gateway, adb_key,
-                                 gateway_password, mtc_password):
+                                 gateway_password, mtc_password, root_password=None):
         """Install the user's ADB public key on the seat.
 
-        Flow (per the user's preference — single mtc password covers both
-        SSH login and sudo on the seat):
+        Flow (per the user's preference — three passwords: gateway for SSH
+        into the jump host, mtc for SSH into the seat, root for ``su -``
+        on the seat):
 
           1. Open a paramiko SSH connection to the gateway (using the gateway
              password). Honours ``~/.ssh/config`` for ``ProxyCommand``
              (``*.vrack`` HTTPS tunnels).
           2. Open an interactive PTY shell on the gateway, then run
-             ``ssh -t mtc@<seat> 'sudo -S su -'``.
-          3. Feed the mtc password for SSH login, then again for the sudo
-             prompt on the seat.
+             ``ssh -t mtc@<seat> 'su -'`` (or the bct equivalent).
+          3. Feed the mtc password for SSH login, then the root password
+             for the ``su`` prompt on the seat.
           4. Verify we're root on the seat (``id -u`` = 0 and
              ``/data/misc/adb`` exists, creating the dir if necessary).
           5. Dedup-check, then append ``adb_key`` to
              ``/data/misc/adb/adb_keys`` and verify by reading it back.
 
-        Replaces the old ``seat.sh setup-adbkey`` bash approach, which couldn't
-        reliably ferry the key into a `sudo -S su -c '...'` block (stdin was
-        consumed by sudo) and surfaced openssl cert warnings from the user's
-        ``~/.ssh/config`` ProxyCommand as connection errors.
+        If ``root_password`` is None, falls back to ``mtc_password`` so
+        older seat images (where mtc and root shared a credential) still
+        work.
         """
         if paramiko is None:
             self.log(
@@ -3429,7 +3635,10 @@ class SeatMixin:
             sh = None
             try:
                 jump = _SeatJumpHost(gateway, gateway_password, log=self.log)
-                sh = _seat_root_shell_via_mtc(jump, seat, mtc_password, log=self.log)
+                sh = _seat_root_shell_via_mtc(
+                    jump, seat, mtc_password, log=self.log,
+                    root_password=root_password,
+                )
                 key_was_installed = _push_adb_key(sh, adb_key, log=self.log)
                 if key_was_installed:
                     self.log(f"ADB key installed on seat {seat}", "INFO")
@@ -3452,15 +3661,25 @@ class SeatMixin:
                     lambda: self._reconnect_seat_device_after_install(seat_dev),
                 )
             except _SeatAuthError as e:
-                # Wrong mtc password (cached or freshly typed). Re-prompt on
-                # the GUI thread, update the cache, and retry once.
+                # Wrong mtc OR root password (cached or freshly typed).
+                # The ``kind`` attribute tells us which prompt to show —
+                # ``mtc`` for the SSH login, ``root`` for the ``su -``
+                # password on the seat.
                 self.log(f"Failed to install ADB key: {e}", "ERROR")
-                self.log("Cached mtc password may be wrong — prompting again.", "INFO")
-                self.run_on_main_thread(
-                    lambda: self._retry_install_adb_key_with_new_mtc_password(
-                        seat, gateway, adb_key, gateway_password, seat_dev
-                    ),
-                )
+                if getattr(e, 'kind', 'mtc') == 'root':
+                    self.log("Cached root password may be wrong — prompting again.", "INFO")
+                    self.run_on_main_thread(
+                        lambda: self._retry_install_adb_key_with_new_root_password(
+                            seat, gateway, adb_key, gateway_password, mtc_password, seat_dev,
+                        ),
+                    )
+                else:
+                    self.log("Cached mtc password may be wrong — prompting again.", "INFO")
+                    self.run_on_main_thread(
+                        lambda: self._retry_install_adb_key_with_new_mtc_password(
+                            seat, gateway, adb_key, gateway_password, seat_dev
+                        ),
+                    )
             except _SeatSshError as e:
                 self.log(f"Failed to install ADB key: {e}", "ERROR")
             except Exception as e:
@@ -3547,8 +3766,41 @@ class SeatMixin:
         # codebase (which uses mtc_global) sees the updated password.
         self.credential_manager.set_global_mtc_password(new_mtc)
         self.log("Cached mtc password updated. Retrying install...", "INFO")
+        # Reuse the cached root password (or fall back to mtc for
+        # backwards-compat seat images). If the user's seat images
+        # require a separate root password and they typed a fresh mtc,
+        # the install will fail again with the root prompt — at which
+        # point _retry_install_adb_key_with_new_root_password takes over.
+        root_pw = getattr(self, '_pending_root_password', None) or new_mtc
         self._install_adb_key_on_seat(
             seat, gateway, adb_key, gateway_password, new_mtc,
+            root_password=root_pw,
+        )
+
+    def _retry_install_adb_key_with_new_root_password(self, seat, gateway, adb_key,
+                                                      gateway_password, mtc_password,
+                                                      seat_dev):
+        """GUI-thread handler: re-prompt for the root password (the cached one
+        was wrong on the ``su -`` prompt), update the cache, then re-spawn
+        the install worker.
+        """
+        new_root, ok = QInputDialog.getText(
+            self, "Wrong Root Password",
+            f"The cached root password was rejected by the ``su -`` prompt on {seat}.\n\n"
+            "Enter the correct root password:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not new_root:
+            self.log("Root password prompt cancelled — install aborted.", "ERROR")
+            return
+        # Persist to the global root keychain entry. All seats share the
+        # same root password (matches the gateway/mtc password model).
+        self.credential_manager.set_global_root_password(new_root)
+        self._pending_root_password = new_root
+        self.log("Cached root password updated. Retrying install...", "INFO")
+        self._install_adb_key_on_seat(
+            seat, gateway, adb_key, gateway_password, mtc_password,
+            root_password=new_root,
         )
 
     def takeover_seat(self, seat, gateway=None, silent=True, on_ready=None):
@@ -3628,6 +3880,16 @@ class SeatMixin:
                 or gateway_password  # last resort: try same cred as gateway
             )
 
+            # Root password is used by ``su -`` on the seat — distinct
+            # from the mtc password. All seats share one global root
+            # password. Falls back to mtc_password for backwards
+            # compatibility with seat images where root == mtc.
+            root_password = (
+                self.credential_manager.get_global_root_password()
+                or getattr(self, '_pending_root_password', None)
+                or mtc_password
+            )
+
             if not gateway_password:
                 if silent:
                     self.log(
@@ -3657,10 +3919,6 @@ class SeatMixin:
                         self.log("Takeover aborted: missing mtc password.", "ERROR")
                         return
 
-            # Warn the user that this is a disruptive action
-            if not silent:
-                self.run_on_main_thread(lambda: self._warn_user_before_takeover(seat, gateway_norm))
-
             # Single log line for the whole takeover — the per-step
             # "Stopping adbd / Starting adbd / Racing / etc." messages
             # were too noisy and didn't add information beyond the
@@ -3673,7 +3931,10 @@ class SeatMixin:
             sh = None
             try:
                 jump = _SeatJumpHost(gateway_norm, gateway_password, log=self.log)
-                sh = _seat_root_shell_via_mtc(jump, seat, mtc_password, log=self.log)
+                sh = _seat_root_shell_via_mtc(
+                    jump, seat, mtc_password, log=self.log,
+                    root_password=root_password,
+                )
                 # Use stop + start sequence instead of restart for reliability
                 out1, code1 = sh.run("setprop ctl.stop adbd", timeout=8)
                 time.sleep(1)  # Give adbd moment to fully stop before restarting
@@ -3838,14 +4099,9 @@ class SeatMixin:
             confirmed = safe_question_multiline(
                 self,
                 "Device Connection Transfer",
-                f"The seat {seat} is not free — another session may have it.\n"
-                f"The device {device_id} was found in `adb devices` (status may be "
+                f"The device {device_id} / seat {seat} was found in `adb devices` (status may be "
                 f"offline/missing — could be another user, or the device may be dead).\n\n"
-                "Attempt to take over this seat?\n"
-                "This will restart adbd on the device and disconnect any other user "
-                "(they will receive an Android notification).\n\n"
-                "Note: if the device is dead or powered off, this will fail.\n"
-                "Click 'No' to abort this connection.",
+                "Attempt to take over this seat? This will disconnect any other user.\n"
             )
             if not confirmed:
                 # The user said No — but the device may have settled to
@@ -3986,11 +4242,13 @@ class SeatMixin:
         Installs the ADB key if requested, starts the device watcher, and
         updates the UI panels + busy-token release.
         """
-        # Install ADB key if requested. Only needs gateway + mtc passwords
-        # (mtc is reused for SSH login and sudo on the seat).
+        # Install ADB key if requested. Needs gateway, mtc and root
+        # passwords (root is separate from mtc — see
+        # [[separation-of-gateway-mtc-and-root-passwords]]).
         adb_key = getattr(self, '_pending_adb_key', None)
         device_password = getattr(self, '_pending_device_password', None)
         mtc_password = getattr(self, '_pending_mtc_password', None)
+        root_password = getattr(self, '_pending_root_password', None)
         if adb_key and device_password and mtc_password:
             # Wait for the seat port forward (5555) to become available so
             # adb devices shows the device IP. The dialog may have eaten
@@ -4000,6 +4258,7 @@ class SeatMixin:
             threading.Thread(
                 target=self._install_adb_key_on_seat,
                 args=(seat, gateway, adb_key, device_password, mtc_password),
+                kwargs={"root_password": root_password},
                 daemon=True,
             ).start()
             self.log("ADB key installation thread started", "INFO")
@@ -4009,6 +4268,15 @@ class SeatMixin:
             # install is actually happening — not a constant
             # "not installing" line on every normal seat connect.
             self.log("Not installing ADB key (missing credentials or flag)", "DEBUG")
+
+        # Mark this seat so the device watcher auto-opens the mirror window
+        # the first time it observes status='device'. Set BEFORE the
+        # watcher is started (next line) so the flag is in place when the
+        # watcher begins polling. Cleared by the watcher on success so the
+        # mirror is only opened ONCE per click-to-connect.
+        if not hasattr(self, '_pending_auto_mirror_seats'):
+            self._pending_auto_mirror_seats = set()
+        self._pending_auto_mirror_seats.add(seat)
 
         self.log(f"Seat connected on port {port}", "INFO")
         self.update_status(f"Connected to {seat}")
@@ -5025,20 +5293,18 @@ class SeatMixin:
                 self.credential_manager.set_global_gateway_password(gateway_password)
 
             mtc_password = None
+            root_password = None
             if install_adb_key:
-                # Single mtc password covers both the SSH login to the seat
-                # and the sudo prompt on the seat (the user's flow: ssh to
-                # gateway, then `ssh -t mtc@<seat> 'sudo -S su -'` using the
-                # same password twice). The mtc password is the same across ALL
-                # seats and gateways, so we cache it under one canonical key
-                # and only re-prompt if the install fails with auth error.
+                # mtc password covers the SSH login to the seat. The root
+                # password (used by ``su -`` on the seat) is distinct from
+                # mtc — see [[separation-of-gateway-mtc-and-root-passwords]].
+                # Both are global (same across all seats/gateways).
                 mtc_key = "mtc_global"
                 mtc_password = self.credential_manager.get_mtc_password_with_fallback()
                 if not mtc_password:
                     mtc_password, ok = QInputDialog.getText(
                         dialog, "MTC Password",
-                        "Enter mtc password "
-                        "(used for SSH login and sudo on the seat):",
+                        "Enter mtc password (used for SSH login to the seat):",
                         QLineEdit.EchoMode.Password
                     )
                     if not ok or not mtc_password:
@@ -5049,12 +5315,28 @@ class SeatMixin:
                     # Mirror to the canonical global mtc key too.
                     self.credential_manager.set_global_mtc_password(mtc_password)
 
+                # Root password — only ask if not already cached. Falls back
+                # to mtc_password for backwards-compat seat images where
+                # root == mtc; the retry handler will catch real mismatches.
+                root_password = self.credential_manager.get_global_root_password()
+                if not root_password:
+                    root_password, ok = QInputDialog.getText(
+                        dialog, "Root Password",
+                        "Enter root password (used for ``su -`` on the seat — "
+                        "may be the same as mtc):",
+                        QLineEdit.EchoMode.Password
+                    )
+                    if not ok or not root_password:
+                        return
+                    self.credential_manager.set_global_root_password(root_password)
+
             # Use the existing connect_seat method. device_password is the
-            # gateway SSH password; mtc_password covers both the seat's SSH
-            # login and the sudo prompt on the seat.
+            # gateway SSH password; mtc_password is for SSH login to the
+            # seat; root_password is fed to ``su -`` on the seat (distinct
+            # from mtc — see [[separation-of-gateway-mtc-and-root-passwords]]).
             self.connect_seat(seat_name, gateway, install_adb_key=install_adb_key,
                             adb_key=adb_key, device_password=gateway_password,
-                            mtc_password=mtc_password)
+                            mtc_password=mtc_password, root_password=root_password)
             dialog.accept()
 
         connect_btn.clicked.connect(on_connect)

@@ -174,6 +174,7 @@ class CredentialManager:
     # that work across all gateways/users.
     GLOBAL_GATEWAY_ACCOUNT = "user@gateway_global"
     GLOBAL_MTC_ACCOUNT = "mtc@mtc_global"
+    GLOBAL_ROOT_ACCOUNT = "root@root_global"
 
     def get_global_gateway_password(self):
         """Retrieve the shared gateway password (used for any gateway)."""
@@ -191,6 +192,14 @@ class CredentialManager:
     def set_global_mtc_password(self, password):
         """Store the shared mtc password."""
         return self.set_password("mtc_global", "mtc", password)
+
+    def get_global_root_password(self):
+        """Retrieve the shared root password (used for ``su -`` on any seat)."""
+        return self.get_password("root_global", "root")
+
+    def set_global_root_password(self, password):
+        """Store the shared root password."""
+        return self.set_password("root_global", "root", password)
 
     def get_gateway_password_with_fallback(self, gateway, user):
         """Look up a gateway password, falling back to the global one.
