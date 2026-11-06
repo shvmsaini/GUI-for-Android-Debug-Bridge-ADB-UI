@@ -1004,132 +1004,170 @@ def _clean_adb_key_line(raw_lines):
     return ""
 
 
+# Auth-failure markers that show up on stderr/stdout across seat images.
+# Kept module-level so both escalation attempts reuse the same set.
+_AUTH_FAIL_MARKERS = (
+    "permission denied",
+    "incorrect password",
+    "authentication failure",
+    "su: authentication failure",
+    "not in the sudoers",
+    "may not run sudo",
+    "try again",
+)
+
+
 def _escalate_to_root(sh, root_pw, mtc_pw, log):
     """Escalate an mtc shell on a seat to a root shell.
 
-    Seat images vary in which escalation primitive they accept:
+    Seat images vary in which escalation primitive they accept. We try a
+    sequence of (command, password) pairs and stop at the first one that
+    actually lands us in root (verified via ``id -u`` = 0 — the prompt
+    alone isn't reliable, since some seats use a custom PS1):
 
-      1. ``su -`` — uses a separate root password (distinct from mtc).
-         Some seats are configured this way; ``su`` rejects the mtc
-         password and demands the dedicated root one.
-      2. ``sudo su -`` — ``sudo`` is set up to reuse the mtc password
-         (``mtc`` is in ``sudoers`` with ``NOPASSWD`` or with password =
-         mtc). ``sudo`` rejects ``su -`` with the same root password in
-         this configuration.
+      1. ``su -`` with the dedicated root password — preferred because
+         it doesn't initialise a PAM session that may mount ``/data``
+         read-only (matters for adb_keys installer; harmless for the
+         file explorer).
+      2. ``sudo su -`` with the mtc password — covers seats where
+         ``mtc`` is in ``sudoers`` with password = mtc (or NOPASSWD).
+      3. ``sudo -i`` with the mtc password — some seats disable
+         ``sudo su -`` but allow direct ``sudo -i``.
+      4. ``sudo -s`` with the mtc password — last resort; opens a
+         non-login shell but still gives uid 0.
 
-    We try ``su -`` first (matches the working bundled-script path and
-    is the path the user told us is preferred). If the seat rejects the
-    root password, fall back to ``sudo su -`` with the mtc password —
-    silently, because the seat's sudoers configuration is seat-local
-    and the user shouldn't be pestered about it on every install.
+    We try ALL of these — the user explicitly asked for both ``su -``
+    and ``sudo`` to be attempted, even on the bct path, because seat
+    images are heterogeneous and no single escalation primitive works
+    everywhere. See ``[[seat-root-escalation-multi-attempt]]``.
 
-    ``su -`` is preferred over ``sudo -i`` because on some seat images
-    ``sudo -i`` initialises a PAM session that mounts ``/data`` as
-    read-only or otherwise blocks writing to ``/data/misc/adb`` — even
-    though ``id -u`` still returns 0.
+    For each attempt:
+      - Wait up to 12s for a password prompt OR an auth-failure line.
+      - On silent timeout (no prompt, no failure), check ``id -u`` — if
+        we're already root, return; otherwise move to the next attempt.
+      - After sending the password, wait up to 8s for either an
+        auth-failure line or a root prompt; then verify with ``id -u``
+        because some seats use a custom PS1 that doesn't include
+        ``root@``.
 
-    Raises ``_SeatAuthError(kind="root")`` if BOTH attempts fail.
+    Raises ``_SeatAuthError(kind="root")`` if every attempt fails.
 
-    Does NOT verify ``id -u`` — the caller does that after this returns
-    so a single error path covers both escalation routes.
+    Does NOT verify ``id -u`` on the final return — the caller does that
+    after this returns so a single error path covers all escalation
+    routes. The internal ``id -u`` checks here are only used to decide
+    whether to advance to the next attempt.
     """
-    # ── Attempt 1: ``su -`` with the dedicated root password ─────────
-    sh.buf = ""
-    sh.send_line("su -\n")
 
-    outcome = None  # 'pwd' (we saw a password prompt) | 'auth_fail' | 'silent' (no prompt — root may already be active)
-    end_at = time.time() + 12
-    while time.time() < end_at and outcome is None:
-        sh._pull()
+    def _buf_has_auth_fail():
         low = sh.buf.lower()
-        if (
-            "permission denied" in low
-            or "incorrect password" in low
-            or "authentication failure" in low
-            or "su: authentication failure" in low
-        ):
-            outcome = 'auth_fail'
-        elif re.search(r"(?i)password[^\n]*:", sh.buf):
-            outcome = 'pwd'
-        else:
-            time.sleep(0.1)
+        return any(m in low for m in _AUTH_FAIL_MARKERS)
 
-    if outcome == 'auth_fail':
-        log("SEAT: su rejected root password — falling back to sudo su -", "INFO")
-    elif outcome is None:
-        # No prompt and no failure: root may already be active. Leave
-        # the helper and let id -u verify.
-        log("SEAT: no su password prompt — root may already be active", "DEBUG")
-        return
-    else:
-        log("SEAT: sending root password for su")
+    def _wait_for_prompt_or_fail(timeout):
+        """Watch the buffer until we see a password prompt or an auth-fail.
+
+        Returns 'pwd' | 'auth_fail' | None (timeout).
+        """
+        end_at = time.time() + timeout
+        while time.time() < end_at:
+            sh._pull()
+            if _buf_has_auth_fail():
+                return 'auth_fail'
+            if re.search(r"(?i)password[^\n]*:", sh.buf):
+                return 'pwd'
+            time.sleep(0.1)
+        return None
+
+    def _wait_for_root_or_fail(timeout):
+        """After sending a password, watch for auth-fail or a root prompt.
+
+        Returns 'auth_fail' | 'root' | None (silent timeout).
+        """
+        end_at = time.time() + timeout
+        while time.time() < end_at:
+            sh._pull()
+            if _buf_has_auth_fail():
+                return 'auth_fail'
+            if re.search(r"\[?root@[^\s\]]*[^\n]*[\]#$] ?", sh.buf):
+                return 'root'
+            time.sleep(0.1)
+        return None
+
+    def _check_already_root():
+        """Run ``id -u`` and return True if the shell is already uid 0."""
+        try:
+            out, _ = sh.run("id -u", timeout=8)
+            return bool(re.search(r"^\s*0\s*$", out, re.M))
+        except Exception:
+            return False
+
+    def _try_attempt(cmd, password, label, prompt_timeout=12, post_pw_timeout=8):
+        """Run one escalation attempt.
+
+        Returns True on success (we're root), False on failure (try next).
+
+        Per-attempt progress is intentionally silent — the caller logs
+        a single line on success/failure of the whole sequence so the
+        GUI log panel doesn't drown in 'attempt 1/4 ... attempt 2/4 ...
+        attempt 3/4 ...' noise on every seat connect.
+        """
+        sh.buf = ""
+        sh.send_line(cmd + "\n")
+
+        outcome = _wait_for_prompt_or_fail(prompt_timeout)
+
+        if outcome == 'auth_fail':
+            return False
+
+        if outcome is None:
+            # No prompt, no failure marker. Could mean (a) we already
+            # landed in root silently (e.g. NOPASSWD sudo), or (b) the
+            # command does not exist on this seat. Verify with id -u.
+            if _check_already_root():
+                return True
+            return False
+
+        # Got a password prompt — send the password.
         time.sleep(0.2)
         sh.buf = ""
-        sh.send_line(root_pw + "\n")
-        if sh.wait_for(
-            r"(?i)su: authentication failure|incorrect password|"
-            r"authentication fail",
-            3,
-        ):
-            log("SEAT: su rejected root password — falling back to sudo su -", "INFO")
-        else:
-            return  # Either accepted or no failure indicator — let id -u verify.
+        sh.send_line(password + "\n")
 
-    # ── Attempt 2: ``sudo su -`` with the mtc password ───────────────
-    # Some seat images have ``mtc`` in sudoers with password = mtc (or
-    # NOPASSWD). ``su -`` is rejected in those configurations because
-    # root is locked behind a separate password; ``sudo su -`` reuses
-    # the mtc credential to land in root.
-    sh.buf = ""
-    sh.send_line("sudo su -\n")
+        post = _wait_for_root_or_fail(post_pw_timeout)
+        if post == 'auth_fail':
+            return False
+        if post == 'root':
+            return True
 
-    outcome = None
-    end_at = time.time() + 12
-    while time.time() < end_at and outcome is None:
-        sh._pull()
-        low = sh.buf.lower()
-        if (
-            "permission denied" in low
-            or "incorrect password" in low
-            or "authentication failure" in low
-            or "not in the sudoers" in low
-            or "may not run sudo" in low
-            or "try again" in low
-        ):
-            outcome = 'auth_fail'
-        elif re.search(r"(?i)password[^\n]*:", sh.buf):
-            outcome = 'pwd'
-        else:
-            time.sleep(0.1)
+        # Silent timeout: neither auth-fail nor root prompt arrived.
+        # Verify with id -u before giving up — some seats use a custom
+        # PS1 that doesn't match the root prompt regex.
+        if _check_already_root():
+            return True
+        return False
 
-    if outcome == 'auth_fail':
-        raise _SeatAuthError(
-            "Neither ``su -`` (with the dedicated root password) nor "
-            "``sudo su -`` (with the mtc password) worked on this seat. "
-            "Verify the root password and that mtc is in sudoers.",
-            kind="root",
-        )
+    # Sequence of (command, password, label). Order matters: prefer ``su -``
+    # because it avoids PAM session quirks that affect /data writes; fall
+    # back through sudo variants for seats that lock ``su`` behind sudo.
+    attempts = [
+        ("su -",     root_pw, "attempt 1/4 (su - + root pw)"),
+        ("sudo su -", mtc_pw, "attempt 2/4 (sudo su - + mtc pw)"),
+        ("sudo -i",   mtc_pw, "attempt 3/4 (sudo -i + mtc pw)"),
+        ("sudo -s",   mtc_pw, "attempt 4/4 (sudo -s + mtc pw)"),
+    ]
 
-    if outcome is None:
-        # No prompt — sudo may be NOPASSWD or we're already root.
-        log("SEAT: no sudo password prompt — sudo may be NOPASSWD", "DEBUG")
-        return
+    for cmd, pw, label in attempts:
+        if _try_attempt(cmd, pw, label):
+            log(f"SEAT: escalation succeeded via {label}", "INFO")
+            return
+        log(f"SEAT: escalation {label} did not land in root", "DEBUG")
 
-    log("SEAT: sending mtc password for sudo su -")
-    time.sleep(0.2)
-    sh.buf = ""
-    sh.send_line(mtc_pw + "\n")
-    if sh.wait_for(
-        r"(?i)try again|incorrect password|authentication fail|"
-        r"not in the sudoers|may not run sudo|su: authentication failure",
-        3,
-    ):
-        raise _SeatAuthError(
-            "Neither ``su -`` (with the dedicated root password) nor "
-            "``sudo su -`` (with the mtc password) worked on this seat. "
-            "Verify the root password and that mtc is in sudoers.",
-            kind="root",
-        )
+    raise _SeatAuthError(
+        "Tried every escalation path — "
+        "'su -' (with the root password), then 'sudo su -', 'sudo -i', "
+        "and 'sudo -s' (with the mtc password) — and none landed in "
+        "root. Verify the root password and that mtc is in sudoers "
+        "(NOPASSWD, or password = mtc).",
+        kind="root",
+    )
 
 
 def _seat_root_shell_via_mtc(jump, seat, mtc_password, log, root_password=None):
@@ -1148,12 +1186,12 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log, root_password=None):
     with the correct password. See ``[[bct-login-fallback-for-mtc-ssh]]``.
 
     Once we have an mtc shell on the seat (via either path), we hand off
-    to ``_escalate_to_root`` which tries ``su -`` with the dedicated
-    root password first and falls back to ``sudo su -`` with the mtc
-    password if the seat doesn't accept the root password. Seat images
-    differ on which escalation primitive they accept, so both attempts
-    happen on every connect — ``su -`` is the cheap path and ``sudo``
-    is the fallback that covers the rest.
+    to ``_escalate_to_root`` which tries ``su -`` (root password) first,
+    then ``sudo su -`` / ``sudo -i`` / ``sudo -s`` (mtc password) until
+    one of them lands in root. Seat images differ on which escalation
+    primitive they accept, so all four attempts happen on every connect
+    — ``su -`` is the cheap path and the sudo variants are fallbacks
+    that cover seats where ``su`` is locked or restricted.
 
     If ``root_password`` is None, falls back to ``mtc_password`` for
     backwards compatibility with older seat images where mtc and root
@@ -1217,18 +1255,20 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log, root_password=None):
                 )
             log(f"SEAT: bct login reached mtc prompt on {seat}")
 
-            # Hand off to the dual-try escalation helper — ``su -``
-            # with the root password first, ``sudo su -`` with mtc as
-            # fallback. Seat images differ on which is accepted.
+            # Hand off to the escalation helper — tries ``su -`` (root
+            # password) first, then ``sudo su -`` / ``sudo -i`` /
+            # ``sudo -s`` (mtc password) until one lands in root. See
+            # ``_escalate_to_root`` for the full sequence.
             _escalate_to_root(sh, root_pw, mtc_password, log)
         else:
             # Path 2: classic ssh -tt mtc@<seat>.
             #
             # We SSH into the seat as ``mtc`` (no inline ``su -`` here —
-            # ``_escalate_to_root`` drives ``su -``/``sudo su -`` on the
-            # resulting mtc shell). Keeping the inner command a bare shell
-            # lets the helper run multiple escalation attempts
-            # interactively, which the inner ``su -`` form couldn't do.
+            # ``_escalate_to_root`` drives ``su -``/``sudo su -``/
+            # ``sudo -i``/``sudo -s`` on the resulting mtc shell).
+            # Keeping the inner command a bare shell lets the helper run
+            # multiple escalation attempts interactively, which the
+            # inner ``su -`` form couldn't do.
             ssh_seat_cmd = (
                 f"ssh -o StrictHostKeyChecking=accept-new "
                 f"-o UserKnownHostsFile=/dev/null "
@@ -1296,9 +1336,10 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log, root_password=None):
 
             log(f"SEAT: ssh mtc@{seat} reached mtc prompt")
 
-            # Hand off to the dual-try escalation helper — ``su -``
-            # with the root password first, ``sudo su -`` with mtc as
-            # fallback. Seat images differ on which is accepted.
+            # Hand off to the escalation helper — tries ``su -`` (root
+            # password) first, then ``sudo su -`` / ``sudo -i`` /
+            # ``sudo -s`` (mtc password) until one lands in root. See
+            # ``_escalate_to_root`` for the full sequence.
             _escalate_to_root(sh, root_pw, mtc_password, log)
 
         time.sleep(0.5)
@@ -1770,7 +1811,7 @@ class SeatMixin:
 
         return True
 
-    def _start_seat_device_watcher(self, seat, port='5555', gateway=None, max_wait=60, interval=2, seizure_mode=False):
+    def _start_seat_device_watcher(self, seat, port='5555', gateway=None, max_wait=60, interval=1, seizure_mode=False):
         """Poll adb devices until the seat's device finishes authorizing.
 
         Right after `seat.sh auto-connect`, `adb connect localhost:<port>`
@@ -1888,14 +1929,15 @@ class SeatMixin:
                         self.run_on_main_thread(
                             lambda s=seat, g=gateway: self._open_mirror_for_seat(s, gateway=g)
                         )
-                watcher.stop()
-                self.update_status(f"Connected to {seat}")
-                # Clear seized state on successful connection
-                if seat in getattr(self, '_seat_was_seized', {}):
-                    del self._seat_was_seized[seat]
-                first_device_seen['value'] = True
-                # Force a refresh so the UI reflects the new status.
-                self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
+                    self.update_status(f"Connected to {seat}")
+                    # Clear seized state on successful connection
+                    if seat in getattr(self, '_seat_was_seized', {}):
+                        del self._seat_was_seized[seat]
+                    first_device_seen['value'] = True
+                    # Force a refresh so the UI reflects the new status.
+                    self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
+
+                # Persistent monitoring: don't stop the watcher when 'device'
                 return
 
             # If we've seen the device as 'device' before and it goes offline,
@@ -1913,27 +1955,34 @@ class SeatMixin:
             # rather than "you were kicked" because we can't tell from here
             # whether the disconnect was a seizure or a network blip.
             if seat_status in (None, 'offline') and first_device_seen['value']:
-                # Device went offline after being online - this could be:
-                # 1. Seizure by another user (most likely when seat.sh still shows as connected)
-                # 2. Network blip / phone rebooted
-                # 3. User A manually disconnected seat.sh from a different session
-                # Since we can't distinguish, we show a general disconnect dialog
-                # and push a device-side notification.
-                if elapsed['secs'] >= 2:  # Give a moment to confirm it's really disconnected
-                    # Try to notify the device via whichever adb session
-                    # currently has it. Pass seat_device_id=None so the
-                    # helper re-looks-up the active holder from
-                    # `adb devices` — our stale seat_device_id may route
-                    # through a broken session.
-                    self._notify_device_disconnect(seat, seat_device_id=None)
-                    # Snapshot the open mirror (if any) so we can reopen
-                    # it after the user reconnects. Snapshot BEFORE the
-                    # dialog/dialog-flow so we capture the current state.
-                    self._capture_mirror_for_auto_resume(seat_device_id)
+                # Optimization: Seizure detection is now immediate when seen
+                # while the seat tunnel is still active.
+                self.log(f"Detected disconnect for {seat} (status: {seat_status})", "INFO")
+
+                # Try to notify the device via whichever adb session
+                # currently has it.
+                self._notify_device_disconnect(seat, seat_device_id=None)
+                # Snapshot the open mirror (if any)
+                self._capture_mirror_for_auto_resume(seat_device_id)
+
+                # If the tunnel is still up, it's a seizure.
+                if self.seat_port_manager.is_seat_connected(seat):
+                    self.run_on_main_thread(lambda: self._show_seat_seized_dialog(seat, gateway=gateway))
+                else:
                     self.run_on_main_thread(lambda: self._show_seat_disconnected_dialog(seat))
-                    watcher.stop()
-                    self.seat_port_manager.mark_seat_disconnected(seat)
-                    self.run_on_main_thread(self.refresh_seat_port_lists)
+
+                watcher.stop()
+                self.seat_port_manager.mark_seat_disconnected(seat)
+                # Mark this seat as user-disconnected so the seat panel
+                # stops highlighting it green even if ``seat.sh
+                # devices`` is slow to notice the tunnel drop.
+                # Cleared by the next successful ``connect_seat`` for
+                # the same seat.
+                if not hasattr(self, '_user_disconnected_seats'):
+                    self._user_disconnected_seats = set()
+                self._user_disconnected_seats.add(seat)
+                self.run_on_main_thread(self.refresh_devices)
+                self.run_on_main_thread(self.refresh_seat_port_lists)
                 return
 
             # Vysor-style fast siege: if device is offline OR missing
@@ -1981,15 +2030,25 @@ class SeatMixin:
         watcher.timeout.connect(tick)
         watcher.start()
 
-    def _show_seat_seized_dialog(self, seat):
+    def _show_seat_seized_dialog(self, seat, gateway=None):
         """Show dialog when another user seizes a seat we were connected to."""
-        from .safe_dialog import safe_critical
-        safe_critical(
+        from .safe_dialog import safe_question_multiline
+
+        # If gateway not provided, try to look it up from current connection state
+        if not gateway:
+            gateway = self.seat_port_manager.connected_seats.get(seat)
+
+        confirmed = safe_question_multiline(
             self,
-            "Seat Seized",
-            f"The seat '{seat}' has been seized by another user.\n\n"
-            "Click the seat button again to reconnect."
+            "Seat Seized / Offline",
+            f"The device for seat '{seat}' has gone offline.\n"
+            "This usually means it was seized by another user.\n\n"
+            "Do you want to seize it back immediately?",
+            yes_label="Take Back",
+            no_label="Cancel"
         )
+        if confirmed:
+            self.takeover_seat(seat, gateway=gateway, silent=False)
 
     def _on_manual_seizure_clicked(self, entry):
         """Handle manual seizure button click - explicitly attempt to take over a seat"""
@@ -2280,6 +2339,23 @@ class SeatMixin:
         if hasattr(self, 'pf_search_entry'):
             pf_filter = self.pf_search_entry.text().lower().strip()
 
+        # Cheap pre-check: skip the rebuild if nothing we care about
+        # (cached data + filter text) has changed since the last
+        # refresh. This avoids tearing down and re-creating up to 50
+        # seat buttons × 3 child widgets each on every 5-second timer
+        # tick, which was the main source of the visible UI stutter.
+        # The reconciliation block below still runs (so dropped-seat
+        # detection continues to advance), but the expensive button
+        # rebuild is skipped.
+        prev_filter_fp = getattr(self, '_seat_lists_filter_fp', None)
+        prev_data_fp = getattr(self, '_seat_lists_data_fp', None)
+        current_filter_fp = (seat_filter, pf_filter)
+        skip_rebuild = (
+            prev_filter_fp == current_filter_fp
+            and prev_data_fp is not None
+            and not refetch
+        )
+
         # Fetch data from external sources only if refetch=True or no cache exists
         if refetch or not hasattr(self, '_cached_seat_sh_devices'):
             self._cached_seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
@@ -2294,21 +2370,45 @@ class SeatMixin:
         # but no longer appears in `seat.sh devices` has dropped in the
         # background — clear our internal flag so the highlight goes away.
         #
-        # Grace period: If seat.sh is slow or intermittently fails, don't clear
-        # connected state immediately. Wait for 3 consecutive failures.
+        # Grace period: If seat.sh is slow or intermittently fails, don't
+        # clear connected state immediately. Wait for 2 consecutive
+        # failures (was 3, but the rebuild-fingerprint short-circuit now
+        # makes the UI update cheap on the next change, so the cost of
+        # a single transient failure is just one extra redraw). The user
+        # complained about a green seat button staying green long after
+        # ``seat.sh devices`` was empty — 2 ticks (~13s with the
+        # staggered timer) is a much better UX than 3 (~20s).
         current_seat_names = {d['seat'] for d in seat_sh_devices if d.get('seat')}
         if not hasattr(self, '_seat_sh_missing_count'):
             self._seat_sh_missing_count = {}
 
+        # Track whether the reconciliation actually changed the
+        # connected-set. If so, the button highlight has to redraw even
+        # if the rest of the data fingerprint is identical — otherwise
+        # the green button stays green until something else triggers a
+        # rebuild (and that something else may never come).
+        reconciliation_changed = False
         for seat in list(self.seat_port_manager.connected_seats.keys()):
             if seat not in current_seat_names:
                 count = self._seat_sh_missing_count.get(seat, 0) + 1
                 self._seat_sh_missing_count[seat] = count
-                if count >= 3:
+                if count >= 2:
                     self.seat_port_manager.connected_seats.pop(seat, None)
                     self._seat_sh_missing_count.pop(seat, None)
+                    reconciliation_changed = True
             else:
+                if self._seat_sh_missing_count.get(seat):
+                    reconciliation_changed = True
                 self._seat_sh_missing_count[seat] = 0
+
+        # If the cached data is unchanged and we're not being asked to
+        # re-fetch, also skip the (expensive) button rebuild below. The
+        # reconciliation above already ran, so seat-highlight state
+        # stays correct for the next rebuild — UNLESS reconciliation
+        # actually flipped something, in which case we MUST rebuild or
+        # the stale green button sticks around.
+        if skip_rebuild and not reconciliation_changed:
+            return
 
         # Clear existing buttons
         while self.seat_list_layout.count() > 0:
@@ -2374,14 +2474,32 @@ class SeatMixin:
         # Sort: Connected seats first (from both connection state and seat.sh), then disconnected
         connected_seats = []
         disconnected_seats = []
+        # Seats that the user (or the watcher on their behalf) explicitly
+        # decided are no longer ours. We track these here so the
+        # ``live_seat_map`` check below doesn't keep painting the button
+        # green when seat.sh is still reporting the tunnel up — the
+        # disconnect path already cleared ``connected_seats`` but seat.sh
+        # may take a while to catch up (especially after a seizure), so
+        # until we see ``connected_seats`` re-add the seat we treat the
+        # live_seat_map entry as stale. Populated by:
+        #   * ``disconnect_seat`` (full path, after seat.sh disconnect)
+        #   * ``_start_seat_device_watcher`` (watcher-detected seizure)
+        # Cleared by:
+        #   * ``connect_seat`` success path (we re-add the seat)
+        user_disconnected = getattr(self, '_user_disconnected_seats', None)
         for entry in top_seats:
             # A seat is connected only if:
             #  - internal state marks it connected AND the gateway matches, OR
-            #  - seat.sh devices currently lists this seat as connected for this gateway.
+            #  - seat.sh devices currently lists this seat as connected for this gateway
+            #    AND we haven't explicitly disconnected this seat.
+            live_connected = (
+                entry['gateway'] in live_seat_map.get(entry['seat'], {})
+                and not (user_disconnected and entry['seat'] in user_disconnected)
+            )
             is_conn = (
                 (self.seat_port_manager.is_seat_connected(entry['seat']) and
                  self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
-                or entry['gateway'] in live_seat_map.get(entry['seat'], {})
+                or live_connected
             )
             if is_conn:
                 connected_seats.append(entry)
@@ -2394,11 +2512,20 @@ class SeatMixin:
         top_seats = top_seats[:50]
         for entry in top_seats:
             # Same rule as above for the actual highlight
+            live_connected = (
+                entry['gateway'] in live_seat_map.get(entry['seat'], {})
+                and not (user_disconnected and entry['seat'] in user_disconnected)
+            )
             is_connected = (
                 (self.seat_port_manager.is_seat_connected(entry['seat']) and
                  self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
-                or entry['gateway'] in live_seat_map.get(entry['seat'], {})
+                or live_connected
             )
+            # Stash on the entry dict so the rebuild-fingerprint at the
+            # end of this function captures the highlight state. Not
+            # used by any consumer downstream (the seat loop uses the
+            # local ``is_connected`` / ``btn_connected``).
+            entry['_is_connected'] = is_connected
             btn_connected = is_connected
             # Format: two lines with Port info on the seat line
             # Truncate long gateway names to prevent horizontal scrolling
@@ -2615,6 +2742,9 @@ class SeatMixin:
                 self.seat_port_manager.is_portforward_connected(gw)
                 or is_active_rack
             )
+            # Stash on the entry dict so the rebuild-fingerprint at
+            # the end of this function captures the highlight state.
+            entry['_is_connected'] = is_connected
 
             # Determine headend
             headend = entry.get('headend', '').strip()
@@ -2724,6 +2854,34 @@ class SeatMixin:
 
             # Add container to layout (was: directly the button)
             self.portforward_list_layout.addWidget(pf_container)
+
+        # Record the fingerprints of what we just rendered so the next
+        # ``refresh_seat_port_lists_async`` tick (5s later) can short-
+        # circuit if neither the search filter nor the underlying data
+        # has changed. Captured AFTER all status / connected-state
+        # reconciliation is done, so the fingerprints include the
+        # current highlight / icon for each row.
+        self._seat_lists_filter_fp = (seat_filter, pf_filter)
+        # Build a tuple of (seat, gateway, port, status, is_connected)
+        # for visible seats and (gateway, headend, seat, port, status,
+        # is_connected) for visible pf rows. ``is_connected`` is the
+        # *post-reconciliation* highlight flag (the green / red
+        # styling), so a seat going online / offline alone flips the
+        # fp and triggers a rebuild.
+        seat_fp = tuple(
+            (e['seat'], e['gateway'], str(e.get('port', '')),
+             str(e.get('status', '')).lower(),
+             bool(e.get('_is_connected', False)))
+            for e in top_seats
+        )
+        pf_fp = tuple(
+            (e.get('gateway', ''), e.get('headend', '').strip(),
+             e.get('seat', ''), str(e.get('port', '')),
+             str(e.get('status', '')).lower(),
+             bool(e.get('_is_connected', False)))
+            for e in top_pf
+        )
+        self._seat_lists_data_fp = (seat_fp, pf_fp)
 
     def _on_seat_clicked(self, entry, source_button=None):
         """Handle seat button click"""
@@ -3189,6 +3347,12 @@ class SeatMixin:
                     pass
 
         def do_connect_inner():
+            # Clear the user-disconnected flag — the user is explicitly
+            # asking to reconnect, so the seat panel should highlight
+            # green again as soon as ``connected_seats`` is populated
+            # (which happens just below on the success path).
+            if hasattr(self, '_user_disconnected_seats'):
+                self._user_disconnected_seats.discard(seat)
             try:
                 # Kill any stale SSH tunnels for this seat before connecting.
                 # `seat.sh auto-connect` runs `ssh -f -N -L <port>:<seat>:5555 <gw>`
@@ -3789,7 +3953,7 @@ class SeatMixin:
         """Forcefully take over a seat from another user or competing connection (Vysor mode).
 
         Fast Path:
-          1. Kicks local ADB transport and reconnects (under 300ms).
+          1. Kicks local ADB transport using `reconnect device` then reconnects (under 300ms).
         Full Path (if occupied by remote TCP socket):
           2. Connects to seat host via SSH and triggers `setprop ctl.restart adbd`.
              This severs the competing user's TCP connection instantly.
@@ -3826,13 +3990,45 @@ class SeatMixin:
         seat_dev = f"localhost:{port}"
 
         def do_takeover():
+            # ── Fast path: aggressive local reconnect ───────────────────────────
+            # Before doing the heavy SSH-based adbd restart, try the aggressive
+            # non-root "reconnect device" command. This tells the device-side
+            # transport to drop its current session and restart, which can
+            # evict other users without needing root or SSH.
+            self.log(f"⚡ Fast-seizing {seat_dev} via reconnect device...", "DEBUG")
+            try:
+                # `reconnect device` kicks the device-side transport
+                self.adb.run_command(f"-s {seat_dev} reconnect device")
+                time.sleep(0.3)
+                self.adb.run_command(f"disconnect {seat_dev}")
+                time.sleep(0.2)
+                result = self.adb.run_command(f"connect {seat_dev}")
+                if result.get('success', False):
+                    time.sleep(0.5)
+                    devs = self.adb.get_devices(silent=True)
+                    if any(d.get('id') == seat_dev and d.get('status') == 'device' for d in devs):
+                        self.log(f"Fast-seizure successful for {seat_dev}", "INFO")
+                        self.update_status(f"Seat {seat} acquired (fast path)")
+                        self._notify_device_of_seizure(seat_dev)
+                        self.run_on_main_thread(lambda: self.refresh_devices())
+                        self.run_on_main_thread(self.refresh_seat_port_lists)
+                        if on_ready:
+                            self.run_on_main_thread(lambda: on_ready(seat_dev))
+                        # Restart persistent watcher to monitor for future seizures
+                        self.run_on_main_thread(
+                            lambda s=seat, p=port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, seizure_mode=True)
+                        )
+                        return
+            except Exception as e:
+                self.log(f"Fast path failed for {seat_dev}: {e}", "DEBUG")
+
             # ── Full path: remote adbd reset via seat SSH ───────────────────────
-            # When adbd is occupied by another user's TCP session, the only
-            # way to evict them is to restart adbd on the device over SSH.
-            # The "fast path" (adb reconnect/disconnect/connect) only recycles
-            # our local ADB daemon state — it cannot close the remote device's
-            # already-accepted TCP socket, so it never works when someone else
-            # is connected. We go straight to SSH + setprop ctl.restart adbd.
+            # When adbd is occupied by another user's TCP session and fast path
+            # fails, the only way to evict them is to restart adbd on the device
+            # over SSH.
+            # The "fast path" (adb reconnect/disconnect/connect) above recycles
+            # our local ADB daemon state and tries to kick the remote transport.
+            # If that failed, we go straight to SSH + setprop ctl.restart adbd.
 
             if not gateway:
                 self.log(f"Cannot take over seat {seat}: gateway not found", "ERROR")
@@ -4305,64 +4501,79 @@ class SeatMixin:
         if not device_id:
             return
 
+        # Prevent multiple concurrent seizure dialogs for the same device
+        if not hasattr(self, '_active_seizure_dialogs'):
+            self._active_seizure_dialogs = set()
+        if device_id in self._active_seizure_dialogs:
+            return
+        self._active_seizure_dialogs.add(device_id)
+
         # Ask user for confirmation first - this needs to block until response
         # because seizure is a disruptive action affecting other users
         confirmed = {'result': None}
 
         def ask_and_seize():
-            from .safe_dialog import safe_question_multiline
-            response = safe_question_multiline(
-                self,
-                "Device Connection Transfer",
-                f"The device {device_id} appears offline.\n"
-                "This may mean it's being used by another user.\n\n"
-                "Transfer control to this session?\n"
-                "This will disconnect the other user immediately.",
-            )
-
-            if not response:
-                confirmed['result'] = False
-                self.log(f"Seizure cancelled for {device_id}", "DEBUG")
-                return
-
-            confirmed['result'] = True
-            self.log(f"⚡ Forcing connection to {device_id}...", "INFO")
-
-            # First try fast local disconnect/reconnect
             try:
-                self.adb.run_command(f"disconnect {device_id}")
-                time.sleep(0.2)
-                result = self.adb.run_command(f"connect {device_id}")
-                if result.get('success', False):
-                    time.sleep(0.5)  # Give adbd moment to come online
-                    # Check if it's now 'device' not 'offline'
-                    devices = self.adb.get_devices(silent=True)
-                    dev_status = next((d.get('status') for d in devices if d.get('id') == device_id), None)
-                    if dev_status == 'device':
-                        self._notify_device_of_seizure(device_id)
+                from .safe_dialog import safe_question_multiline
+                response = safe_question_multiline(
+                    self,
+                    "Device Connection Transfer",
+                    f"The device {device_id} appears offline.\n"
+                    "This may mean it's being used by another user.\n\n"
+                    "Transfer control to this session?\n"
+                    "This will disconnect the other user immediately.",
+                )
+
+                if not response:
+                    confirmed['result'] = False
+                    self.log(f"Seizure cancelled for {device_id}", "DEBUG")
+                    return
+
+                confirmed['result'] = True
+                self.log(f"⚡ Forcing connection to {device_id}...", "INFO")
+
+                # First try fast local reconnect
+                try:
+                    # `reconnect device` tells the device-side transport to drop its session
+                    self.adb.run_command(f"-s {device_id} reconnect device")
+                    time.sleep(0.3)
+                    self.adb.run_command(f"disconnect {device_id}")
+                    time.sleep(0.2)
+                    result = self.adb.run_command(f"connect {device_id}")
+                    if result.get('success', False):
+                        time.sleep(0.5)  # Give adbd moment to come online
+                        # Check if it's now 'device' not 'offline'
+                        devices = self.adb.get_devices(silent=True)
+                        dev_status = next((d.get('status') for d in devices if d.get('id') == device_id), None)
+                        if dev_status == 'device':
+                            self._notify_device_of_seizure(device_id)
+                            self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
+                            # Watcher is likely already running if this was called from tick()
+                            # and will detect 'device' on next tick, setting first_device_seen.
+                            return
+                except Exception as e:
+                    self.log(f"Fast seize failed for {device_id}: {e}", "DEBUG")
+
+                # Fast path didn't work - escalate to full SSH takeover
+                # This is the only way to sever a remote TCP session that we can't disconnect
+                self.log(f"Fast seize failed - escalating to full takeover for {device_id}", "DEBUG")
+                # Parse seat and port from device_id
+                if device_id and device_id.startswith('localhost:'):
+                    port = device_id.split(':', 1)[1]
+                    # Get seat for this port
+                    seat = None
+                    for dev in (self.seat_port_manager.get_devices_from_seat_sh() or []):
+                        if dev.get('port') == port:
+                            seat = dev.get('seat')
+                            break
+                    if seat:
+                        self.takeover_seat(seat, gateway=gateway, silent=False)
+                    else:
+                        self.log(f"Cannot takeover {device_id} - no seat found for port {port}", "WARNING")
                         self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
                         return
-            except Exception as e:
-                self.log(f"Fast seize failed for {device_id}: {e}", "DEBUG")
-
-            # Fast path didn't work - escalate to full SSH takeover
-            # This is the only way to sever a remote TCP session that we can't disconnect
-            self.log(f"Fast seize failed - escalating to full takeover for {device_id}", "DEBUG")
-            # Parse seat and port from device_id
-            if device_id and device_id.startswith('localhost:'):
-                port = device_id.split(':', 1)[1]
-                # Get seat for this port
-                seat = None
-                for dev in (self.seat_port_manager.get_devices_from_seat_sh() or []):
-                    if dev.get('port') == port:
-                        seat = dev.get('seat')
-                        break
-                if seat:
-                    self.takeover_seat(seat, gateway=gateway, silent=False)
-                else:
-                    self.log(f"Cannot takeover {device_id} - no seat found for port {port}", "WARNING")
-                    self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
-                    return
+            finally:
+                self._active_seizure_dialogs.discard(device_id)
 
         # Run in GUI thread to block until dialog closes
         self.run_on_main_thread(ask_and_seize)
@@ -4418,6 +4629,15 @@ class SeatMixin:
                     if dev_info.get('seat') == seat:
                         device_id_pre = dev_info.get('device')
                         break
+
+                # Mark this seat as user-disconnected so the seat panel
+                # stops highlighting it green immediately, before
+                # ``seat.sh disconnect`` runs (which is asynchronous on
+                # the worker thread). Cleared by the next successful
+                # ``connect_seat`` for the same seat.
+                if not hasattr(self, '_user_disconnected_seats'):
+                    self._user_disconnected_seats = set()
+                self._user_disconnected_seats.add(seat)
 
                 # Resolve script path (custom override or bundled fallback)
                 script_path = self.seat_port_manager._get_seat_script_path()

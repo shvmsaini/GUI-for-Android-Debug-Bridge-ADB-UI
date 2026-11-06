@@ -111,8 +111,16 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                 # Emit signal so _show_window runs on the GUI thread.
                 show_signal.call.emit({'shell': shell, 'jump': jump})
                 return
-            except _SeatAuthError:
-                raise Exception("mtc password was rejected.")
+            except _SeatAuthError as e:
+                # kind='mtc' = SSH into seat rejected; kind='root' =
+                # every escalation path (``su -``, ``sudo su -``,
+                # ``sudo -i``, ``sudo -s``) failed. Forward the helper's
+                # message so the user sees what actually went wrong.
+                kind = getattr(e, 'kind', 'mtc')
+                which = 'mtc' if kind == 'mtc' else 'root'
+                raise Exception(
+                    f"{which} password / sudoers rejected: {e}"
+                )
             except Exception as e:
                 parent.log(f"Seat Root: connection failed: {e}", "ERROR")
                 error_signal.call.emit(str(e))

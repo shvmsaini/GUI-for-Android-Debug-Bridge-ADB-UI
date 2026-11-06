@@ -430,15 +430,22 @@ class ScrcpyMixin:
         self.auto_refresh_timer.timeout.connect(lambda: self.refresh_devices(silent=True))
         self.auto_refresh_timer.start(5000)
 
-        # Auto-refresh seat/port lists every 5 seconds
+        # Auto-refresh seat/port lists every 5 seconds — offset by 1.5s
+        # from the device refresh so all three 5-second timers don't fire
+        # on the same event-loop tick. Their worker threads are fine,
+        # but the post-fetch GUI-thread callbacks (apply_device_refresh,
+        # refresh_seat_port_lists, _apply_portforward_status) used to
+        # stack and produce a visible 5–6 second stutter. Refresh-fp
+        # short-circuits in refresh_seat_port_lists also help.
         self.seat_port_refresh_timer = QTimer()
         self.seat_port_refresh_timer.timeout.connect(self.refresh_seat_port_lists_async)
-        self.seat_port_refresh_timer.start(5000)
+        self.seat_port_refresh_timer.start(6500)
 
         # Check port forward status every 5 seconds to detect if it died
+        # — offset again so it's not aligned with the device refresh.
         self.pf_status_timer = QTimer()
         self.pf_status_timer.timeout.connect(self.check_portforward_alive)
-        self.pf_status_timer.start(5000)
+        self.pf_status_timer.start(8000)
         # Track previous state for comparison
         self.last_pf_active = False
         self.last_active_rack = None
