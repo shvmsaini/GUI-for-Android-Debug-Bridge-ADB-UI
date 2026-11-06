@@ -509,17 +509,18 @@ class SettingsDialog(QDialog):
             self,
             "Clear Passwords",
             "Clear all stored SSH passwords?\n\n"
-            "This will remove all Keychain entries for SSH credentials "
-            "(gateways, seats, MTC, etc.).\n\n"
+            "This will remove all stored credentials "
+            "(gateways, seats, MTC, root, etc.).\n\n"
             "You'll need to enter passwords again on next connection."
         )
         if not confirmed:
             return
 
+        from .credentials import CredentialManager
+        creds = CredentialManager()
+        deleted, failed = creds.clear_all()
+
         if sys.platform == 'darwin':
-            from .credentials import CredentialManager
-            creds = CredentialManager()
-            deleted, failed = creds.clear_all()
             if deleted == 0 and failed == 0:
                 msg = ("No stored passwords found in Keychain.\n\n"
                        "If passwords still appear cached, check Keychain Access → "
@@ -530,12 +531,28 @@ class SettingsDialog(QDialog):
                 if failed:
                     msg += f"\n\n{failed} entry(ies) could not be removed."
                 safe_info(self, "Passwords Cleared", msg)
-        else:
-            safe_info(
-                self,
-                "Not Supported",
-                "Password clearing is only supported on macOS."
-            )
+        elif sys.platform == 'win32':
+            if deleted == 0 and failed == 0:
+                msg = ("No stored passwords found in Credential Manager.\n\n"
+                       "If passwords still appear cached, check Credential Manager → "
+                       "Windows Credentials → look for 'ADB-GUI-UI' entries.")
+                safe_info(self, "No Passwords Found", msg)
+            else:
+                msg = f"Cleared {deleted} stored password(s)."
+                if failed:
+                    msg += f"\n\n{failed} entry(ies) could not be removed."
+                safe_info(self, "Passwords Cleared", msg)
+        else:  # Linux
+            if deleted == 0 and failed == 0:
+                msg = ("No stored passwords found in GNOME Keyring / libsecret.\n\n"
+                       "If passwords still appear cached, check Secret Tool or "
+                       "search for 'ADB-GUI-UI' entries.")
+                safe_info(self, "No Passwords Found", msg)
+            else:
+                msg = f"Cleared {deleted} stored password(s)."
+                if failed:
+                    msg += f"\n\n{failed} entry(ies) could not be removed."
+                safe_info(self, "Passwords Cleared", msg)
 
     def browse_adb(self):
         """Browse for ADB executable"""

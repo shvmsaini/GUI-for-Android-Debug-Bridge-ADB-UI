@@ -424,15 +424,60 @@ class CredentialManager:
         """Delete all tracked credentials from the Keychain.
 
         Returns (deleted_count, failed_count)."""
-        if sys.platform != 'darwin' and not sys.platform.startswith('linux'):
-            return (0, 0)
-
         # Sync first to catch any pre-existing entries
         self._sync_index_from_keychain()
 
         deleted = 0
         failed = 0
         index = self._load_index()
+
+        # On Linux, use secret-tool to clear all entries for our service
+        if sys.platform.startswith('linux'):
+            try:
+                result = subprocess.run(
+                    ['secret-tool', 'clear', 'service', self.service_name],
+                    capture_output=True, timeout=10
+                )
+                if result.returncode == 0:
+                    deleted = len(index)
+                # Clear the index file regardless
+                self._save_index(set())
+                return (deleted, 0)
+            except Exception:
+                pass
+
+        # On Windows, enumerate and delete each credential
+        if sys.platform == 'win32' and ctypes:
+            try:
+                advapi32 = ctypes.windll.advapi32
+                CredEnumerateW = advapi32.CredEnumerateW
+                CredEnumerateW.argtypes = [wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(ctypes.POINTER(PCREDENTIAL))]
+                CredEnumerateW.restype = wintypes.BOOL
+
+                count = wintypes.DWORD()
+                p_creds = ctypes.POINTER(PCREDENTIAL)()
+                if CredEnumerateW(None, 0, ctypes.byref(count), ctypes.byref(p_creds)):
+                    try:
+                        for i in range(count.value):
+                            cred = p_creds[i].contents
+                            target = cred.TargetName or ""
+                            if target.startswith(f"{self.service_name}:"):
+                                account = target[len(self.service_name)+1:]
+                                if '@' in account:
+                                    user, gateway = account.rsplit('@', 1)
+                                    if self.delete_password(gateway, user):
+                                        deleted += 1
+                                    else:
+                                        failed += 1
+                    finally:
+                        advapi32.CredFree(p_creds)
+                # Clear the index
+                self._save_index(set())
+                return (deleted, failed)
+            except Exception:
+                pass
+
+        # Fallback: iterate through index for macOS
         for account in list(index):
             # Parse "user@gateway"
             if '@' not in account:

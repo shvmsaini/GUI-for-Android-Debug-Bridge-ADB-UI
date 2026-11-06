@@ -3412,8 +3412,36 @@ class SeatMixin:
                 # one-shot helper process and closes cleanly once ssh has
                 # the password; the forked tunnel child detaches properly
                 # and survives after the script exits.
-                askpass_file = '/tmp/adb_gui_askpass.sh'
-                askpass_script = f"#!/bin/sh\necho {password}\n"
+                #
+                # NOTE: We use ``printf '%s\n' "$(cat …)"`` rather than ``echo``
+                # for two reasons:
+                #   1. Some passwords contain backslashes, dollar signs, or
+                #      backticks; ``echo`` lets the shell expand those, which
+                #      silently corrupts the password. ssh then retries with
+                #      the wrong value and (without ``SSH_ASKPASS_REQUIRE=force``
+                #      on older OpenSSH, or when SSH_ASKPASS_REQUIRE is
+                #      ignored) falls back to prompting on the controlling
+                #      terminal — exactly the "password prompt in terminal
+                #      instead of popup" symptom users hit on Linux.
+                #   2. ``echo`` is not portable: dash, bash, and zsh treat
+                #      ``echo -e`` and ``echo -n`` differently. ``printf``
+                #      with ``%s\n`` is the only fully-portable way to emit
+                #      a literal string followed by a newline.
+                # We also isolate the password into a separate file (mode 0600)
+                # rather than embedding it inline in the script so that even
+                # an interactive ``cat`` of the script can't leak it, and we
+                # make the temp paths unique per-call to avoid two concurrent
+                # connections clobbering each other's askpass script.
+                import shlex as _shlex
+                askpass_file = f"/tmp/adb_gui_askpass_seat_{os.getpid()}_{threading.get_ident()}.sh"
+                pw_file = f"/tmp/adb_gui_askpass_pw_{os.getpid()}_{threading.get_ident()}.txt"
+                with open(pw_file, 'w') as _pw_f:
+                    _pw_f.write(password)
+                os.chmod(pw_file, 0o600)
+                askpass_script = (
+                    "#!/bin/sh\n"
+                    "exec printf '%s\\n' \"$(cat " + _shlex.quote(pw_file) + ")\"\n"
+                )
                 with open(askpass_file, 'w') as f:
                     f.write(askpass_script)
                 os.chmod(askpass_file, 0o755)
@@ -3498,6 +3526,10 @@ class SeatMixin:
                 # Clean up the askpass file
                 try:
                     os.remove(askpass_file)
+                except Exception:
+                    pass
+                try:
+                    os.remove(pw_file)
                 except Exception:
                     pass
 
