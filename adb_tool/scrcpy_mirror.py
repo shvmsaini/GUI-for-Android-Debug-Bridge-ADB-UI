@@ -1592,15 +1592,24 @@ class ScrcpyMirrorWindow(QMainWindow):
                     return
                 msg = str(e)
                 exc_type = type(e).__name__
+                is_timeout = (exc_type == "ScrcpyTimeoutError" or "timeout" in msg.lower())
 
-                # Always log the full traceback as ERROR so it's visible
-                # in the GUI log panel (with our log callback) or in the
-                # terminal (without). DEBUG-only lines are suppressed by
-                # the default _scrcpy_verbose=False setting.
-                self._log(
-                    "ERROR",
-                    f"STREAM EXCEPTION for {self.device_id}: {exc_type}: {msg}",
-                )
+                # Frame timeouts are a *handled* condition, not an error:
+                # scrcpy only emits a frame when the picture changes, so
+                # a static screen is normal.  We log it at DEBUG and let
+                # the handler below restart the listener silently.  Only
+                # unknown errors go to the GUI log panel at ERROR.
+                if is_timeout:
+                    self._log(
+                        "DEBUG",
+                        f"Frame timeout for {self.device_id}: "
+                        f"{exc_type}: {msg} (screen may be static — restarting listener)",
+                    )
+                else:
+                    self._log(
+                        "ERROR",
+                        f"STREAM EXCEPTION for {self.device_id}: {exc_type}: {msg}",
+                    )
                 tb_lines = traceback.format_exc().splitlines()
                 for _ln in tb_lines:
                     self._log("DEBUG", _ln)
@@ -1618,13 +1627,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                 # restart the listener loop so it can wait again.  If
                 # the socket is genuinely dead the decode thread will
                 # set reader_error, which we pick up on the next tick.
-                if exc_type == "ScrcpyTimeoutError" or "timeout" in msg.lower():
-                    self._log(
-                        "DEBUG",
-                        f"Frame timeout (no new frame in "
-                        f"{'60' if self.device_id.startswith('localhost:') else '30'}s) "
-                        f"— restarting listener (screen may be static)",
-                    )
+                if is_timeout:
                     self.signal.auto_retry.emit("timeout")
                     return
 
