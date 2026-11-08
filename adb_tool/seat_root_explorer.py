@@ -213,7 +213,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         # Buttons row
         btn_row = QHBoxLayout()
         push_btn = QPushButton("⬆️ Push")
-        copy_gw_btn = QPushButton("⬆️ Copy to Gateway")
         pull_btn = QPushButton("⬇️ Pull")
         edit_btn = QPushButton("📝 Edit")
         delete_btn = QPushButton("🗑️ Delete")
@@ -222,7 +221,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         run_btn = QPushButton("▶️ Run Command")
         close_btn = QPushButton("Close")
         btn_row.addWidget(push_btn)
-        btn_row.addWidget(copy_gw_btn)
         btn_row.addWidget(pull_btn)
         btn_row.addWidget(edit_btn)
         btn_row.addWidget(delete_btn)
@@ -472,131 +470,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                 ui.call.emit(done)
 
             threading.Thread(target=do_upload, daemon=True).start()
-
-        def copy_to_gateway():
-            """Copy selected files from this seat TO the gateway via SCP run ON the seat."""
-            sel = selected()
-            if not sel:
-                QMessageBox.information(explorer, "Copy to Gateway", "Select files to copy first.")
-                return
-
-            # Ask user for destination path on gateway (default: gateway user's home)
-            default_path = f"/home/{gateway_user}/"
-            target_path, ok = QInputDialog.getText(
-                explorer, "Copy to Gateway",
-                f"Destination path on gateway {gateway_host}:\n\n"
-                f"(from: {seat_hostname})\n"
-                f"Default: {default_path}",
-                text=default_path,
-            )
-            if not ok or not target_path:
-                return
-
-            # Build list of source files
-            files_to_copy = []
-            for _row, _display, raw, _is_dir in sel:
-                remote_path = join_remote(current_path(), raw)
-                files_to_copy.append((raw, remote_path))
-
-            progress = QProgressDialog("Copying to gateway…", None, 0, 100, explorer)
-            progress.setWindowTitle("Copy to Gateway")
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(500)
-            progress.setValue(0)
-
-            def do_copy():
-                parent.log(f"Copying {len(files_to_copy)} file(s) from {seat_hostname} to {gateway_host}:{target_path}", "INFO")
-
-                for i, (name, remote_path) in enumerate(files_to_copy):
-                    pct = int(100 * i / len(files_to_copy))
-                    # Marshal to GUI thread — PyQt6 silently drops
-                    # QTimer.singleShot() from worker threads.
-                    parent.run_on_main_thread(lambda p=pct, n=name: (
-                        progress.setValue(p),
-                        progress.setLabelText(f"Copying {n} to gateway…"),
-                    ))
-
-                    # Run scp ON the seat (we already have a root shell there).
-                    # mtc account on the seat can ssh to {gateway_user}@{gateway_host}
-                    # via the LAN. We use SSH_ASKPASS so the password is fed
-                    # non-interactively.
-                    #
-                    # Note: from inside the seat shell, "gateway" needs to be
-                    # resolvable from the seat's perspective. Use gateway_host
-                    # as-is — seats on the same LAN can reach the gateway.
-                    askpass_tmp = f"/tmp/.adb-gui-askpass-{uuid.uuid4().hex}.sh"
-                    askpass_script = f"#!/bin/sh\necho {shlex.quote(gateway_password)}\n"
-
-                    try:
-                        # Write askpass script on the seat
-                        _, code_w = shell.run(
-                            f"printf %s {shlex.quote(askpass_script)} > {askpass_tmp} && chmod 700 {askpass_tmp}",
-                            timeout=10,
-                        )
-                        if code_w != 0:
-                            raise Exception("Could not write askpass script on seat")
-
-                        # Build scp command. From the seat, this looks like:
-                        #   mtc@seat:~$ scp <local_file> <gateway_user>@<gateway_host>:<dest>
-                        # The "local_file" is on the seat — we want to send
-                        # the file at `remote_path` (which may be in /data, /system, etc).
-                        # `scp` source paths are local to the seat, so we can
-                        # use the full seat path directly.
-                        scp_cmd = (
-                            f"SSH_ASKPASS={shlex.quote(askpass_tmp)} "
-                            f"SSH_ASKPASS_REQUIRE=force "
-                            f"DISPLAY=:0 "
-                            f"scp -O "
-                            f"-o StrictHostKeyChecking=no "
-                            f"-o UserKnownHostsFile=/dev/null "
-                            f"-o CheckHostIP=no "
-                            f"-o ConnectTimeout=15 "
-                            f"{shlex.quote(remote_path)} "
-                            f"{gateway_user}@{gateway_host}:{shlex.quote(target_path + '/' + name if target_path.endswith('/') else target_path)}"
-                        )
-                        parent.log(f"Seat: running {scp_cmd}", "DEBUG")
-
-                        out, code = shell.run(scp_cmd, timeout=300)
-
-                        if code != 0:
-                            raise Exception(out or f"scp exited with code {code}")
-
-                        parent.log(f"  Copied {name} to {gateway_host}:{target_path}", "INFO")
-
-                    except Exception as e:
-                        parent.log(f"  Failed to copy {name}: {e}", "ERROR")
-                        # Marshal to GUI thread — PyQt6 silently drops
-                        # QTimer.singleShot() from worker threads, and
-                        # QMessageBox must run on the GUI thread anyway.
-                        from .safe_dialog import safe_critical
-                        parent.run_on_main_thread(
-                            lambda n=name, err=str(e): safe_critical(
-                                explorer, "Copy Failed",
-                                f"Failed to copy {n}: {err}"
-                            )
-                        )
-                        return
-                    finally:
-                        # Clean up askpass script on seat
-                        try:
-                            shell.run(f"rm -f {shlex.quote(askpass_tmp)}", timeout=5)
-                        except:
-                            pass
-
-                # Marshal to GUI thread — PyQt6 silently drops
-                # QTimer.singleShot() from worker threads, and QMessageBox
-                # must run on the GUI thread anyway.
-                from .safe_dialog import safe_info
-                parent.run_on_main_thread(lambda: (
-                    progress.setValue(100),
-                    progress.close(),
-                    safe_info(
-                        explorer, "Copy to Gateway Complete",
-                        f"Copied {len(files_to_copy)} file(s) to: {gateway_host}:{target_path}"
-                    ),
-                ))
-
-            threading.Thread(target=do_copy, daemon=True).start()
 
         def pull():
             """Download selected files from the seat to a local directory via SCP."""
@@ -945,7 +818,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             threading.Thread(target=_do_load, daemon=True).start()
 
         push_btn.clicked.connect(push)
-        copy_gw_btn.clicked.connect(copy_to_gateway)
         pull_btn.clicked.connect(pull)
         edit_btn.clicked.connect(edit_file)
         delete_btn.clicked.connect(delete)

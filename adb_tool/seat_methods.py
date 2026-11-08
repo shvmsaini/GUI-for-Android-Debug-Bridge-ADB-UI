@@ -2401,6 +2401,18 @@ class SeatMixin:
                     reconciliation_changed = True
                 self._seat_sh_missing_count[seat] = 0
 
+        # Sync internal state with externally-connected seats (seat.sh auto-connect / external tools).
+        # When a device is connected via regular ADB or any means outside our click handler, we need
+        # to reflect that in our internal connected_seats map so the UI highlights it correctly.
+        # Only add seats that appear in seat.sh devices but aren't in our internal map.
+        for dev_info in seat_sh_devices:
+            seat = dev_info.get('seat')
+            gateway = dev_info.get('gateway')
+            if seat and gateway and seat not in self.seat_port_manager.connected_seats:
+                # Mark as connected so UI highlights it (even if we didn't initiate the connection)
+                self.seat_port_manager.mark_seat_connected(seat, gateway)
+                reconciliation_changed = True
+
         # If the cached data is unchanged and we're not being asked to
         # re-fetch, also skip the (expensive) button rebuild below. The
         # reconciliation above already ran, so seat-highlight state
@@ -2487,19 +2499,41 @@ class SeatMixin:
         # Cleared by:
         #   * ``connect_seat`` success path (we re-add the seat)
         user_disconnected = getattr(self, '_user_disconnected_seats', None)
+        # Build a set of device IDs currently visible to ADB (cached_devices).
+        # A seat whose device is no longer in this set should NOT be highlighted
+        # as connected — even if seat.sh still reports the tunnel up. Without
+        # this check, a disconnect (manual or auto) leaves the seat button
+        # green until the next seat.sh tick reconciles, which can be 5–10s.
+        adb_device_ids = {
+            d.get('id') for d in (getattr(self, 'cached_devices', None) or [])
+            if d.get('id')
+        }
         for entry in top_seats:
             # A seat is connected only if:
             #  - internal state marks it connected AND the gateway matches, OR
             #  - seat.sh devices currently lists this seat as connected for this gateway
-            #    AND we haven't explicitly disconnected this seat.
+            #    AND the actual device is still visible to ADB (catches stale seat.sh
+            #    state after a disconnect) AND we haven't explicitly disconnected this seat.
             live_connected = (
                 entry['gateway'] in live_seat_map.get(entry['seat'], {})
                 and not (user_disconnected and entry['seat'] in user_disconnected)
             )
+            # Get the device_id from seat_sh_devices for this seat+gateway pair.
+            # If seat.sh still says the seat is connected but the device has
+            # dropped from ADB, treat the seat as disconnected.
+            seat_device_id = None
+            for dev_info in seat_sh_devices:
+                if (dev_info.get('seat') == entry['seat']
+                        and dev_info.get('gateway') == entry['gateway']):
+                    seat_device_id = dev_info.get('device')
+                    break
+            device_still_present = (
+                not seat_device_id or seat_device_id in adb_device_ids
+            )
             is_conn = (
                 (self.seat_port_manager.is_seat_connected(entry['seat']) and
                  self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
-                or live_connected
+                or (live_connected and device_still_present)
             )
             if is_conn:
                 connected_seats.append(entry)
@@ -2516,10 +2550,21 @@ class SeatMixin:
                 entry['gateway'] in live_seat_map.get(entry['seat'], {})
                 and not (user_disconnected and entry['seat'] in user_disconnected)
             )
+            # Same device-still-present check as above — prevents stale seat.sh
+            # state from keeping the seat green after an ADB-side disconnect.
+            seat_device_id = None
+            for dev_info in seat_sh_devices:
+                if (dev_info.get('seat') == entry['seat']
+                        and dev_info.get('gateway') == entry['gateway']):
+                    seat_device_id = dev_info.get('device')
+                    break
+            device_still_present = (
+                not seat_device_id or seat_device_id in adb_device_ids
+            )
             is_connected = (
                 (self.seat_port_manager.is_seat_connected(entry['seat']) and
                  self.seat_port_manager.connected_seats.get(entry['seat']) == entry['gateway'])
-                or live_connected
+                or (live_connected and device_still_present)
             )
             # Stash on the entry dict so the rebuild-fingerprint at the
             # end of this function captures the highlight state. Not
@@ -3758,14 +3803,14 @@ class SeatMixin:
                     pass
                 self.run_on_main_thread(self._sync_refresh_panels)
                 self.run_on_main_thread(self._finalize_seat_connect_busy)
-                def show_error():
+                def show_error(se=seat, gw=gateway, err=str(e)):
                     from .safe_dialog import safe_question
                     retry = safe_question(
                         self, "Seat Connection Error",
-                        f"Error connecting to seat {seat}: {e}. Retry?"
+                        f"Error connecting to seat {se}: {err}. Retry?"
                     )
                     if retry:
-                        self.connect_seat(seat, gateway,
+                        self.connect_seat(se, gw,
                                         install_adb_key=getattr(self, '_pending_adb_key', None) is not None,
                                         adb_key=getattr(self, '_pending_adb_key', None),
                                         device_password=getattr(self, '_pending_device_password', None),

@@ -931,10 +931,14 @@ class ScrcpyMixin:
         self._open_mirror_window(device_id=device_id, seat_context=seat_context)
 
     def _device_to_seat_context(self, device_id):
-        """Map a device_id (e.g., localhost:65432) to a seat name/rack for the window title if it came from a seat.
+        """Map a device_id (e.g., localhost:65432) to a seat context for the window title.
+
+        Returns the same format as used by auto-mirror: "seatname (gateway)" so that
+        the duplicate window detection in _open_mirror_window can match both paths.
 
         Returns:
-            Optional seat name (str or None). When not None, the mirror window will show extended seat/rack/IP info in its title.
+            Optional seat context string (str or None). When not None, the mirror
+            window will show extended seat/gateway/IP info in its title.
         """
         # Fast bail: only local host/port connections come via seats
         if not device_id or not isinstance(device_id, str):
@@ -958,13 +962,24 @@ class ScrcpyMixin:
             target_port = port_str
             for entry in seat_history:
                 if entry.get('port') == target_port:
-                    return entry.get('seat')
+                    seat = entry.get('seat', '')
+                    gateway = entry.get('gateway', '')
+                    # Return same format as _open_mirror_for_seat uses
+                    if gateway:
+                        gw_short = gateway.split('@')[-1] if '@' in gateway else gateway
+                        return f"{seat} ({gw_short})"
+                    return seat
         # Nested port (outer port unique in history)
         else:
             outer_port = port_str.split(':')[0]
             for entry in seat_history:
                 if entry.get('port') == outer_port:
-                    return entry.get('seat')
+                    seat = entry.get('seat', '')
+                    gateway = entry.get('gateway', '')
+                    if gateway:
+                        gw_short = gateway.split('@')[-1] if '@' in gateway else gateway
+                        return f"{seat} ({gw_short})"
+                    return seat
         # No match
         return None
 
@@ -1255,15 +1270,34 @@ class ScrcpyMixin:
             pass
 
     def _close_mirror_window_if_exists(self, device_id):
-        """Close the mirror window for a specific device if it exists."""
-        # Close standalone mirror window if it exists
-        if hasattr(self, '_active_mirror_windows') and device_id in self._active_mirror_windows:
-            mirror_window = self._active_mirror_windows[device_id]
+        """Close the mirror window for a specific device if it exists.
+
+        Looks up mirror windows by both bare device_id (when no seat context
+        was provided at open time) and by the ``device_id|seat_context``
+        composite key used when a seat context is present. This ensures
+        windows opened via the auto-mirror-on-seat-connect flow are found
+        and closed on a manual disconnect.
+        """
+        if not hasattr(self, '_active_mirror_windows'):
+            return
+        # Match either the bare device_id key or any ``device_id|seat_context``
+        # composite key — we don't know which form was used at open time.
+        keys_to_close = []
+        if device_id in self._active_mirror_windows:
+            keys_to_close.append(device_id)
+        for key in list(self._active_mirror_windows.keys()):
+            if isinstance(key, str) and key.startswith(f"{device_id}|"):
+                keys_to_close.append(key)
+        for key in keys_to_close:
+            mirror_window = self._active_mirror_windows[key]
             try:
                 mirror_window.close()
                 self.log(f"Closed mirror window for device {device_id}", "INFO")
             except Exception as e:
                 self.log(f"Error closing mirror window for {device_id}: {str(e)}", "ERROR")
+            # Drop dead reference (the destroyed signal in _open_mirror_window_impl
+            # also does this, but belt-and-suspenders here).
+            self._active_mirror_windows.pop(key, None)
 
     def _mirror_expand_notif(self):
         """Expand notifications via the scrcpy control socket."""

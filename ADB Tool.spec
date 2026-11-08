@@ -35,6 +35,16 @@ binaries = []
 # List of packages that need thorough collection
 for pkg in ('py_scrcpy_sdk', 'imageio', 'av', 'numpy'):
     p_datas, p_binaries, p_hiddenimports = collect_all(pkg)
+    # Filter out numpy's typing test data files — they ship with read-only
+    # permissions in some Homebrew/Apple Python installs, and BUNDLE(assemble)
+    # tries to copyfile them into the .app, hitting Errno 1 EPERM. They are
+    # test fixtures (typing/tests/data/pass/*), not used at runtime.
+    if pkg == 'numpy':
+        p_datas = [
+            (src, dst) for src, dst in p_datas
+            if 'typing/tests/data' not in src
+            and 'tests/data' not in src
+        ]
     datas += p_datas
     binaries += p_binaries
     hiddenimports += p_hiddenimports

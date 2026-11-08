@@ -347,6 +347,12 @@ class DeviceMixin:
                 # after 30 seconds to allow re-connection without immediate auto-disconnect
                 if dev_id.startswith('localhost:') and dev_id in self._device_ever_online:
                     self._device_ever_online[dev_id] = False
+                # Refresh seat/port panels so any seat highlight tied to this device
+                # clears immediately rather than waiting for the next 6.5s timer tick.
+                try:
+                    self.refresh_seat_port_lists(refetch=False)
+                except Exception:
+                    pass
 
         # Reconcile seat connection state against actual adb devices.
         # A seat whose device (e.g. localhost:64491) is no longer in
@@ -591,6 +597,23 @@ class DeviceMixin:
                 # Update status and log even if devices didn't change (for manual refresh feedback)
                 self.update_status(f"Found {len(devices)} device(s)")
                 self.log(f"Found {len(devices)} device(s) (no changes)", "INFO")
+
+            # Show seat.sh devices when this is a manual (non-silent) refresh.
+            # This is the source of truth for which seats are currently connected
+            # via the SSH tunnel — surfacing it lets users debug why a seat panel
+            # may or may not be highlighted.
+            if not silent and seat_sh_devices:
+                self.log(
+                    f"seat.sh devices ({len(seat_sh_devices)}): "
+                    + ", ".join(
+                        f"{d.get('seat', '?')}@{d.get('gateway', '?')} "
+                        f"({d.get('device', '?')}, {d.get('status', '?')})"
+                        for d in seat_sh_devices
+                    ),
+                    "INFO",
+                )
+            elif not silent:
+                self.log("seat.sh devices: (none)", "INFO")
         else:
             had_devices = len(self.device_buttons) > 0
             # Clear all device buttons

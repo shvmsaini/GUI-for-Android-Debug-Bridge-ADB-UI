@@ -13,7 +13,7 @@ from typing import Optional
 from subprocess import TimeoutExpired
 
 from . import bundled_scripts
-from .constants import ADB_SEAT_PORTS_FILE, PORTFORWARD_RACKS_FILE
+from .constants import ADB_SEAT_PORTS_FILE, PORTFORWARD_RACKS_FILE, CUSTOM_GATEWAYS_FILE
 
 # Platform-specific imports
 if sys.platform == 'win32':
@@ -201,6 +201,72 @@ class SeatPortManager:
                         f"{entry_type} history purge error: {e}", "ERROR",
                     )
         return results
+
+    def load_custom_gateways(self):
+        """Load manually-typed gateways from the custom cache.
+
+        Returns a list of ``user@host`` strings. The file is plain text,
+        one gateway per line — same format as the seat.sh / portforwardRack
+        history files. Lines starting with '#' or empty lines are skipped.
+        Gateways that are also in seat history are NOT deduplicated here;
+        callers should dedupe as needed.
+        """
+        out = []
+        try:
+            if not os.path.exists(CUSTOM_GATEWAYS_FILE):
+                return out
+            with open(CUSTOM_GATEWAYS_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '@' not in line:
+                        continue
+                    out.append(line)
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(
+                    f"Error loading custom gateways: {e}", "DEBUG",
+                )
+        return out
+
+    def add_custom_gateway(self, gateway):
+        """Persist a manually-typed gateway so it appears in the picker next time.
+
+        Args:
+            gateway: ``user@host`` string (already validated to contain '@').
+        """
+        gateway = (gateway or '').strip()
+        if not gateway or '@' not in gateway:
+            return False
+        try:
+            existing = self.load_custom_gateways()
+            if gateway in existing:
+                return False  # already there — nothing to do
+            existing.append(gateway)
+            # Atomic write via temp file + replace.
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix='.adb-custom-gw-', suffix='.tmp',
+                dir=os.path.dirname(CUSTOM_GATEWAYS_FILE) or '.',
+            )
+            try:
+                with os.fdopen(tmp_fd, 'w') as f:
+                    for g in existing:
+                        f.write(g + '\n')
+                os.replace(tmp_path, CUSTOM_GATEWAYS_FILE)
+            except Exception:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise
+            return True
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(
+                    f"Error saving custom gateway {gateway}: {e}", "ERROR",
+                )
+            return False
 
     @staticmethod
     def _validate_script(script_path, required_commands):

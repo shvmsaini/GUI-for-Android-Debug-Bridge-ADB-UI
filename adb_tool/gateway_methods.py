@@ -165,6 +165,26 @@ def _gather_all_gateways(seat_port_manager, seat_sh_devices):
         seen.add(key)
         out.append((seat, host, user))
 
+    # Custom gateways the user typed into the Gateway Explorer — saved to
+    # the custom cache so they show up next session even without a seat
+    # history entry. These have no seat label (the user typed just a host).
+    try:
+        custom_gateways = seat_port_manager.load_custom_gateways() or []
+    except Exception:
+        custom_gateways = []
+    for gateway in custom_gateways:
+        gateway = (gateway or '').strip()
+        if not gateway or '@' not in gateway:
+            continue
+        user, host = gateway.split('@', 1)
+        if not host:
+            continue
+        key = (host, user)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(('', host, user))
+
     # Sort: live (connected) first, then seat.sh, then history
     live_conn = []
     live_sh = []
@@ -399,6 +419,27 @@ class GatewayMixin:
             label = f"{seat} → {host} ({user})"
             out.append((label, host, user))
 
+        # Custom gateways typed into the Gateway Explorer — saved to the
+        # custom cache so they appear in the picker next session.
+        try:
+            custom_gateways = self.seat_port_manager.load_custom_gateways() or []
+        except Exception:
+            custom_gateways = []
+        for gateway in custom_gateways:
+            gateway = (gateway or '').strip()
+            if not gateway or '@' not in gateway:
+                continue
+            user, host = gateway.split('@', 1)
+            if not host:
+                continue
+            # Custom gateways don't have a seat name — key by host+user only.
+            key = ('', host, user)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = f"{host} ({user})"
+            out.append((label, host, user))
+
         # Sort: live (connected_seats) first, then seat.sh, then history.
         # Within each group, sort alphabetically by seat name.
         live_conn = []
@@ -513,6 +554,15 @@ class GatewayMixin:
             return
 
         user, host = text.split('@', 1)
+
+        # Persist the typed gateway to the custom cache so it appears in
+        # the picker next session even without a seat.sh history entry.
+        # This covers gateways the user explores ad-hoc without ever
+        # connecting via connect_seat (which writes to adb-seat-ports).
+        try:
+            self.seat_port_manager.add_custom_gateway(f"{user}@{host}")
+        except Exception:
+            pass
 
         # Look up password (already saved per the user's preference).
         # Per-host entry first, fall back to the global gateway key —
@@ -1299,7 +1349,7 @@ class GatewayMixin:
                         f"SSH_ASKPASS={shlex.quote(askpass_path)} "
                         f"SSH_ASKPASS_REQUIRE=force "
                         f"DISPLAY=:0 "
-                        f"scp -O "
+                        f"scp "
                         f"-o StrictHostKeyChecking=no "
                         f"-o UserKnownHostsFile=/dev/null "
                         f"-o ConnectTimeout=15 "
@@ -1333,21 +1383,21 @@ class GatewayMixin:
                             f"Gateway: Copy-to-Seat succeeded to /data/local/tmp/{raw_name}",
                             "INFO",
                         )
-                        QMessageBox.information(
+                        ui.call.emit(lambda: QMessageBox.information(
                             self, "Copy Complete",
                             f"Copied to seat:\n\n{seat_host}:{dest_path}\n\n"
                             f"Command ran on {user}@{host}:\n"
                             f"scp {raw_name} mtc@{seat_host}:/data/local/tmp/"
-                        )
+                        ))
                     else:
                         self.log(f"Gateway Copy-to-Seat failed: {message}", "ERROR")
                         # Strip the noisy warning banner from scp output so
                         # the user sees just the actionable error.
                         clean = _strip_seat_banner(message)
-                        QMessageBox.critical(
+                        ui.call.emit(lambda: QMessageBox.critical(
                             self, "Copy Failed",
                             f"Could not copy to seat:\n\n{clean}",
-                        )
+                        ))
 
                 if exit_code == 0:
                     ui.call.emit(lambda: done(True, "Copy complete"))
