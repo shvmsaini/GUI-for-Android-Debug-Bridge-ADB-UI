@@ -343,6 +343,23 @@ class VideoDisplayWidget(QWidget):
             pass
 
     def mousePressEvent(self, event):
+        # macOS dims background windows after a few seconds of inactivity.
+        # Without an explicit activateWindow() here, a click on the
+        # (already-dimmed) widget is consumed by the touch-forwarding path
+        # below and the window never regains key status — so it stays
+        # dimmed until the user closes it. Raising + activating on every
+        # click is cheap (Qt coalesces redundant calls) and restores the
+        # window to the foreground so the user can keep interacting.
+        # Also forward to Qt's default handling so the widget's focus
+        # policy actually gets a chance to focus itself.
+        win = self.window()
+        if win is not None and win is not self:
+            try:
+                if not win.isActiveWindow():
+                    win.activateWindow()
+                win.raise_()
+            except Exception:
+                pass
         self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton and self._client:
             coords = self._widget_to_device_coords(event.position().toPoint())
@@ -607,10 +624,10 @@ class ScrcpyMirrorWindow(QMainWindow):
         # latency. 800px on phone aspect ratios is still readable; 24 fps
         # is enough for fluid interaction; 500 kbps caps the bitrate so
         # the encoder doesn't blow past the link's capacity.
-        ("Low (network)",  500_000, 24, 800),
-        ("Medium",         1_500_000, 30, 1024),
-        ("High (local)",   3_000_000, 60, 1024),
-        ("Ultra",          6_000_000, 60, 1920),
+        ("Low", 500_000, 24, 800),
+        ("Medium", 1_500_000, 30, 1024),
+        ("High", 3_000_000, 60, 1024),
+        ("Ultra", 6_000_000, 60, 1920),
     ]
 
     def __init__(self, device_id, adb_path=None, bitrate=3_000_000,
@@ -657,7 +674,7 @@ class ScrcpyMirrorWindow(QMainWindow):
         self._recording_start_time = None
 
         # Set window title with enhanced info (device, seat, and if possible rack)
-        title_parts = [f"📡 Mirror — {device_id}"]
+        title_parts = [f"{device_id}"]
         if seat_info:
             title_parts.append(f"Seat: {seat_info}")
             # Extract potential rack info from seat name if present

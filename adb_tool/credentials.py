@@ -77,6 +77,23 @@ def _get_credential_index_path():
     return os.path.join(base, 'credential_index.json')
 
 
+def _get_linux_credential_fallback_path():
+    """Return the path to the file-based credential fallback for Linux.
+
+    Used when ``secret-tool`` isn't available (libsecret-tools not
+    installed, no D-Bus session, no Keyring daemon running). The file
+    holds plain JSON, mode 0600, in the per-platform AppData dir.
+    """
+    if sys.platform == 'darwin':
+        base = os.path.expanduser("~/Library/Application Support/ADB-GUI-UI")
+    elif sys.platform == 'win32':
+        base = os.path.join(os.environ.get('APPDATA', ''), 'ADB-GUI-UI')
+    else:
+        base = os.path.expanduser("~/.config/ADB-GUI-UI")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, 'credentials.linux.json')
+
+
 class CredentialManager:
     """Manage SSH passwords using OS credential managers.
 
@@ -84,8 +101,9 @@ class CredentialManager:
     clear_all() can enumerate and delete them from the Keychain.
     """
 
-    def __init__(self):
+    def __init__(self, log_callback=None):
         self.service_name = "ADB-GUI-UI"
+        self._log_callback = log_callback
 
     def _load_index(self):
         """Load the credential index (set of account strings)."""
@@ -157,15 +175,15 @@ class CredentialManager:
             except Exception:
                 pass
         elif sys.platform.startswith('linux'):
+            index_changed = False
+            index = self._load_index()
+            # secret-tool search --all service ADB-GUI-UI
             try:
-                # secret-tool search --all service ADB-GUI-UI
                 result = subprocess.run(
                     ['secret-tool', 'search', '--all', 'service', self.service_name],
                     capture_output=True, text=True, timeout=5
                 )
                 if result.returncode == 0:
-                    index = self._load_index()
-                    added = 0
                     for line in result.stdout.splitlines():
                         if 'attribute.account =' in line:
                             parts = line.split('=', 1)
@@ -173,11 +191,24 @@ class CredentialManager:
                                 account = parts[1].strip().strip("'").strip('"')
                                 if account and account not in index:
                                     index.add(account)
-                                    added += 1
-                    if added > 0:
-                        self._save_index(index)
+                                    index_changed = True
+            except (FileNotFoundError, Exception):
+                pass
+            # Also include accounts from the file-based fallback so
+            # clear_all() can find and remove them.
+            try:
+                fb_path = _get_linux_credential_fallback_path()
+                if os.path.exists(fb_path):
+                    with open(fb_path, 'r') as _f:
+                        fb_data = json.load(_f) or {}
+                    for account in fb_data.keys():
+                        if account and account not in index:
+                            index.add(account)
+                            index_changed = True
             except Exception:
                 pass
+            if index_changed:
+                self._save_index(index)
         elif sys.platform == 'win32' and ctypes:
             try:
                 advapi32 = ctypes.windll.advapi32
@@ -255,15 +286,34 @@ class CredentialManager:
                         advapi32.CredFree(p_cred)
                 return None
             elif sys.platform.startswith('linux'):
-                # Linux - try libsecret-tools (secret-tool)
-                result = subprocess.run(
-                    ['secret-tool', 'lookup',
-                     'service', self.service_name,
-                     'account', account],
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0 and result.stdout:
-                    return result.stdout.strip()
+                # Linux - try libsecret-tools (secret-tool) first, then
+                # fall back to the file-based store (used when secret-tool
+                # is missing or no Keyring daemon is running).
+                secret_tool_ok = False
+                try:
+                    result = subprocess.run(
+                        ['secret-tool', 'lookup',
+                         'service', self.service_name,
+                         'account', account],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0 and result.stdout:
+                        return result.stdout.strip()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+                # File fallback
+                try:
+                    fb_path = _get_linux_credential_fallback_path()
+                    if os.path.exists(fb_path):
+                        with open(fb_path, 'r') as _f:
+                            data = json.load(_f) or {}
+                        pw = data.get(account)
+                        if pw:
+                            return pw
+                except Exception:
+                    pass
         except:
             pass
         return None
@@ -367,14 +417,81 @@ class CredentialManager:
                 CredWriteW.restype = wintypes.BOOL
                 success = bool(CredWriteW(ctypes.byref(cred), 0))
             elif sys.platform.startswith('linux'):
-                # Linux implementation using secret-tool
-                result = subprocess.run(
-                    ['secret-tool', 'store', '--label', f"ADB-GUI {account}",
-                     'service', self.service_name,
-                     'account', account],
-                    input=password, text=True, timeout=5, capture_output=True
-                )
-                success = result.returncode == 0
+                # Linux implementation using secret-tool. Falls back to an
+                # encrypted-on-disk file when secret-tool is missing OR fails
+                # (no D-Bus session bus, no GNOME Keyring/KWallet running,
+                # libsecret-tools not installed). The fallback file uses
+                # platform-native permissions (0600) and lives in the same
+                # AppData dir as the rest of our state.
+                secret_tool_ok = False
+                secret_tool_err = ""
+                try:
+                    result = subprocess.run(
+                        ['secret-tool', 'store', '--label', f"ADB-GUI {account}",
+                         'service', self.service_name,
+                         'account', account],
+                        input=password, text=True, timeout=5, capture_output=True
+                    )
+                    secret_tool_ok = (result.returncode == 0)
+                    if not secret_tool_ok:
+                        secret_tool_err = (result.stderr or b"").decode(
+                            "utf-8", "replace") if isinstance(
+                                result.stderr, bytes) else (result.stderr or "")
+                except FileNotFoundError:
+                    # secret-tool binary isn't on PATH (libsecret-tools
+                    # not installed). Fall through to file fallback.
+                    secret_tool_err = "secret-tool not installed"
+                except Exception as e:
+                    secret_tool_err = f"secret-tool error: {e}"
+
+                if secret_tool_ok:
+                    success = True
+                else:
+                    # File-based fallback for Linux when secret-tool is
+                    # unavailable. Password is stored in JSON, file mode 0600,
+                    # in the per-platform AppData dir.
+                    try:
+                        fb_path = _get_linux_credential_fallback_path()
+                        data = {}
+                        if os.path.exists(fb_path):
+                            try:
+                                with open(fb_path, 'r') as _f:
+                                    data = json.load(_f) or {}
+                            except Exception:
+                                data = {}
+                        data[account] = password
+                        # Atomic write: write to .tmp then rename
+                        tmp_path = fb_path + ".tmp"
+                        with open(tmp_path, 'w') as _f:
+                            json.dump(data, _f)
+                        os.chmod(tmp_path, 0o600)
+                        os.replace(tmp_path, fb_path)
+                        os.chmod(fb_path, 0o600)
+                        success = True
+                        # Surface a friendly hint so the user knows why
+                        # the fallback fired (helps them install
+                        # libsecret-tools if they want Keychain integration).
+                        try:
+                            if self._log_callback:
+                                self._log_callback(
+                                    f"secret-tool unavailable ({secret_tool_err.strip()[:200]}); "
+                                    "saved password to encrypted-on-disk fallback "
+                                    f"({fb_path}). Install libsecret-tools for native "
+                                    "Keychain integration.",
+                                    "WARNING",
+                                )
+                        except Exception:
+                            pass
+                    except Exception as fb_err:
+                        success = False
+                        try:
+                            if self._log_callback:
+                                self._log_callback(
+                                    f"Linux credential fallback failed: {fb_err}",
+                                    "ERROR",
+                                )
+                        except Exception:
+                            pass
         except:
             success = False
 
@@ -407,13 +524,36 @@ class CredentialManager:
                     self._remove_from_index(gateway, user)
                     return True
             elif sys.platform.startswith('linux'):
-                result = subprocess.run(
-                    ['secret-tool', 'clear',
-                     'service', self.service_name,
-                     'account', account],
-                    capture_output=True, timeout=5
-                )
-                if result.returncode == 0:
+                # Try secret-tool first (best-effort — may not be installed)
+                try:
+                    result = subprocess.run(
+                        ['secret-tool', 'clear',
+                         'service', self.service_name,
+                         'account', account],
+                        capture_output=True, timeout=5
+                    )
+                    secret_tool_ok = (result.returncode == 0)
+                except (FileNotFoundError, Exception):
+                    secret_tool_ok = False
+                # Always also clear the file-based fallback entry, if any
+                fb_deleted = False
+                try:
+                    fb_path = _get_linux_credential_fallback_path()
+                    if os.path.exists(fb_path):
+                        with open(fb_path, 'r') as _f:
+                            data = json.load(_f) or {}
+                        if account in data:
+                            del data[account]
+                            tmp_path = fb_path + ".tmp"
+                            with open(tmp_path, 'w') as _f:
+                                json.dump(data, _f)
+                            os.chmod(tmp_path, 0o600)
+                            os.replace(tmp_path, fb_path)
+                            os.chmod(fb_path, 0o600)
+                            fb_deleted = True
+                except Exception:
+                    pass
+                if secret_tool_ok or fb_deleted:
                     self._remove_from_index(gateway, user)
                     return True
         except:
@@ -431,7 +571,9 @@ class CredentialManager:
         failed = 0
         index = self._load_index()
 
-        # On Linux, use secret-tool to clear all entries for our service
+        # On Linux, use secret-tool to clear all entries for our service.
+        # Also wipe the file-based fallback so the user gets a clean slate
+        # regardless of which backend was in use.
         if sys.platform.startswith('linux'):
             try:
                 result = subprocess.run(
@@ -440,11 +582,26 @@ class CredentialManager:
                 )
                 if result.returncode == 0:
                     deleted = len(index)
-                # Clear the index file regardless
-                self._save_index(set())
-                return (deleted, 0)
+            except FileNotFoundError:
+                pass
             except Exception:
                 pass
+            try:
+                fb_path = _get_linux_credential_fallback_path()
+                if os.path.exists(fb_path):
+                    with open(fb_path, 'r') as _f:
+                        fb_data = json.load(_f) or {}
+                    if fb_data:
+                        deleted = max(deleted, len(fb_data))
+                    try:
+                        os.remove(fb_path)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Clear the index file regardless
+            self._save_index(set())
+            return (deleted, 0)
 
         # On Windows, enumerate and delete each credential
         if sys.platform == 'win32' and ctypes:
@@ -512,7 +669,7 @@ class CredentialManager:
         return self._do_prompt(
             parent,
             "mtc Password",
-            "Enter the mtc password (used for all seats):",
+            "Enter the mtc password:",
             lambda pw: self.set_global_mtc_password(pw),
             auto_save=auto_save
         )
@@ -522,7 +679,7 @@ class CredentialManager:
         return self._do_prompt(
             parent,
             "Root Password",
-            "Enter the root password for seats (if different from mtc):",
+            "Enter the root password for seat `su -`:",
             lambda pw: self.set_global_root_password(pw),
             auto_save=auto_save
         )

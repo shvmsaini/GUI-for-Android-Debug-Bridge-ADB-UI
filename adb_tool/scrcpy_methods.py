@@ -415,7 +415,7 @@ class ScrcpyMixin:
             self.save_settings()
 
         # Initialize Credential Manager
-        self.credential_manager = CredentialManager()
+        self.credential_manager = CredentialManager(log_callback=self.log)
 
         # Cached logcat text for filtering
         self._logcat_full_text = ""
@@ -697,6 +697,20 @@ class ScrcpyMixin:
             )
             win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
             win.show()
+            # Bring the mirror window to the front so it doesn't launch
+            # behind the main app.  The seat "Play" button auto-launches
+            # the mirror via QTimer.singleShot(2000, …) — at that point
+            # the main window still owns focus, and without an explicit
+            # activateWindow() the mirror appears in the background.
+            # macOS then dims it within seconds and the user has to click
+            # somewhere on the (still-dimmed) window to bring it forward,
+            # which the previous version of the code didn't handle — so
+            # the window stayed dim until closed.
+            try:
+                win.raise_()
+                win.activateWindow()
+            except Exception:
+                pass
             if not hasattr(self, '_active_mirror_windows'):
                 self._active_mirror_windows = {}
             # Use same key as lookup (device_id + seat_context if available)

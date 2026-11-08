@@ -3360,6 +3360,14 @@ class SeatMixin:
         # Get password from Keychain only (no plain text storage)
         # Only prompt if no password is stored and we weren't passed one already
         password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
+        # If Keychain didn't have a credential but the caller passed one in
+        # (device_password/mtc_password), use that — typically they're the same
+        # gateway password the user typed into a recent connect prompt and
+        # auto-saved. We must NOT skip the Keychain fallback silently: if
+        # the caller passed an explicit value, prefer it so reconnect flows
+        # work the same way the first connect did.
+        if not password:
+            password = device_password or mtc_password
         if not password and not any([device_password, mtc_password]):
             self.update_status(f"🔑 Password required for {gateway_host}...")
             password = self.credential_manager.prompt_password(self, gateway_host, user)

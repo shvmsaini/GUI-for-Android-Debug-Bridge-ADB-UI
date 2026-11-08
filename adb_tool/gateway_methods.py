@@ -1167,7 +1167,7 @@ class GatewayMixin:
                 failed = 0
                 for rp, is_dir in targets:
                     try:
-                        _sftp_remove(sftp, rp, is_dir)
+                        _sftp_remove(sftp, rp, is_dir, ssh_client=ssh_client)
                         ok += 1
                     except Exception as e:
                         failed += 1
@@ -1182,15 +1182,56 @@ class GatewayMixin:
 
             threading.Thread(target=do_delete, daemon=True).start()
 
-        def _sftp_remove(sftp, path, is_dir):
+        def _sftp_remove(sftp, path, is_dir, ssh_client=None):
+            # Fast path: for directories (or any path), ask the SSH server to do
+            # the recursive walk itself. Recursing here entry-by-entry is one
+            # SFTP round-trip per file, which is catastrophic on trees like
+            # __MACOSX (hundreds of .DS_Store / ._* AppleDouble files per dir).
+            if ssh_client is not None:
+                try:
+                    # Quote defensively: paths come from the remote listing,
+                    # but treat them as untrusted anyway.
+                    quoted = shlex.quote(path)
+                    transport = ssh_client.get_transport()
+                    if transport is not None and transport.is_active():
+                        chan = transport.open_session(timeout=30)
+                        chan.settimeout(300)
+                        chan.exec_command(f"rm -rf -- {quoted}")
+                        # Drain both streams to EOF so the channel can close
+                        # cleanly and recv_exit_status returns the real rc.
+                        out = b""
+                        err = b""
+                        try:
+                            out = chan.recv(65536)
+                        except Exception:
+                            pass
+                        try:
+                            err = chan.recv_stderr(65536)
+                        except Exception:
+                            pass
+                        rc = chan.recv_exit_status()
+                        chan.close()
+                        self.log(
+                            f"Gateway rm -rf {path}: rc={rc} "
+                            f"stdout={out[:200]!r} stderr={err[:200]!r}"
+                        )
+                        if rc == 0:
+                            return
+                        # If `rm` failed (e.g. shell sandbox, perm denied, weird
+                        # FS), fall through to the slow path so the user still
+                        # gets a best-effort deletion.
+                except Exception as e:
+                    self.log(f"Gateway shell rm failed for {path}: {e}", "WARN")
+
             if is_dir:
-                # Recursive delete
+                # Slow path: walk the tree via SFTP. Used only as a fallback
+                # when shell `rm` isn't available or failed.
                 for attr in sftp.listdir_attr(path):
                     if attr.filename in ('.', '..'):
                         continue
                     child = path.rstrip('/') + '/' + attr.filename
                     child_is_dir = (attr.st_mode & 0o170000) == 0o040000
-                    _sftp_remove(sftp, child, child_is_dir)
+                    _sftp_remove(sftp, child, child_is_dir, ssh_client=ssh_client)
                 sftp.rmdir(path)
             else:
                 sftp.remove(path)
