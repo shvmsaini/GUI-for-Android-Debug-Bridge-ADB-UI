@@ -2461,9 +2461,29 @@ class ScrcpyMirrorWindow(QMainWindow):
         if self._client is None:
             return super().keyPressEvent(event)
 
+        # While the mirror is showing the "Reconnecting…" overlay the
+        # client object still exists but its control socket has been
+        # closed — forwarding keystrokes raises
+        # ``ScrcpyError: control socket is not connected`` and surfaces
+        # as a traceback in the log. Drop the keystroke; the watcher
+        # will resume the stream shortly and the next keypress after
+        # the overlay clears will go through normally.
+        if getattr(self, '_disconnected', False):
+            return super().keyPressEvent(event)
+
         key = event.key()
         modifiers = event.modifiers()
         has_ctrl_or_cmd = bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier))
+
+        def _safe_press(keycode):
+            """Send ``keycode`` to the device, swallowing the
+            ``control socket is not connected`` race that fires while
+            the auto-retry path is tearing down the old client.
+            """
+            try:
+                self._client.press_key(keycode)
+            except Exception as e:
+                self._log("DEBUG", f"press_key({keycode}) dropped: {e}")
 
         # Clipboard paste (Ctrl+V / Cmd+V)
         if has_ctrl_or_cmd:
@@ -2484,44 +2504,44 @@ class ScrcpyMirrorWindow(QMainWindow):
 
         # Android system / navigation keys
         if key == Qt.Key.Key_Escape:
-            self._client.press_key(KEYCODE_BACK)
+            _safe_press(KEYCODE_BACK)
             return
         if key == Qt.Key.Key_Home:
-            self._client.press_key(KEYCODE_HOME)
+            _safe_press(KEYCODE_HOME)
             return
         if key == Qt.Key.Key_Menu:
-            self._client.press_key(KEYCODE_APP_SWITCH)
+            _safe_press(KEYCODE_APP_SWITCH)
             return
 
         # Text editing & control keys
         if key == Qt.Key.Key_Backspace:
-            self._client.press_key(KEYCODE_DEL)
+            _safe_press(KEYCODE_DEL)
             return
         if key == Qt.Key.Key_Delete:
-            self._client.press_key(KEYCODE_FORWARD_DEL)
+            _safe_press(KEYCODE_FORWARD_DEL)
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._client.press_key(KEYCODE_ENTER)
+            _safe_press(KEYCODE_ENTER)
             return
         if key == Qt.Key.Key_Tab:
-            self._client.press_key(KEYCODE_TAB)
+            _safe_press(KEYCODE_TAB)
             return
         if key == Qt.Key.Key_Space:
-            self._client.press_key(KEYCODE_SPACE)
+            _safe_press(KEYCODE_SPACE)
             return
 
         # Directional navigation (arrow keys only - WASD are standard typing characters)
         if key == Qt.Key.Key_Up:
-            self._client.press_key(KEYCODE_DPAD_UP)
+            _safe_press(KEYCODE_DPAD_UP)
             return
         if key == Qt.Key.Key_Down:
-            self._client.press_key(KEYCODE_DPAD_DOWN)
+            _safe_press(KEYCODE_DPAD_DOWN)
             return
         if key == Qt.Key.Key_Left:
-            self._client.press_key(KEYCODE_DPAD_LEFT)
+            _safe_press(KEYCODE_DPAD_LEFT)
             return
         if key == Qt.Key.Key_Right:
-            self._client.press_key(KEYCODE_DPAD_RIGHT)
+            _safe_press(KEYCODE_DPAD_RIGHT)
             return
 
         # Regular text typing (letters, digits, punctuation, symbols, unicode)
@@ -2531,7 +2551,7 @@ class ScrcpyMirrorWindow(QMainWindow):
                 if hasattr(self._client, 'input_text'):
                     self._client.input_text(txt)
                 else:
-                    self._client.press_key(KEYCODE_SPACE if txt == ' ' else KEYCODE_ENTER)
+                    _safe_press(KEYCODE_SPACE if txt == ' ' else KEYCODE_ENTER)
             except Exception as e:
                 self._log("DEBUG", f"input_text failed: {e}")
             return

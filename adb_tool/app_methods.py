@@ -291,10 +291,17 @@ class AppMixin:
                     # Don't count failed installs - just don't increment
                     continue
 
-            # Detect the package name of the last installed APK (for auto-launch)
+            # Detect the package name of the last installed APK (for auto-launch).
+            # Skip entirely when nothing installed — there's no APK to inspect
+            # and the popup shouldn't offer to "launch" a package that
+            # wasn't installed. Without this guard the logs show a
+            # "Detected package: None" line and the user sees a confusing
+            # auto-launch prompt for a failed install.
             detected_pkg = None
             if last_apk and installed_count > 0:
                 detected_pkg = self._detect_package_name(last_apk)
+                if detected_pkg:
+                    self.log(f"Detected package: {detected_pkg}", "INFO")
 
             # Hide progress bar and show completion messagebox marshalled to GUI thread
             # Store metadata so that the method called on GUI thread can complete the UI
@@ -302,8 +309,6 @@ class AppMixin:
             self._install_batch_installed = installed_count
             self._install_batch_device_label = device_label
             self._install_batch_package = detected_pkg
-            self.log(f"Detected package: {detected_pkg}", "INFO")
-            self.log("Scheduling completion popup to GUI thread", "INFO")
             if hasattr(self, '_ui_caller') and self._ui_caller is not None:
                 self._ui_caller.call.emit(self._finalize_install_completion)
             elif hasattr(self, 'run_on_main_thread'):
@@ -545,7 +550,6 @@ class AppMixin:
         so it runs on the GUI thread after the install finishes.
         It uses metadata set when scheduling the call.
         """
-        self.log("_finalize_install_completion CALLED on GUI thread", "INFO")
         total = getattr(self, '_install_batch_total', 0)
         installed = getattr(self, '_install_batch_installed', 0)
         device_label = getattr(self, '_install_batch_device_label', 'unknown')
@@ -596,7 +600,6 @@ class AppMixin:
                                 self.launch_app_dialog()
                     else:
                         QMessageBox.information(self, "Install Complete", msg)
-                    self.log("Completion popup displayed", "INFO")
                 except (RuntimeError, ReferenceError) as e:
                     self.log(f"Could not show completion popup: {e}", "ERROR")
                 except Exception as e:
@@ -1170,7 +1173,7 @@ class AppMixin:
         app_window.setWindowTitle("Installed Apps")
         app_window.setMinimumSize(800, 500)
         app_window.setModal(True)
-        
+
         layout = QVBoxLayout(app_window)
         layout.setSpacing(5)
         layout.setContentsMargins(5, 5, 5, 5)
@@ -1194,7 +1197,16 @@ class AppMixin:
         listbox.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         listbox.setSelectionBehavior(QListWidget.SelectionBehavior.SelectRows)
         layout.addWidget(listbox)
-        
+
+        # Store widgets on the window so refresh_app_list_window can find
+        # them without going through the (closed-over) local variables of
+        # this method. The lambdas in ``refresh_list`` only pass ``app_window``
+        # and the new apps list — everything else is looked up off the
+        # window itself.
+        app_window.search_entry = search_entry
+        app_window.listbox = listbox
+        app_window.filter_checkbox = filter_checkbox
+
         # Store original apps list in window attribute so refresh can access it
         app_window.original_apps = apps.copy()
         
@@ -1956,3 +1968,81 @@ class AppMixin:
         app_window.raise_()
         app_window.activateWindow()
         app_window.exec()
+
+    def refresh_app_list_window(self, app_window, apps, search_entry=None, listbox=None):
+        """Refresh the open app-list window with a new app list.
+
+        Called from the worker thread in ``refresh_list`` once the new
+        ``pm list packages`` output is in. Updates ``original_apps`` (the
+        canonical list that ``update_list`` iterates), preserves existing
+        ``app_labels`` / ``app_versions`` for known packages, and re-runs
+        the same render path that ``show_app_list_window`` set up so the
+        listbox shows the new state.
+
+        ``search_entry`` and ``listbox`` are accepted but optional — when
+        called via the in-process refresh path inside
+        ``show_app_list_window`` they're the locals from that closure, and
+        when called from the worker's ``_ui_caller`` lambda they're
+        already stored as ``app_window.search_entry`` /
+        ``app_window.listbox`` and looked up here. The redundant args
+        exist for backwards-compat with callers that pass them.
+        """
+        try:
+            if app_window is None or not app_window.isVisible():
+                return
+
+            # Resolve widgets: prefer the explicit args, fall back to
+            # attributes the constructor stored on the window.
+            search_entry = search_entry or getattr(app_window, 'search_entry', None)
+            listbox = listbox or getattr(app_window, 'listbox', None)
+            if listbox is None:
+                # Nothing to render into — bail quietly.
+                self.log(
+                    "refresh_app_list_window: listbox not found on app window",
+                    "DEBUG",
+                )
+                return
+
+            # Replace the canonical list and re-render. New entries that
+            # don't yet have a label or version show as the package name
+            # with empty version — consistent with the initial render in
+            # show_app_list_window.
+            app_window.original_apps = list(apps)
+
+            search_term = (
+                search_entry.text().lower() if search_entry is not None else ""
+            )
+            filter_checkbox = getattr(app_window, 'filter_checkbox', None)
+            filter_disabled = (
+                filter_checkbox.isChecked() if filter_checkbox is not None else False
+            )
+
+            listbox.clear()
+            for app in app_window.original_apps:
+                app_label = app_window.app_labels.get(app, app)
+                if app_label == app:
+                    display_label = app
+                else:
+                    display_label = f"{app_label} ({app})"
+                is_disabled = app_window.app_status.get(app, False)
+                if filter_disabled and not is_disabled:
+                    continue
+                app_version = app_window.app_versions.get(app, '')
+                if search_term and not (
+                    search_term in app_label.lower()
+                    or search_term in app.lower()
+                    or search_term in app_version.lower()
+                ):
+                    continue
+                display_name = display_label
+                if app_version:
+                    display_name += f" v{app_version}"
+                if is_disabled:
+                    display_name += " [DISABLED]"
+                listbox.addItem(display_name)
+        except RuntimeError:
+            # Window torn down between our visibility check and the
+            # clear() — drop silently.
+            return
+        except Exception as e:
+            self.log(f"refresh_app_list_window failed: {e}", "DEBUG")

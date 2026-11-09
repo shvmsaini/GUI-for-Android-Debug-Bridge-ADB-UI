@@ -79,9 +79,27 @@ def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
     # binary, so passing the canary script as argv1 would re-run the
     # full GUI instead of the canary — a brief flash of a second
     # window every time the user clicks "Mirror" (the original bug).
+    #
     # In script mode `sys.executable` is the system Python and the
     # `--canary` flag still routes to scrcpy_canary.main() correctly.
-    cmd_argv = [sys.executable, "--canary"]
+    #
+    # Caveat: when running under ``python3 adb_gui.py``, sys.executable
+    # is just the interpreter (e.g. ``/usr/bin/python3``) with NO script
+    # argument, so ``[sys.executable, "--canary"]`` is just
+    # ``python3 --canary`` — Python's own argparse rejects the flag
+    # (``unknown option --canary``, exit code 2), the canary subprocess
+    # dies immediately, and ``_run_scrcpy_canary`` reports it as a
+    # failure — surfacing as the "Mirror Unavailable" dialog every
+    # single time. In frozen mode sys.executable is the bundled binary,
+    # which is also a Python program that knows about --canary, so it
+    # works there. Fix: when NOT frozen, dispatch via
+    # ``python -m adb_tool.scrcpy_canary`` so the module's own
+    # ``if __name__ == "__main__"`` guard runs main() directly. argv
+    # doesn't matter — the canary reads its JSON config from stdin.
+    if getattr(sys, "frozen", False):
+        cmd_argv = [sys.executable, "--canary"]
+    else:
+        cmd_argv = [sys.executable, "-m", "adb_tool.scrcpy_canary"]
 
     # CREATE_NO_WINDOW on Windows so no console pops up. On macOS/Linux
     # start_new_session so a SIGINT to the GUI doesn't kill the canary

@@ -575,6 +575,117 @@ class SeatPortManager:
         except Exception:
             pass
 
+    def kill_port_listener(self, port):
+        """Kill any process currently LISTENing on the given TCP port.
+
+        Belt-and-suspenders companion to :meth:`kill_seat_tunnel`. The pkill
+        patterns in ``kill_seat_tunnel`` match ssh command lines, but a
+        TCP LISTEN on the port can also be held by:
+          * an orphaned adb process from a half-killed previous connect,
+          * the adb server itself if it grabbed the port for a forward,
+          * a stale ssh child whose argv0 no longer matches our patterns
+            (e.g. wrapped by ``env`` / ``sudo`` / a shell wrapper).
+
+        We port-kill FIRST so ``seat.sh auto-connect`` (which reuses the
+        saved port) doesn't fail with ``bind: Address already in use``.
+
+        Mirrors the fish snippet::
+
+            set tunnel_pid (lsof -tiTCP:"$PORT" -sTCP:LISTEN)
+            if test -n "$tunnel_pid"
+                kill $tunnel_pid
+            end
+
+        Args:
+            port: TCP port number (string or int). Silently ignored when
+                empty / non-numeric.
+        """
+        if not port:
+            return
+        port_str = str(port).strip()
+        if not port_str.isdigit():
+            return
+        port_int = int(port_str)
+        if not (1 <= port_int <= 65535):
+            return
+
+        pids = []
+        if sys.platform == 'win32':
+            # Windows: netstat -ano lists LISTENING pids in the last column.
+            # No ``lsof`` equivalent ships with stock Windows.
+            try:
+                out = subprocess.run(
+                    ['netstat', '-ano', '-p', 'TCP'],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout or ''
+            except Exception:
+                out = ''
+            # Lines look like:  TCP    0.0.0.0:5555    0.0.0.0:0    LISTENING    1234
+            listen_re = re.compile(
+                r'^\s*TCP\s+\S+:' + re.escape(port_str) + r'\s+\S+\s+LISTENING\s+(\d+)\s*$',
+                re.MULTILINE,
+            )
+            pids = listen_re.findall(out)
+        else:
+            # macOS / Linux: ``lsof -tiTCP:<port> -sTCP:LISTEN`` prints the
+            # PIDs of processes LISTENing on <port>, one per line. Empty
+            # stdout means the port is free.
+            try:
+                out = subprocess.run(
+                    ['lsof', '-tiTCP:' + port_str, '-sTCP:LISTEN'],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout or ''
+            except FileNotFoundError:
+                # lsof not on PATH (rare, but possible on minimal Linux
+                # containers). Fall back to ss which is in iproute2.
+                try:
+                    ss_out = subprocess.run(
+                        ['ss', '-ltnp', f'sport = :{port_str}'],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout or ''
+                except Exception:
+                    ss_out = ''
+                # ss prints ``users:(("ssh",pid=1234,fd=4))`` — extract pid=
+                pids = re.findall(r'pid=(\d+)', ss_out)
+            except Exception:
+                pids = []
+            else:
+                pids = [p.strip() for p in out.splitlines() if p.strip()]
+
+        if not pids:
+            return
+
+        if self.log_callback:
+            self.log_callback(
+                f"Killing {len(pids)} stale LISTENer(s) on port {port_str} "
+                f"before seat connect (pids={','.join(pids)})",
+                "DEBUG",
+            )
+
+        for pid in pids:
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(
+                        ['taskkill', '/F', '/PID', pid],
+                        capture_output=True, timeout=5,
+                    )
+                else:
+                    # ``kill`` (SIGTERM) first; the ssh / adb children
+                    # exit cleanly and release the socket. SIGKILL only
+                    # if the process is still around a moment later.
+                    subprocess.run(
+                        ['kill', pid],
+                        capture_output=True, timeout=5,
+                    )
+            except Exception:
+                pass
+
+        # Give the kernel a moment to release the bound port.
+        try:
+            time.sleep(0.3)
+        except Exception:
+            pass
+
     def get_portforward_status(self):
         """Get current port forward status from script
         Returns dict with 'active', 'rack', 'headend', 'user', 'pid', 'ports' or None

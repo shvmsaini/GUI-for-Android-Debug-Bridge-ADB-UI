@@ -248,12 +248,23 @@ class DeviceMixin:
             if d.get('status') == 'offline'
             and self._device_ever_online.get(d.get('id'))
         ]
-        if offline_devices:
+        offline_ids = frozenset(d.get('id') for d in offline_devices if d.get('id'))
+        # Only log when the set of previously-online-but-now-offline devices
+        # has actually changed — otherwise every 5s refresh re-emits the
+        # same line and floods the output.
+        if not hasattr(self, '_offline_logged_ids'):
+            self._offline_logged_ids = frozenset()
+        if offline_devices and offline_ids != self._offline_logged_ids:
             self.log(
                 f"Found {len(offline_devices)} offline device(s) that were previously online — "
                 "prompting before disconnecting",
                 "INFO",
             )
+            self._offline_logged_ids = offline_ids
+        elif not offline_devices:
+            # Reset so the next time a device goes offline we log again.
+            self._offline_logged_ids = frozenset()
+        if offline_devices:
             # Set of seat names we've already prompted about in this session.
             # Without this, every 5-second refresh would re-prompt about the
             # same offline seat until the user clicks a button, flooding the
@@ -660,6 +671,17 @@ class DeviceMixin:
         """
         from .safe_dialog import safe_question
 
+        # Guard against stacking with a more-specific seizure dialog
+        # (which has better wording about "another user seized this seat").
+        if hasattr(self, '_seat_seized_dialog_open') and seat in self._seat_seized_dialog_open:
+            self.log(
+                f"Skipping duplicate offline-seat prompt for {seat} — "
+                "seizure dialog already open",
+                "DEBUG",
+            )
+            self._seat_offline_prompt_pending.discard(seat)
+            return
+
         # Snapshot the open mirror (if any) BEFORE the user clicks anything.
         # The watcher (in _start_seat_device_watcher) also snapshots on its
         # 2-second poll cycle, but there is a race: this popup fires from
@@ -704,6 +726,18 @@ class DeviceMixin:
         # stays open and the user can decide.
         def _auto_close_check():
             try:
+                # Check if the seat watcher has detected a seizure.
+                # If so, let the seizure dialog take priority — close
+                # this generic offline prompt so we don't show duplicate
+                # modals.
+                if seat in getattr(self, '_seat_was_seized', {}):
+                    self.log(
+                        f"Auto-closing offline prompt for {seat} — "
+                        "seizure dialog will be shown instead",
+                        "DEBUG",
+                    )
+                    return True
+
                 cached = getattr(self, 'cached_devices', None) or []
                 now_dev = next(
                     (d for d in cached if d.get('id') == device_id),

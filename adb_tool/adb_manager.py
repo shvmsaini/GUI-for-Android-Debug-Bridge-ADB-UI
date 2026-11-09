@@ -226,19 +226,32 @@ class ADBManager:
             return False
 
     def run_command(self, command, timeout=30):
-        """Run ADB command and return result"""
+        """Run ADB command and return result.
+
+        Implementation note: ``stdin=subprocess.DEVNULL`` is intentional.
+        Without it, the child inherits the GUI process's stdin, which is
+        typically a closed/invalid handle on macOS / Linux app bundles
+        and a console-less handle on Windows. ``adb install`` and a few
+        other commands wait on a stdin read for prompt confirmation
+        (``Do you want to uninstall?``, etc.) — if that read blocks
+        forever waiting on an invalid handle, the command never returns
+        and the call appears to time out. Pointing stdin at ``/dev/null``
+        makes those reads return EOF immediately. The terminal never
+        hits this because the shell's stdin is the user's keyboard.
+        """
         try:
             # Use shlex.split to properly handle quoted arguments
             # Split the command string into parts, handling quotes properly
             command_parts = shlex.split(command, posix=False) if command else []
             full_command = [self.adb_path] + command_parts
-            
+
             result = subprocess.run(
                 full_command,
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
+                stdin=subprocess.DEVNULL,
                 timeout=timeout,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
