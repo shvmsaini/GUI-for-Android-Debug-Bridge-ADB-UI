@@ -515,6 +515,15 @@ class DeviceMixin:
             self._cached_device_labels = new_labels
             self._cached_device_statuses = new_device_statuses
 
+            if ids_changed:
+                try:
+                    self.refresh_seat_port_lists(refetch=True)
+                except Exception as _seat_refresh_err:
+                    self.log(
+                        f"Post-device-refresh seat refresh failed: {_seat_refresh_err}",
+                        "DEBUG",
+                    )
+
             # Rebuild UI if anything changed
             if devices_changed:
                 # Clear old device buttons

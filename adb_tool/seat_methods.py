@@ -4571,12 +4571,27 @@ class SeatMixin:
                 "user whether to seize it",
                 "INFO",
             )
+
+            def _auto_close_check():
+                try:
+                    cached = getattr(self, 'cached_devices', None) or []
+                    now_dev = next(
+                        (d for d in cached if d.get('id') == device_id),
+                        None,
+                    )
+                    if now_dev is None:
+                        return False
+                    return now_dev.get('status') == 'device'
+                except Exception:
+                    return False
+
             confirmed = safe_question_multiline(
                 self,
                 "Device Connection Transfer",
                 f"The device {device_id} / seat {seat} was found in `adb devices` (status may be "
                 f"offline/missing — could be another user, or the device may be dead).\n\n"
-                "Attempt to take over this seat? This will disconnect any other user.\n"
+                "Attempt to take over this seat? This will disconnect any other user.\n",
+                auto_close_check=_auto_close_check,
             )
             if not confirmed:
                 # The user said No — but the device may have settled to
@@ -4812,6 +4827,19 @@ class SeatMixin:
         def ask_and_seize():
             try:
                 from .safe_dialog import safe_question_multiline
+                def _auto_close_check():
+                    try:
+                        cached = getattr(self, 'cached_devices', None) or []
+                        now_dev = next(
+                            (d for d in cached if d.get('id') == device_id),
+                            None,
+                        )
+                        if now_dev is None:
+                            return False
+                        return now_dev.get('status') == 'device'
+                    except Exception:
+                        return False
+
                 response = safe_question_multiline(
                     self,
                     "Device Connection Transfer",
@@ -4819,6 +4847,7 @@ class SeatMixin:
                     "This may mean it's being used by another user.\n\n"
                     "Transfer control to this session?\n"
                     "This will disconnect the other user immediately.",
+                    auto_close_check=_auto_close_check,
                 )
 
                 if not response:
