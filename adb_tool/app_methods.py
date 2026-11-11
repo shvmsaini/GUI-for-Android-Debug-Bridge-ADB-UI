@@ -273,11 +273,21 @@ class AppMixin:
                             self.run_on_main_thread(lambda i=idx: self._update_progress(i))
 
                     if use_gateway and self._is_seat_device(self.current_device):
-                        # Gateway deployment for seat devices
+                        # Gateway deployment for seat devices.
+                        # _install_via_gateway returns True only when the
+                        # APK actually made it onto the seat AND pm install
+                        # succeeded; an SCP failure used to be silently
+                        # counted as a successful install here, which made
+                        # the completion popup lie.
                         self.log(f"Using gateway deployment", "INFO")
-                        self._install_via_gateway(apk_path, fname, mtc_password)
-                        installed_count += 1  # Only count if gateway install succeeded
-                        last_apk = apk_path
+                        if self._install_via_gateway(apk_path, fname, mtc_password):
+                            installed_count += 1
+                            last_apk = apk_path
+                            self.log(f"✅ [{idx}/{total}] {fname} installed successfully")
+                            self.update_status(f"✅ Completed [{idx}/{total}]")
+                        else:
+                            self.log(f"❌ [{idx}/{total}] {fname} failed via gateway", "ERROR")
+                            self.update_status(f"❌ Failed [{idx}/{total}]")
                     else:
                         # Regular ADB install
                         if use_gateway:
@@ -329,12 +339,14 @@ class AppMixin:
         threading.Thread(target=do_install, daemon=True).start()
 
     def _install_via_gateway(self, apk_path, apk_name, mtc_password=None):
-        """Install APK via gateway using SCP with ProxyCommand tunnel
+        """Install APK via gateway using SCP with ProxyCommand tunnel.
 
-        Args:
-            apk_path: Local path to APK
-            apk_name: APK filename
-            mtc_password: mtc user password for SCP authentication
+        Returns:
+            True on success (APK installed via `pm install` on the seat),
+            False on any failure. Caller uses this to decide whether to
+            mark the APK as installed — without a return value, a failed
+            SCP was silently counted as a success and the user saw
+            "Installed successfully" + an auto-launch prompt.
         """
         device_id = self.current_device
 
@@ -351,12 +363,12 @@ class AppMixin:
         except Exception as e:
             self.log(f"Error getting seat info: {e}", "ERROR")
             self.update_status("Gateway: Failed")
-            return
+            return False
 
         if not seat_name or not gateway or '@' not in gateway:
             self.log("Missing seat/gateway info", "ERROR")
             self.update_status("Gateway: Missing info")
-            return
+            return False
 
         gateway_user, gateway_host = gateway.split('@', 1)
         # Copy to /tmp on the seat (was previously /storage/emulated/0/, i.e. /sdcard/).
@@ -373,16 +385,27 @@ class AppMixin:
             self.log("No mtc password - falling back to adb push", "WARNING")
             cmd = f"{self.get_device_flag()} push {shlex.quote(apk_path)} /sdcard/{apk_name}"
             result = self.adb.run_command(cmd, timeout=120)
-            if result['success']:
-                cmd = f"{self.get_device_flag()} shell pm install -r -d -t /sdcard/{apk_name}"
-                result = self.adb.run_command(cmd, timeout=180)
-                if result['success']:
-                    self.update_status("✅ Installed (fallback)")
-                else:
-                    self.log("Install failed", "ERROR")
-            else:
+            if not result['success']:
                 self.log("Push failed", "ERROR")
-            return
+                self.update_status("Gateway: Push failed")
+                return False
+            cmd = f"{self.get_device_flag()} shell pm install -r -d -t /sdcard/{apk_name}"
+            result = self.adb.run_command(cmd, timeout=180)
+            if not result['success']:
+                self.log("Install failed", "ERROR")
+                self.update_status("Gateway: Install failed")
+                return False
+            self.update_status("✅ Installed (fallback)")
+            # Mirror the success-path cleanup below so we don't leak
+            # /sdcard/<apk_name> on the seat.
+            try:
+                self.adb.run_command(
+                    f"{self.get_device_flag()} shell rm -f /sdcard/{shlex.quote(apk_name)}",
+                    timeout=30,
+                )
+            except Exception:
+                pass
+            return True
 
         # Establish jump host connection
         try:
@@ -500,11 +523,11 @@ class AppMixin:
             else:
                 self.log(f"SCP failed: {err_str[:200]}", "ERROR")
                 self.update_status("Gateway: SCP failed")
-            return
+            return False
         except Exception as e:
             self.log(f"SCP exception: {e}", "ERROR")
             self.update_status("Gateway: Exception")
-            return
+            return False
         finally:
             if 'jump' in locals():
                 try: jump.close()
@@ -515,6 +538,20 @@ class AppMixin:
         self.log("Running pm install...", "INFO")
         cmd = f"{self.get_device_flag()} shell pm install -r -d -t {shlex.quote(remote_path)}"
         result = self.adb.run_command(cmd, timeout=180)
+        if not result['success']:
+            stderr = (result.get('stderr') or '').strip() or (result.get('stdout') or '').strip()
+            self.log(f"❌ pm install failed: {stderr[:200]}", "ERROR")
+            self.update_status(f"Gateway: pm install failed - {stderr[:80]}")
+            # Best-effort cleanup — the file is on the seat but the install
+            # didn't go through, so leave it off the device.
+            try:
+                self.adb.run_command(
+                    f"{self.get_device_flag()} shell rm -f {shlex.quote(remote_path)}",
+                    timeout=30,
+                )
+            except Exception:
+                pass
+            return False
 
         # Clean up APK files after successful installation to save space
         # Remove from seat and local APK if successful
@@ -535,6 +572,7 @@ class AppMixin:
             QTimer.singleShot(2000, _cleanup) if not getattr(self, '_closing', False) else None
         ))
         self.update_status("Gateway: ✅ Installed")
+        return True
 
     def _show_progress(self, current, total):
         """Show progress bar and initialize values"""
@@ -567,12 +605,26 @@ class AppMixin:
         if hasattr(self, 'progress_bar'):
             self._hide_progress()
 
-        if installed < total:
-            self.update_status(f"Installed {installed}/{total} APK(s) on {device_label}")
-            msg = f"Installed {installed}/{total} APK file(s) on {device_label}. Some failed - check logs."
+        if installed == 0:
+            self.update_status(f"❌ Install failed on {device_label} (0/{total})")
+            title = "Install Failed"
+            msg = (
+                f"Failed to install APK file(s) on {device_label}.\n\n"
+                f"0 of {total} installed successfully.\n"
+                f"Check the logs for details."
+            )
+        elif installed < total:
+            self.update_status(f"❌ Installed {installed}/{total} APK(s) on {device_label}")
+            title = "Install Partially Failed"
+            msg = (
+                f"Installed {installed}/{total} APK file(s) on {device_label} "
+                f"— {total - installed} failed.\n\n"
+                f"Check the logs for details on the failures."
+            )
         else:
-            self.update_status(f"Installed {total} APK(s) on {device_label}")
-            msg = f"Installed {total} APK file(s) on {device_label} successfully!"
+            self.update_status(f"✅ Installed {total}/{total} APK(s) on {device_label}")
+            title = "Install Complete"
+            msg = f"Installed {total}/{total} APK file(s) on {device_label} successfully!"
 
         try:
             # Defer the QMessageBox to the next event-loop tick so it runs
@@ -591,7 +643,7 @@ class AppMixin:
                                 f"Do you want to launch this app?"
                             )
                             reply = QMessageBox.question(
-                                self, "Install Complete",
+                                self, title,
                                 launch_text,
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                 QMessageBox.StandardButton.Yes
@@ -601,15 +653,25 @@ class AppMixin:
                                 self._launch_package(detected_pkg)
                         else:
                             reply = QMessageBox.question(
-                                self, "Install Complete",
+                                self, title,
                                 msg + "\n\nDo you want to launch an app?",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                 QMessageBox.StandardButton.Yes
                             )
                             if reply == QMessageBox.StandardButton.Yes:
                                 self.launch_app_dialog()
+                    elif installed == 0:
+                        # All failed — use a critical dialog with an error
+                        # icon so the user sees the failure clearly, not
+                        # the friendly "i" icon used for informational
+                        # popups.
+                        QMessageBox.critical(self, title, msg)
+                    elif installed < total:
+                        # Partial failure — warning so the dialog is
+                        # visually distinct from a normal completion.
+                        QMessageBox.warning(self, title, msg)
                     else:
-                        QMessageBox.information(self, "Install Complete", msg)
+                        QMessageBox.information(self, title, msg)
                 except (RuntimeError, ReferenceError) as e:
                     self.log(f"Could not show completion popup: {e}", "ERROR")
                 except Exception as e:
