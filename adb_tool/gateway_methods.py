@@ -326,6 +326,15 @@ class GatewayMixin:
                 look_for_keys=False,
                 sock=sock,
             )
+            # Send an SSH keepalive every 30s so idle explorer windows notice
+            # dead sockets (NAT/firewall timeout) instead of hanging forever on
+            # the next sftp.listdir_attr() call.
+            transport = client.get_transport()
+            if transport is not None:
+                try:
+                    transport.set_keepalive(30)
+                except Exception:
+                    pass
             sftp = client.open_sftp()
             return client, sftp
         except paramiko.AuthenticationException:
@@ -823,12 +832,21 @@ class GatewayMixin:
             return (value if status == 'ok' else None), (None if status == 'ok' else str(value))
 
         # Listing ----------------------------------------------------------
+        # Each refresh bumps _refresh_gen. Stale worker callbacks compare
+        # against the current gen and bail out, so a slow previous ls()
+        # can't overwrite a newer listing (and can't pin "Loading…" if it
+        # never returns).
+        _refresh_state = {'gen': 0}
+        _LS_TIMEOUT_S = 15  # watchdog: surface [Error] if SFTP wedges
+
         def refresh_listing():
             p = current_path()
             listbox.set_device_context(f"sftp:{user}@{host}", p)
             listbox.setRowCount(0)
             listbox.setRowCount(1)
             listbox.setItem(0, 0, QTableWidgetItem("Loading…"))
+            _refresh_state['gen'] += 1
+            gen = _refresh_state['gen']
 
             def do_ls():
                 rows = []
@@ -853,6 +871,11 @@ class GatewayMixin:
                     err = str(e)
 
                 def apply():
+                    # Drop stale results — a newer refresh_listing() has
+                    # already kicked off and the user is past this listing.
+                    if _refresh_state['gen'] != gen:
+                        return
+                    t_watchdog.cancel()
                     listbox.setRowCount(0)
                     if err:
                         listbox.setRowCount(1)
@@ -869,7 +892,29 @@ class GatewayMixin:
 
                 ui.call.emit(apply)
 
+            def watchdog():
+                # If the SFTP call wedges (e.g. dead SSH socket before
+                # keepalive has had a chance to notice), surface an error
+                # instead of leaving "Loading…" pinned forever.
+                if _refresh_state['gen'] != gen:
+                    return
+                ui.call.emit(_show_listing_error(
+                    gen,
+                    f"Listing timed out after {_LS_TIMEOUT_S}s — session may be dead; click Refresh.",
+                ))
+
             threading.Thread(target=do_ls, daemon=True).start()
+            t_watchdog = threading.Timer(_LS_TIMEOUT_S, watchdog)
+            t_watchdog.daemon = True
+            t_watchdog.start()
+
+        def _show_listing_error(gen, msg):
+            """GUI-thread helper: surface a timeout/error row, ignoring stale gens."""
+            if _refresh_state['gen'] != gen:
+                return
+            listbox.setRowCount(0)
+            listbox.setRowCount(1)
+            listbox.setItem(0, 0, QTableWidgetItem(f"[Error] {msg}"))
 
         def go_up():
             p = current_path()
