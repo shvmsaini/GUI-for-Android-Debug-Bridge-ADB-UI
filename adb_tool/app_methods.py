@@ -426,7 +426,7 @@ class AppMixin:
                     self.update_status(f"Gateway: {msg}")
                     self.log(f"Gateway: {msg}", "INFO")
 
-            jump.copy_to_seat_via_gateway(
+            actual_remote_path = jump.copy_to_seat_via_gateway(
                 local_path=apk_path,
                 remote_path=remote_path,
                 seat_host=seat_name,
@@ -434,10 +434,12 @@ class AppMixin:
                 timeout=300,
                 progress_callback=_on_stage,
             )
+            if not isinstance(actual_remote_path, str):
+                actual_remote_path = remote_path
 
             try:
                 self.adb.run_command(
-                    f"{self.get_device_flag()} shell chmod 644 {shlex.quote(remote_path)}",
+                    f"{self.get_device_flag()} shell chmod 644 {shlex.quote(actual_remote_path)}",
                     timeout=15,
                 )
             except Exception:
@@ -445,7 +447,7 @@ class AppMixin:
                     jump.run_remote_command(
                         seat_host=seat_name,
                         mtc_password=mtc_password,
-                        command=f"chmod 644 {shlex.quote(remote_path)}",
+                        command=f"chmod 644 {shlex.quote(actual_remote_path)}",
                         timeout=15,
                     )
                 except Exception:
@@ -480,7 +482,7 @@ class AppMixin:
 
         self.update_status(f"Gateway: Installing {apk_name}...")
         self.log("Running pm install...", "INFO")
-        cmd = f"{self.get_device_flag()} shell pm install -r -d -t {shlex.quote(remote_path)}"
+        cmd = f"{self.get_device_flag()} shell pm install -r -d -t {shlex.quote(actual_remote_path)}"
         result = self.adb.run_command(cmd, timeout=180)
         if not result['success']:
             stderr = (result.get('stderr') or '').strip() or (result.get('stdout') or '').strip()
@@ -488,7 +490,7 @@ class AppMixin:
             self.update_status(f"Gateway: pm install failed - {stderr[:80]}")
             try:
                 self.adb.run_command(
-                    f"{self.get_device_flag()} shell rm -f {shlex.quote(remote_path)}",
+                    f"{self.get_device_flag()} shell rm -f {shlex.quote(actual_remote_path)}",
                     timeout=30,
                 )
             except Exception:
@@ -497,8 +499,7 @@ class AppMixin:
 
         def _cleanup():
             try:
-                self.adb.run_command(f"{self.get_device_flag()} shell rm -f {shlex.quote(remote_path)}", timeout=30)
-                self.log(f"Cleaned up {apk_name} from seat /data/local/tmp", "DEBUG")
+                self.adb.run_command(f"{self.get_device_flag()} shell rm -f {shlex.quote(actual_remote_path)}", timeout=30)
             except Exception:
                 pass
 

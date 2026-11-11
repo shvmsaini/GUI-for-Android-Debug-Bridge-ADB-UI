@@ -496,6 +496,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             mtc_password=mtc_password,
                             timeout=300,
                             progress_callback=_on_stage,
+                            root_shell=shell,
                         )
                         ok += 1
                         parent.log(f"✓ {seat_hostname}:{target_path}", "INFO")
@@ -512,6 +513,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                                     mtc_password=mtc_password,
                                     timeout=300,
                                     progress_callback=_on_stage,
+                                    root_shell=shell,
                                 )
                                 mv_cmd = f"cp -f {shlex.quote(staged_tmp)} {shlex.quote(target_path)} && rm -f {shlex.quote(staged_tmp)} && chmod 644 {shlex.quote(target_path)}"
                                 _, code_mv = shell.run(mv_cmd, timeout=30)

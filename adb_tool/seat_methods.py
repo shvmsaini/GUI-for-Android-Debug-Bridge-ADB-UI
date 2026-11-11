@@ -784,7 +784,7 @@ class _SeatJumpHost:
                 cmd.extend(["-P", str(self._port)])
             cmd.extend([
                 local_path,
-                f"{self._user}@{self._host}:{gateway_dest_path}",
+                f"{self._user}@{self._host}:{gateway_dest_path.replace(' ', chr(92) + ' ')}",
             ])
 
             env = os.environ.copy()
@@ -845,7 +845,7 @@ class _SeatJumpHost:
             if self._port != 22:
                 cmd.extend(["-P", str(self._port)])
             cmd.extend([
-                f"{self._user}@{self._host}:{gateway_source_path}",
+                f"{self._user}@{self._host}:{gateway_source_path.replace(' ', chr(92) + ' ')}",
                 local_path,
             ])
 
@@ -969,8 +969,14 @@ class _SeatJumpHost:
 
     def copy_to_seat_via_gateway(self, local_path, remote_path, seat_host,
                                  mtc_password=None, timeout=600,
-                                 progress_callback=None):
-        """Copy a local file to the seat through the gateway."""
+                                 progress_callback=None, root_shell=None):
+        """Copy a local file to the seat through the gateway.
+
+        root_shell: optional _SeatShell with root access on the seat.
+        When provided and bct/scp fails with Permission Denied, tries a list
+        of candidate staging paths on the seat (some seats lock /data/local/tmp,
+        others lock /tmp), then uses the root shell to mv to the final destination.
+        """
         import uuid as _uuid
         basename = os.path.basename(local_path)
         gw_staging = f"/tmp/{basename}"
@@ -985,7 +991,8 @@ class _SeatJumpHost:
             self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
         except Exception as e:
             self._log(f"Staging directly as {gw_staging} failed ({e}), falling back to unique name", "DEBUG")
-            gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex[:8]}-{basename}"
+            # UUID-only name avoids issues with spaces or special chars in basename
+            gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex}"
             self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
 
         if has_bct:
@@ -1002,10 +1009,12 @@ class _SeatJumpHost:
         success = False
         last_error = ""
 
-        try:
+        def _try_transfer(seat_dest_path, gw_stage=gw_staging):
+            """Try bct put then gateway scp to seat_dest_path. Returns (ok, err_str).
+            gw_stage is NOT deleted on failure — the caller owns cleanup."""
             if has_bct:
-                staging_dir = os.path.dirname(gw_staging) or "/tmp"
-                staging_name = os.path.basename(gw_staging)
+                staging_dir = os.path.dirname(gw_stage) or "/tmp"
+                staging_name = os.path.basename(gw_stage)
                 bct_put_inner = (
                     "export PS1='$ '; "
                     "shopt -s expand_aliases 2>/dev/null; "
@@ -1021,76 +1030,157 @@ class _SeatJumpHost:
                     '  done; '
                     'fi; '
                     f'cd {shlex.quote(staging_dir)} && ('
-                    f'bct put -s {shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{remote_path}")} || '
-                    f'bct put -s ./{shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{remote_path}")} || '
-                    f'bct put -s {shlex.quote(gw_staging)} -d {shlex.quote(f"{seat_host}:{remote_path}")}); '
-                    f'_RC=$?; rm -f {shlex.quote(gw_staging)}; exit $_RC'
+                    f'bct put -s {shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")} || '
+                    f'bct put -s ./{shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")} || '
+                    f'bct put -s {shlex.quote(gw_stage)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")}); '
+                    # Only delete on success; on failure leave the file for the next fallback attempt
+                    f'_RC=$?; [ $_RC -eq 0 ] && rm -f {shlex.quote(gw_stage)}; exit $_RC'
                 )
                 bct_put_cmd = f"bash -lic {shlex.quote(bct_put_inner)}"
-                self._log(f"BCT: bct put -s {staging_name} -d {seat_host}:{remote_path}", "INFO")
+                self._log(f"BCT: bct put -s {staging_name} -d {seat_host}:{seat_dest_path}", "INFO")
                 res = self.run_gateway_command(bct_put_cmd, timeout=timeout)
                 if res.returncode == 0:
+                    return True, ""
+                err = (res.stderr or res.stdout or "").strip()
+                bct_err = f"bct put failed (code {res.returncode}): {err[:300]}"
+                self._log(f"{bct_err}; trying scp fallback...", "WARNING")
+                if progress_callback:
+                    progress_callback("fallback_doing_scp", "bct put failed, trying scp…")
+                if "permission denied" in err.lower():
+                    return False, bct_err
+
+            if mtc_password:
+                askpass_path = f"/tmp/.adb-gui-ap-{_uuid.uuid4().hex[:8]}.sh"
+                askpass_script = (
+                    "#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    f"  *\"password:\"*|*\"Password:\"*) echo {shlex.quote(mtc_password)} ;;\n"
+                    "  *) echo \"yes\" ;;\n"
+                    "esac\n"
+                )
+                scp_gw_cmd = (
+                    f"cat > {askpass_path} << 'EOF'\n{askpass_script}\nEOF\n"
+                    f"chmod 700 {askpass_path}\n"
+                    f"SSH_ASKPASS={shlex.quote(askpass_path)} SSH_ASKPASS_REQUIRE=force DISPLAY=:0 "
+                    f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "
+                    f"{shlex.quote(gw_stage)} mtc@{seat_host}:{shlex.quote(seat_dest_path)}\n"
+                    f"RET=$?\n"
+                    f"rm -f {askpass_path}\n"
+                    # Only delete gw_stage on success; leave it for the next fallback
+                    f"[ $RET -eq 0 ] && rm -f {shlex.quote(gw_stage)}\n"
+                    f"exit $RET"
+                )
+                self._log(f"Running scp on gateway: {gw_stage} → mtc@{seat_host}:{seat_dest_path}", "INFO")
+                res = self.run_gateway_command(scp_gw_cmd, timeout=timeout)
+                if res.returncode == 0:
+                    return True, ""
+                err = (res.stderr or res.stdout or "").strip()
+                return False, f"gateway scp failed (code {res.returncode}): {err[:300]}"
+
+            return False, "no mtc_password available for scp fallback"
+
+        def _is_perm_denied(err):
+            return "permission denied" in err.lower()
+
+        try:
+            ok, last_error = _try_transfer(remote_path)
+            if ok:
+                success = True
+
+            # If bct/scp failed without an obvious "permission denied" in the error
+            # (can happen when SSL noise masks the real message), try direct scp to
+            # get a cleaner error before deciding whether to escalate.
+            if not success and not _is_perm_denied(last_error):
+                try:
+                    self._log(f"Attempting direct scp from local to {seat_host}:{remote_path}...", "INFO")
+                    self.run_scp(
+                        local_path=local_path,
+                        remote_path=remote_path,
+                        seat_host=seat_host,
+                        mtc_password=mtc_password,
+                        timeout=timeout,
+                    )
                     success = True
-                    self._log(f"✓ bct put succeeded: {seat_host}:{remote_path}", "INFO")
-                else:
-                    err = (res.stderr or res.stdout or "").strip()
-                    last_error = f"bct put failed (code {res.returncode}): {err[:300]}"
-                    self._log(f"{last_error}; attempting fallback via scp to seat...", "WARNING")
+                    self._log(f"✓ direct scp succeeded: {seat_host}:{remote_path}", "INFO")
+                except Exception as e:
+                    direct_err = str(e)
+                    self._log(f"Direct scp failed: {direct_err[:200]}", "ERROR")
+                    if _is_perm_denied(direct_err):
+                        last_error = direct_err  # surface the cleaner error
+
+            # Permission denied: try staging via alternative seat directories.
+            # Seat images vary: some lock /data/local/tmp, others lock /tmp.
+            # With root_shell: mv to the final destination after staging.
+            # Without root_shell: leave the file at the staging path and return it.
+            actual_seat_path = remote_path
+            if not success and _is_perm_denied(last_error):
+                dest_dir = os.path.dirname(remote_path) or "/"
+                staging_candidates = ["/data/local/tmp", "/tmp", "/sdcard", "/storage/emulated/0"]
+                for staging_base in staging_candidates:
+                    stage_path = f"{staging_base}/{basename}"
+                    if os.path.dirname(stage_path) == dest_dir:
+                        continue
+                    self._log(f"Trying staging via {staging_base}…", "INFO")
                     if progress_callback:
-                        progress_callback("fallback_doing_scp", "bct put failed, trying scp to seat…")
-
-            if not success:
-                if mtc_password:
-                    askpass_path = f"/tmp/.adb-gui-ap-{_uuid.uuid4().hex[:8]}.sh"
-                    askpass_script = (
-                        "#!/bin/sh\n"
-                        "case \"$1\" in\n"
-                        f"  *\"password:\"*|*\"Password:\"*) echo {shlex.quote(mtc_password)} ;;\n"
-                        "  *) echo \"yes\" ;;\n"
-                        "esac\n"
-                    )
-                    scp_gw_cmd = (
-                        f"cat > {askpass_path} << 'EOF'\n{askpass_script}\nEOF\n"
-                        f"chmod 700 {askpass_path}\n"
-                        f"SSH_ASKPASS={shlex.quote(askpass_path)} SSH_ASKPASS_REQUIRE=force DISPLAY=:0 "
-                        f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "
-                        f"{shlex.quote(gw_staging)} mtc@{seat_host}:{shlex.quote(remote_path)}\n"
-                        f"RET=$?\n"
-                        f"rm -f {askpass_path} {shlex.quote(gw_staging)}\n"
-                        f"exit $RET"
-                    )
-                    self._log(f"Running scp on gateway: {gw_staging} → mtc@{seat_host}:{remote_path}", "INFO")
-                    res = self.run_gateway_command(scp_gw_cmd, timeout=timeout)
-                    if res.returncode == 0:
-                        success = True
-                        self._log(f"✓ gateway scp succeeded: {seat_host}:{remote_path}", "INFO")
-                    else:
-                        err = (res.stderr or res.stdout or "").strip()
-                        last_error = f"gateway scp failed (code {res.returncode}): {err[:300]}"
-                        self._log(last_error, "WARNING")
-
-                if not success:
-                    try:
-                        self._log(f"Attempting direct scp from local to {seat_host}:{remote_path}...", "INFO")
-                        self.run_scp(
-                            local_path=local_path,
-                            remote_path=remote_path,
-                            seat_host=seat_host,
-                            mtc_password=mtc_password,
-                            timeout=timeout,
+                        progress_callback(
+                            "gateway_done_doing_bct" if has_bct else "gateway_done_doing_scp",
+                            f"Staging to {staging_base}…"
                         )
-                        success = True
-                        self._log(f"✓ direct scp succeeded: {seat_host}:{remote_path}", "INFO")
-                    except Exception as e:
-                        last_error = str(e)
-                        self._log(f"Direct scp failed: {e}", "ERROR")
+                    stage_ok, stage_err = _try_transfer(stage_path)
+                    if stage_ok:
+                        if root_shell:
+                            mv_cmd = (
+                                f"cp -f {shlex.quote(stage_path)} {shlex.quote(remote_path)} && "
+                                f"rm -f {shlex.quote(stage_path)} && "
+                                f"chmod 644 {shlex.quote(remote_path)}"
+                            )
+                            _, code_mv = root_shell.run(mv_cmd, timeout=30)
+                            if code_mv == 0:
+                                success = True
+                                actual_seat_path = remote_path
+                                self._log(f"✓ Staged via {staging_base}, root-moved to {remote_path}", "INFO")
+                                break
+                            else:
+                                self._log(
+                                    f"Root mv from {stage_path} to {remote_path} failed (code {code_mv})",
+                                    "WARNING"
+                                )
+                                try:
+                                    root_shell.run(f"rm -f {shlex.quote(stage_path)}", timeout=5)
+                                except Exception:
+                                    pass
+                        else:
+                            success = True
+                            actual_seat_path = stage_path
+                            self._log(f"✓ Staged to {stage_path} (no root shell; using this path)", "INFO")
+                            break
+                    else:
+                        self._log(f"Staging to {staging_base} also failed: {stage_err[:200]}", "WARNING")
+
+            # Final direct-scp attempt (only if not already tried above)
+            if not success and not _is_perm_denied(last_error):
+                try:
+                    self._log(f"Attempting direct scp from local to {seat_host}:{remote_path}...", "INFO")
+                    self.run_scp(
+                        local_path=local_path,
+                        remote_path=remote_path,
+                        seat_host=seat_host,
+                        mtc_password=mtc_password,
+                        timeout=timeout,
+                    )
+                    success = True
+                    actual_seat_path = remote_path
+                    self._log(f"✓ direct scp succeeded: {seat_host}:{remote_path}", "INFO")
+                except Exception as e:
+                    last_error = str(e)
+                    self._log(f"Direct scp failed: {e}", "ERROR")
 
             if not success:
                 raise _SeatSshError(f"Failed to copy to seat: {last_error}")
 
             if progress_callback:
                 progress_callback("done", f"✓ Done copying {basename} to {seat_host}")
-            return True
+            return actual_seat_path
         finally:
             def _async_cleanup(p=gw_staging):
                 try:
