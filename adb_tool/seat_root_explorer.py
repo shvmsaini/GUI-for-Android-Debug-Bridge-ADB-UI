@@ -214,6 +214,9 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         listbox.set_device_context(f"seat_root:{seat_hostname}", "/")
         layout.addWidget(listbox, 1)
 
+        # Track current directory write permissions
+        current_dir_writable = True
+
         # Buttons row
         btn_row = QHBoxLayout()
         push_btn = QPushButton("⬆️ Push")
@@ -242,6 +245,11 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             p = raw.strip() or "/"
             parent.log(f"Seat Root: current_path() read {raw!r} → {p!r}", "DEBUG")
             return p.rstrip('/') if p not in ('/', '.') else '/'
+
+        def set_current_dir_writable(is_writable):
+            nonlocal current_dir_writable
+            current_dir_writable = is_writable
+            parent.log(f"Seat Root: current directory {current_path()} writable={is_writable}", "DEBUG")
 
         def join_remote(base, name):
             base = base.rstrip('/') if base != '/' else ''
@@ -386,6 +394,22 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         listbox.setItem(i, 1, size_item)
                     explorer._ls_in_progress = False  # done, allow next refresh
                 ui.call.emit(apply)
+
+                # Check write permissions for current directory
+                def check_write_permissions():
+                    try:
+                        p = current_path()
+                        test_file = f"{p}/.write_test_{uuid.uuid4().hex[:8]}"
+                        cmd = f"touch {shlex.quote(test_file)} && rm {shlex.quote(test_file)}"
+                        parent.log(f"Seat Root: checking write permissions for {p}", "DEBUG")
+                        out, code = shell.run(cmd, timeout=10)
+                        is_writable = code == 0
+                        ui.call.emit(lambda: set_current_dir_writable(is_writable))
+                    except Exception as e:
+                        parent.log(f"Seat Root: write permission check failed: {e}", "DEBUG")
+                        ui.call.emit(lambda: set_current_dir_writable(False))
+
+                threading.Thread(target=check_write_permissions, daemon=True).start()
             threading.Thread(target=do_ls, daemon=True).start()
 
         def go_up():
@@ -443,8 +467,25 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             # Destination is the current path on the seat
             dest = current_path()
 
-            # Use a simpler flow: just do the push right away
-            # Error handling will detect read-only and suggest fallback
+            # Check if current directory is writable
+            if not current_dir_writable:
+                # Show dialog asking if user wants to push to /data/local/tmp/ instead
+                msg_box = QMessageBox(explorer)
+                msg_box.setIcon(QMessageBox.Icon.Warning)
+                msg_box.setWindowTitle("Directory Not Writable")
+                msg_box.setText(f"Current directory '{dest}' is not writable.")
+                msg_box.setInformativeText("Would you like to push files to '/data/local/tmp/' instead?")
+                msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+                result = msg_box.exec()
+
+                if result == QMessageBox.StandardButton.Yes:
+                    dest = "/data/local/tmp/"
+                    parent.log(f"User chose alternate destination: {dest}", "INFO")
+                else:
+                    parent.log("User cancelled push due to read-only directory", "INFO")
+                    return
+
             parent.log(f"Pushing {len(files)} file(s) from local to {seat_hostname}:{dest}", "INFO")
             parent.update_status("Pushing to seat…")
 
