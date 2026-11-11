@@ -970,26 +970,9 @@ class _SeatJumpHost:
     def copy_to_seat_via_gateway(self, local_path, remote_path, seat_host,
                                  mtc_password=None, timeout=600,
                                  progress_callback=None):
-        """Copy a local file to the seat through the gateway.
-
-        First checks if the associated gateway has `bct`.
-        Copies the file from local machine to gateway via regular scp.
-        Then:
-          - If gateway has `bct`:
-            uses `bct put -s <gw_path> -d <seat-ip>:<remote_path>`
-            (falls back to scp if bct put fails)
-          - If gateway does not have `bct`:
-            uses scp for copying to seat.
-
-        Reports progress via progress_callback(stage, message) so the UI
-        shows:
-          1. staging_to_gateway
-          2. gateway copying is done, now doing bct / scp to seat
-          3. done
-        """
+        """Copy a local file to the seat through the gateway."""
         import uuid as _uuid
         basename = os.path.basename(local_path)
-        # Prefer staging directly in /tmp/<basename> (e.g. /tmp/requirements.txt)
         gw_staging = f"/tmp/{basename}"
 
         has_bct = self._probe_bct()
@@ -1001,12 +984,10 @@ class _SeatJumpHost:
         try:
             self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
         except Exception as e:
-            # If /tmp/<basename> exists and belongs to another user, fall back to unique staging path
             self._log(f"Staging directly as {gw_staging} failed ({e}), falling back to unique name", "DEBUG")
             gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex[:8]}-{basename}"
             self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
 
-        # Gateway copying is done! Report progress for the second hop.
         if has_bct:
             msg = f"Gateway copying is done, now doing bct to seat ({seat_host}:{remote_path})…"
             if progress_callback:
@@ -1042,7 +1023,8 @@ class _SeatJumpHost:
                     f'cd {shlex.quote(staging_dir)} && ('
                     f'bct put -s {shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{remote_path}")} || '
                     f'bct put -s ./{shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{remote_path}")} || '
-                    f'bct put -s {shlex.quote(gw_staging)} -d {shlex.quote(f"{seat_host}:{remote_path}")})'
+                    f'bct put -s {shlex.quote(gw_staging)} -d {shlex.quote(f"{seat_host}:{remote_path}")}); '
+                    f'_RC=$?; rm -f {shlex.quote(gw_staging)}; exit $_RC'
                 )
                 bct_put_cmd = f"bash -lic {shlex.quote(bct_put_inner)}"
                 self._log(f"BCT: bct put -s {staging_name} -d {seat_host}:{remote_path}", "INFO")
@@ -1058,7 +1040,6 @@ class _SeatJumpHost:
                         progress_callback("fallback_doing_scp", "bct put failed, trying scp to seat…")
 
             if not success:
-                # Gateway has no bct OR bct put failed: try scp for copying to seat
                 if mtc_password:
                     askpass_path = f"/tmp/.adb-gui-ap-{_uuid.uuid4().hex[:8]}.sh"
                     askpass_script = (
@@ -1075,7 +1056,7 @@ class _SeatJumpHost:
                         f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "
                         f"{shlex.quote(gw_staging)} mtc@{seat_host}:{shlex.quote(remote_path)}\n"
                         f"RET=$?\n"
-                        f"rm -f {askpass_path}\n"
+                        f"rm -f {askpass_path} {shlex.quote(gw_staging)}\n"
                         f"exit $RET"
                     )
                     self._log(f"Running scp on gateway: {gw_staging} → mtc@{seat_host}:{remote_path}", "INFO")
@@ -1088,7 +1069,6 @@ class _SeatJumpHost:
                         last_error = f"gateway scp failed (code {res.returncode}): {err[:300]}"
                         self._log(last_error, "WARNING")
 
-                # Fallback: direct scp from local via ProxyJump
                 if not success:
                     try:
                         self._log(f"Attempting direct scp from local to {seat_host}:{remote_path}...", "INFO")
@@ -1112,19 +1092,17 @@ class _SeatJumpHost:
                 progress_callback("done", f"✓ Done copying {basename} to {seat_host}")
             return True
         finally:
-            try:
-                self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=10)
-            except Exception:
-                pass
+            def _async_cleanup(p=gw_staging):
+                try:
+                    self.run_gateway_command(f"rm -f {shlex.quote(p)}", timeout=10)
+                except Exception:
+                    pass
+            threading.Thread(target=_async_cleanup, daemon=True).start()
 
     def copy_from_seat_via_gateway(self, remote_path, local_path, seat_host,
                                    mtc_password=None, timeout=600,
                                    progress_callback=None):
-        """Copy a file from the seat to the local machine through the gateway (reverse of push).
-
-        Uses `bct get -s <seat-ip>:<remote_path> -d .` on the gateway, then scps
-        from gateway to local. If bct is not present or fails, falls back to scp.
-        """
+        """Copy a file from the seat to the local machine through the gateway."""
         import uuid as _uuid
         basename = os.path.basename(remote_path)
         gw_staging = f"/tmp/{basename}"
@@ -1177,7 +1155,6 @@ class _SeatJumpHost:
                         progress_callback("fallback_doing_scp", "bct get failed, trying scp…")
 
             if not success:
-                # Gateway has no bct OR bct get failed: try scp from seat to gateway
                 if mtc_password:
                     askpass_path = f"/tmp/.adb-gui-ap-{_uuid.uuid4().hex[:8]}.sh"
                     askpass_script = (
@@ -1208,7 +1185,6 @@ class _SeatJumpHost:
                         self._log(last_error, "WARNING")
 
             if not success:
-                # Direct scp fallback from local via ProxyJump
                 try:
                     self._log(f"Attempting direct scp from {seat_host}:{remote_path} to local...", "INFO")
                     self.run_scp(
@@ -1227,7 +1203,6 @@ class _SeatJumpHost:
                     self._log(f"Direct scp failed: {e}", "ERROR")
                     raise _SeatSshError(f"Failed to copy from seat: {last_error}")
 
-            # Step 2: copy from gateway to local machine
             if progress_callback:
                 progress_callback("gateway_to_local", f"Downloading {basename} from gateway to local…")
             self._log(f"Downloading from gateway: {gw_staging} → {local_path}", "INFO")
@@ -1237,10 +1212,12 @@ class _SeatJumpHost:
                 progress_callback("done", f"✓ Done downloading {basename}")
             return True
         finally:
-            try:
-                self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=10)
-            except Exception:
-                pass
+            def _async_cleanup(p=gw_staging):
+                try:
+                    self.run_gateway_command(f"rm -f {shlex.quote(p)}", timeout=10)
+                except Exception:
+                    pass
+            threading.Thread(target=_async_cleanup, daemon=True).start()
 
     def run_scp_via_bct(self, local_path, remote_path, seat_host, timeout=600,
                         progress_callback=None):

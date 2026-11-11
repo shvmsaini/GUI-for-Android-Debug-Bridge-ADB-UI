@@ -433,12 +433,8 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             if not files:
                 return
 
-            # Destination is the current path on the seat
             dest = current_path()
-
-            # Check if current directory is writable
             if not current_dir_writable:
-                # Show dialog asking if user wants to push to /data/local/tmp/ instead
                 msg_box = QMessageBox(explorer)
                 msg_box.setIcon(QMessageBox.Icon.Warning)
                 msg_box.setWindowTitle("Directory Not Writable")
@@ -504,8 +500,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         ok += 1
                         parent.log(f"✓ {seat_hostname}:{target_path}", "INFO")
                     except Exception as e:
-                        # Fallback for non-/data/local/tmp/ directories that may require root:
-                        # stage in /data/local/tmp/ and move with root shell
                         staged_tmp = f"/data/local/tmp/{basename}"
                         recovered = False
                         if dest != "/data/local/tmp/":

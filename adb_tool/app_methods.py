@@ -426,9 +426,6 @@ class AppMixin:
                     self.update_status(f"Gateway: {msg}")
                     self.log(f"Gateway: {msg}", "INFO")
 
-            # Check if gateway has bct, copy via regular scp to gateway,
-            # show progress that gateway copying is done, now doing bct / scp to seat,
-            # and copy to /data/local/tmp/ on seat!
             jump.copy_to_seat_via_gateway(
                 local_path=apk_path,
                 remote_path=remote_path,
@@ -438,7 +435,6 @@ class AppMixin:
                 progress_callback=_on_stage,
             )
 
-            # Ensure APK on seat is readable by pm install (chmod 644)
             try:
                 self.adb.run_command(
                     f"{self.get_device_flag()} shell chmod 644 {shlex.quote(remote_path)}",
@@ -456,18 +452,13 @@ class AppMixin:
                     pass
 
         except _SeatSshError as e:
-            # Extract the actual error message from SCP output (not SSH debug)
             err_str = str(e)
-            # Look for the actual SCP/remote error (typically contains file path or "No space")
             actual_error = ""
             for line in err_str.split('\n'):
-                # Skip SSH debug lines
                 if line.startswith('debug1:') or line.startswith('Executing:') or 'OpenSSH' in line:
                     continue
-                # Skip the command line
                 if 'scp -v' in line or 'command scp' in line:
                     continue
-                # This is likely the actual error
                 actual_error = line.strip()
                 break
 
@@ -487,7 +478,6 @@ class AppMixin:
                 try: jump.close()
                 except: pass
 
-        # Install via pm install
         self.update_status(f"Gateway: Installing {apk_name}...")
         self.log("Running pm install...", "INFO")
         cmd = f"{self.get_device_flag()} shell pm install -r -d -t {shlex.quote(remote_path)}"
@@ -496,8 +486,6 @@ class AppMixin:
             stderr = (result.get('stderr') or '').strip() or (result.get('stdout') or '').strip()
             self.log(f"❌ pm install failed: {stderr[:200]}", "ERROR")
             self.update_status(f"Gateway: pm install failed - {stderr[:80]}")
-            # Best-effort cleanup — the file is on the seat but the install
-            # didn't go through, so leave it off the device.
             try:
                 self.adb.run_command(
                     f"{self.get_device_flag()} shell rm -f {shlex.quote(remote_path)}",
@@ -507,20 +495,13 @@ class AppMixin:
                 pass
             return False
 
-        # Clean up APK files after successful installation to save space
-        # Remove from seat and local APK if successful
         def _cleanup():
-            # Delete from seat's /data/local/tmp
             try:
                 self.adb.run_command(f"{self.get_device_flag()} shell rm -f {shlex.quote(remote_path)}", timeout=30)
                 self.log(f"Cleaned up {apk_name} from seat /data/local/tmp", "DEBUG")
             except Exception:
                 pass
 
-        # Schedule cleanup after showing completion message
-        # NOTE: QTimer.singleShot from a worker thread is silently dropped
-        # on PyQt6 (see pyqt6-singleshot-worker-thread-dropped.md). Use
-        # run_on_main_thread so the cleanup actually fires on the GUI thread.
         self.log("Scheduling cleanup of APK file on seat /data/local/tmp", "DEBUG")
         self.run_on_main_thread(lambda: (
             QTimer.singleShot(2000, _cleanup) if not getattr(self, '_closing', False) else None
