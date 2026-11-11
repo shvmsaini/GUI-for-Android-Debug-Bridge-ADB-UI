@@ -678,37 +678,240 @@ class _SeatJumpHost:
                     try: os.unlink(f.name)
                     except: pass
 
+    def run_gateway_command(self, command, timeout=60):
+        """Run an arbitrary command directly on the gateway host via SSH with SSH_ASKPASS.
+
+        Returns:
+            subprocess.CompletedProcess with returncode, stdout, and stderr.
+        """
+        gw_pw_file = None
+        askpass_file = None
+        try:
+            gw_pw_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_gw_pw_"
+            )
+            gw_pw_file.write(self._password)
+            gw_pw_file.close()
+            os.chmod(gw_pw_file.name, 0o600)
+
+            askpass_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_ssh_ap_", suffix=".sh"
+            )
+            askpass_file.write(
+                "#!/bin/sh\n"
+                f"case \"$1\" in\n"
+                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
+                "  *) echo \"yes\" ;;\n"
+                "esac\n"
+            )
+            askpass_file.close()
+            os.chmod(askpass_file.name, 0o700)
+
+            cmd = [
+                "ssh",
+                "-tt",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+            ]
+            if self._port != 22:
+                cmd.extend(["-p", str(self._port)])
+            cmd.extend([
+                f"{self._user}@{self._host}",
+                command,
+            ])
+
+            env = os.environ.copy()
+            env["SSH_ASKPASS"] = askpass_file.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = ":0"
+            env.pop("SSHPASS", None)
+
+            self._log(f"SSH gateway run: {command[:150]}", "DEBUG")
+            res = subprocess.run(
+                cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout
+            )
+            stdout = (res.stdout or "").replace('\r\n', '\n').replace('\r', '\n')
+            stderr = (res.stderr or "").replace('\r\n', '\n').replace('\r', '\n')
+            stdout = re.sub(r"(?i)Connection to [^\n]+ closed\.\s*", "", stdout)
+            stderr = re.sub(r"(?i)Connection to [^\n]+ closed\.\s*", "", stderr)
+            return subprocess.CompletedProcess(
+                args=res.args,
+                returncode=res.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        finally:
+            for f in (gw_pw_file, askpass_file):
+                if f:
+                    try:
+                        os.unlink(f.name)
+                    except Exception:
+                        pass
+
+    def run_scp_to_gateway(self, local_path, gateway_dest_path, timeout=300):
+        """Copy a local file to the gateway host using scp with SSH_ASKPASS."""
+        gw_pw_file = None
+        askpass_file = None
+        try:
+            gw_pw_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_gw_pw_"
+            )
+            gw_pw_file.write(self._password)
+            gw_pw_file.close()
+            os.chmod(gw_pw_file.name, 0o600)
+
+            askpass_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_ssh_ap_", suffix=".sh"
+            )
+            askpass_file.write(
+                "#!/bin/sh\n"
+                f"case \"$1\" in\n"
+                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
+                "  *) echo \"yes\" ;;\n"
+                "esac\n"
+            )
+            askpass_file.close()
+            os.chmod(askpass_file.name, 0o700)
+
+            cmd = [
+                "scp", "-O",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+            ]
+            if self._port != 22:
+                cmd.extend(["-P", str(self._port)])
+            cmd.extend([
+                local_path,
+                f"{self._user}@{self._host}:{gateway_dest_path}",
+            ])
+
+            env = os.environ.copy()
+            env["SSH_ASKPASS"] = askpass_file.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = ":0"
+            env.pop("SSHPASS", None)
+
+            self._log(f"SCP to gateway: {local_path} → {self._user}@{self._host}:{gateway_dest_path}", "INFO")
+            res = subprocess.run(
+                cmd, env=env, capture_output=True, text=True, timeout=timeout
+            )
+            if res.returncode != 0:
+                err = (res.stderr or res.stdout or "").strip()
+                raise _SeatSshError(
+                    f"scp to gateway failed (code {res.returncode}): {err[:300]}"
+                )
+            return True
+        finally:
+            for f in (gw_pw_file, askpass_file):
+                if f:
+                    try:
+                        os.unlink(f.name)
+                    except Exception:
+                        pass
+
+    def run_scp_from_gateway(self, gateway_source_path, local_path, timeout=300):
+        """Copy a file from the gateway host to the local machine using scp with SSH_ASKPASS."""
+        gw_pw_file = None
+        askpass_file = None
+        try:
+            gw_pw_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_gw_pw_"
+            )
+            gw_pw_file.write(self._password)
+            gw_pw_file.close()
+            os.chmod(gw_pw_file.name, 0o600)
+
+            askpass_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix="adb_ssh_ap_", suffix=".sh"
+            )
+            askpass_file.write(
+                "#!/bin/sh\n"
+                f"case \"$1\" in\n"
+                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
+                "  *) echo \"yes\" ;;\n"
+                "esac\n"
+            )
+            askpass_file.close()
+            os.chmod(askpass_file.name, 0o700)
+
+            cmd = [
+                "scp", "-O",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+            ]
+            if self._port != 22:
+                cmd.extend(["-P", str(self._port)])
+            cmd.extend([
+                f"{self._user}@{self._host}:{gateway_source_path}",
+                local_path,
+            ])
+
+            env = os.environ.copy()
+            env["SSH_ASKPASS"] = askpass_file.name
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = ":0"
+            env.pop("SSHPASS", None)
+
+            self._log(f"SCP from gateway: {self._user}@{self._host}:{gateway_source_path} → {local_path}", "INFO")
+            res = subprocess.run(
+                cmd, env=env, capture_output=True, text=True, timeout=timeout
+            )
+            if res.returncode != 0:
+                err = (res.stderr or res.stdout or "").strip()
+                raise _SeatSshError(
+                    f"scp from gateway failed (code {res.returncode}): {err[:300]}"
+                )
+            return True
+        finally:
+            for f in (gw_pw_file, askpass_file):
+                if f:
+                    try:
+                        os.unlink(f.name)
+                    except Exception:
+                        pass
+
     def _probe_bct(self, shell=None):
         """Return True iff ``bct`` is available on this gateway.
 
-        Probes via an interactive shell so PATH set in the user's login
-        profile (~/.zshrc / ~/.bashrc) is in scope — exec_command skips
-        those rc files. The result is cached on the instance so we don't
-        re-probe every call.
+        Probes via login shell so PATH set in login profiles (~/.zshrc / ~/.bashrc)
+        is in scope. Caches the result on this instance so subsequent calls are instant.
         """
         cached = getattr(self, "_has_bct", None)
         if cached is not None:
             return cached
-        own_shell = shell is None
-        try:
-            if own_shell:
-                shell = self.shell()
-                shell.drain(quiet=0.5, maxwait=4)
-            shell.buf = ""
-            shell.send_line("command -v bct >/dev/null 2>&1 && echo __ADB_GUI_BCT_YES__ || echo __ADB_GUI_BCT_NO__\n")
-            shell.wait_for(r"__ADB_GUI_BCT_(YES|NO)__", 6)
-            has_bct = "YES" in shell.buf
-        except Exception:
-            has_bct = False
-        try:
-            self._has_bct = has_bct
-        except Exception:
-            pass
-        if own_shell:
+
+        # If an interactive gateway shell was passed in, probe through it
+        if shell is not None:
             try:
-                shell.close()
+                shell.buf = ""
+                shell.send_line("command -v bct >/dev/null 2>&1 && echo __ADB_GUI_BCT_YES__ || echo __ADB_GUI_BCT_NO__\n")
+                if shell.wait_for(r"__ADB_GUI_BCT_(YES|NO)__", 6):
+                    has_bct = "YES" in shell.buf
+                    self._has_bct = has_bct
+                    return has_bct
             except Exception:
                 pass
+
+        # Otherwise probe via run_gateway_command using interactive login shell (bash -lic)
+        try:
+            probe_cmd = (
+                "bash -lic 'shopt -s expand_aliases 2>/dev/null; "
+                "[ -f /etc/profile ] && . /etc/profile 2>/dev/null; "
+                '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null; '
+                "command -v bct >/dev/null 2>&1 || which bct >/dev/null 2>&1 || type bct >/dev/null 2>&1 || "
+                "[ -x /usr/local/bin/bct ] || [ -x /opt/homebrew/bin/bct ] || [ -x $HOME/bin/bct ] || [ -x $HOME/.local/bin/bct ]'"
+            )
+            res = self.run_gateway_command(probe_cmd, timeout=15)
+            has_bct = (res.returncode == 0)
+        except Exception as e:
+            self._log(f"Probe bct failed: {e}", "DEBUG")
+            has_bct = False
+
+        self._has_bct = has_bct
+        self._log(f"Gateway bct probe result: {has_bct}", "DEBUG")
         return has_bct
 
     def run_remote_command_via_bct(self, seat_host, command, timeout=60):
@@ -764,104 +967,306 @@ class _SeatJumpHost:
                 except Exception:
                     pass
 
+    def copy_to_seat_via_gateway(self, local_path, remote_path, seat_host,
+                                 mtc_password=None, timeout=600,
+                                 progress_callback=None):
+        """Copy a local file to the seat through the gateway.
+
+        First checks if the associated gateway has `bct`.
+        Copies the file from local machine to gateway via regular scp.
+        Then:
+          - If gateway has `bct`:
+            uses `bct put -s <gw_path> -d <seat-ip>:<remote_path>`
+            (falls back to scp if bct put fails)
+          - If gateway does not have `bct`:
+            uses scp for copying to seat.
+
+        Reports progress via progress_callback(stage, message) so the UI
+        shows:
+          1. staging_to_gateway
+          2. gateway copying is done, now doing bct / scp to seat
+          3. done
+        """
+        import uuid as _uuid
+        basename = os.path.basename(local_path)
+        # Prefer staging directly in /tmp/<basename> (e.g. /tmp/requirements.txt)
+        gw_staging = f"/tmp/{basename}"
+
+        has_bct = self._probe_bct()
+        self._log(f"Copy-to-seat: gateway bct availability = {has_bct}", "INFO")
+
+        if progress_callback:
+            progress_callback("staging_to_gateway", f"Copying {basename} to gateway…")
+
+        try:
+            self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
+        except Exception as e:
+            # If /tmp/<basename> exists and belongs to another user, fall back to unique staging path
+            self._log(f"Staging directly as {gw_staging} failed ({e}), falling back to unique name", "DEBUG")
+            gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex[:8]}-{basename}"
+            self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
+
+        # Gateway copying is done! Report progress for the second hop.
+        if has_bct:
+            msg = f"Gateway copying is done, now doing bct to seat ({seat_host}:{remote_path})…"
+            if progress_callback:
+                progress_callback("gateway_done_doing_bct", msg)
+            self._log(msg, "INFO")
+        else:
+            msg = f"Gateway copying is done, now doing scp to seat ({seat_host}:{remote_path})…"
+            if progress_callback:
+                progress_callback("gateway_done_doing_scp", msg)
+            self._log(msg, "INFO")
+
+        success = False
+        last_error = ""
+
+        try:
+            if has_bct:
+                staging_dir = os.path.dirname(gw_staging) or "/tmp"
+                staging_name = os.path.basename(gw_staging)
+                bct_put_inner = (
+                    "export PS1='$ '; "
+                    "shopt -s expand_aliases 2>/dev/null; "
+                    '[ -f /etc/profile ] && . /etc/profile 2>/dev/null; '
+                    '[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null; '
+                    '[ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile" 2>/dev/null; '
+                    '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null; '
+                    '[ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc" 2>/dev/null; '
+                    'export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
+                    'if ! command -v bct >/dev/null 2>&1; then '
+                    '  for candidate in /usr/local/bin/bct /opt/*/bct /opt/*/*/bct /tools/*/bct /tools/*/*/bct $HOME/bin/bct $HOME/.local/bin/bct; do '
+                    '    if [ -x "$candidate" ]; then export PATH="$(dirname "$candidate"):$PATH"; break; fi; '
+                    '  done; '
+                    'fi; '
+                    f'cd {shlex.quote(staging_dir)} && ('
+                    f'bct put -s {shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{remote_path}")} || '
+                    f'bct put -s ./{shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{remote_path}")} || '
+                    f'bct put -s {shlex.quote(gw_staging)} -d {shlex.quote(f"{seat_host}:{remote_path}")})'
+                )
+                bct_put_cmd = f"bash -lic {shlex.quote(bct_put_inner)}"
+                self._log(f"BCT: bct put -s {staging_name} -d {seat_host}:{remote_path}", "INFO")
+                res = self.run_gateway_command(bct_put_cmd, timeout=timeout)
+                if res.returncode == 0:
+                    success = True
+                    self._log(f"✓ bct put succeeded: {seat_host}:{remote_path}", "INFO")
+                else:
+                    err = (res.stderr or res.stdout or "").strip()
+                    last_error = f"bct put failed (code {res.returncode}): {err[:300]}"
+                    self._log(f"{last_error}; attempting fallback via scp to seat...", "WARNING")
+                    if progress_callback:
+                        progress_callback("fallback_doing_scp", "bct put failed, trying scp to seat…")
+
+            if not success:
+                # Gateway has no bct OR bct put failed: try scp for copying to seat
+                if mtc_password:
+                    askpass_path = f"/tmp/.adb-gui-ap-{_uuid.uuid4().hex[:8]}.sh"
+                    askpass_script = (
+                        "#!/bin/sh\n"
+                        "case \"$1\" in\n"
+                        f"  *\"password:\"*|*\"Password:\"*) echo {shlex.quote(mtc_password)} ;;\n"
+                        "  *) echo \"yes\" ;;\n"
+                        "esac\n"
+                    )
+                    scp_gw_cmd = (
+                        f"cat > {askpass_path} << 'EOF'\n{askpass_script}\nEOF\n"
+                        f"chmod 700 {askpass_path}\n"
+                        f"SSH_ASKPASS={shlex.quote(askpass_path)} SSH_ASKPASS_REQUIRE=force DISPLAY=:0 "
+                        f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "
+                        f"{shlex.quote(gw_staging)} mtc@{seat_host}:{shlex.quote(remote_path)}\n"
+                        f"RET=$?\n"
+                        f"rm -f {askpass_path}\n"
+                        f"exit $RET"
+                    )
+                    self._log(f"Running scp on gateway: {gw_staging} → mtc@{seat_host}:{remote_path}", "INFO")
+                    res = self.run_gateway_command(scp_gw_cmd, timeout=timeout)
+                    if res.returncode == 0:
+                        success = True
+                        self._log(f"✓ gateway scp succeeded: {seat_host}:{remote_path}", "INFO")
+                    else:
+                        err = (res.stderr or res.stdout or "").strip()
+                        last_error = f"gateway scp failed (code {res.returncode}): {err[:300]}"
+                        self._log(last_error, "WARNING")
+
+                # Fallback: direct scp from local via ProxyJump
+                if not success:
+                    try:
+                        self._log(f"Attempting direct scp from local to {seat_host}:{remote_path}...", "INFO")
+                        self.run_scp(
+                            local_path=local_path,
+                            remote_path=remote_path,
+                            seat_host=seat_host,
+                            mtc_password=mtc_password,
+                            timeout=timeout,
+                        )
+                        success = True
+                        self._log(f"✓ direct scp succeeded: {seat_host}:{remote_path}", "INFO")
+                    except Exception as e:
+                        last_error = str(e)
+                        self._log(f"Direct scp failed: {e}", "ERROR")
+
+            if not success:
+                raise _SeatSshError(f"Failed to copy to seat: {last_error}")
+
+            if progress_callback:
+                progress_callback("done", f"✓ Done copying {basename} to {seat_host}")
+            return True
+        finally:
+            try:
+                self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=10)
+            except Exception:
+                pass
+
+    def copy_from_seat_via_gateway(self, remote_path, local_path, seat_host,
+                                   mtc_password=None, timeout=600,
+                                   progress_callback=None):
+        """Copy a file from the seat to the local machine through the gateway (reverse of push).
+
+        Uses `bct get -s <seat-ip>:<remote_path> -d .` on the gateway, then scps
+        from gateway to local. If bct is not present or fails, falls back to scp.
+        """
+        import uuid as _uuid
+        basename = os.path.basename(remote_path)
+        gw_staging = f"/tmp/{basename}"
+        staging_dir = "/tmp"
+
+        has_bct = self._probe_bct()
+        self._log(f"Copy-from-seat: gateway bct availability = {has_bct}", "INFO")
+
+        if progress_callback:
+            progress_callback(
+                "seat_to_gateway_bct" if has_bct else "seat_to_gateway_scp",
+                f"Downloading {basename} from seat to gateway…"
+            )
+
+        success = False
+        last_error = ""
+
+        try:
+            if has_bct:
+                bct_get_inner = (
+                    "export PS1='$ '; "
+                    "shopt -s expand_aliases 2>/dev/null; "
+                    '[ -f /etc/profile ] && . /etc/profile 2>/dev/null; '
+                    '[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null; '
+                    '[ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile" 2>/dev/null; '
+                    '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null; '
+                    '[ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc" 2>/dev/null; '
+                    'export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
+                    'if ! command -v bct >/dev/null 2>&1; then '
+                    '  for candidate in /usr/local/bin/bct /opt/*/bct /opt/*/*/bct /tools/*/bct /tools/*/*/bct $HOME/bin/bct $HOME/.local/bin/bct; do '
+                    '    if [ -x "$candidate" ]; then export PATH="$(dirname "$candidate"):$PATH"; break; fi; '
+                    '  done; '
+                    'fi; '
+                    f'cd {shlex.quote(staging_dir)} && ('
+                    f'bct get -s {shlex.quote(f"{seat_host}:{remote_path}")} -d . || '
+                    f'bct get -s {shlex.quote(f"{seat_host}:{remote_path}")} -d {shlex.quote(staging_dir)} || '
+                    f'bct get -s {shlex.quote(f"{seat_host}:{remote_path}")} -d {shlex.quote(gw_staging)})'
+                )
+                bct_get_cmd = f"bash -lic {shlex.quote(bct_get_inner)}"
+                self._log(f"BCT: bct get -s {seat_host}:{remote_path} -d .", "INFO")
+                res = self.run_gateway_command(bct_get_cmd, timeout=timeout)
+                if res.returncode == 0:
+                    success = True
+                    self._log(f"✓ bct get succeeded: {seat_host}:{remote_path} → gateway", "INFO")
+                else:
+                    err = (res.stderr or res.stdout or "").strip()
+                    last_error = f"bct get failed (code {res.returncode}): {err[:300]}"
+                    self._log(f"{last_error}; attempting fallback via scp...", "WARNING")
+                    if progress_callback:
+                        progress_callback("fallback_doing_scp", "bct get failed, trying scp…")
+
+            if not success:
+                # Gateway has no bct OR bct get failed: try scp from seat to gateway
+                if mtc_password:
+                    askpass_path = f"/tmp/.adb-gui-ap-{_uuid.uuid4().hex[:8]}.sh"
+                    askpass_script = (
+                        "#!/bin/sh\n"
+                        "case \"$1\" in\n"
+                        f"  *\"password:\"*|*\"Password:\"*) echo {shlex.quote(mtc_password)} ;;\n"
+                        "  *) echo \"yes\" ;;\n"
+                        "esac\n"
+                    )
+                    scp_gw_cmd = (
+                        f"cat > {askpass_path} << 'EOF'\n{askpass_script}\nEOF\n"
+                        f"chmod 700 {askpass_path}\n"
+                        f"SSH_ASKPASS={shlex.quote(askpass_path)} SSH_ASKPASS_REQUIRE=force DISPLAY=:0 "
+                        f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "
+                        f"mtc@{seat_host}:{shlex.quote(remote_path)} {shlex.quote(gw_staging)}\n"
+                        f"RET=$?\n"
+                        f"rm -f {askpass_path}\n"
+                        f"exit $RET"
+                    )
+                    self._log(f"Running scp on gateway: mtc@{seat_host}:{remote_path} → {gw_staging}", "INFO")
+                    res = self.run_gateway_command(scp_gw_cmd, timeout=timeout)
+                    if res.returncode == 0:
+                        success = True
+                        self._log(f"✓ gateway scp succeeded: {remote_path} → {gw_staging}", "INFO")
+                    else:
+                        err = (res.stderr or res.stdout or "").strip()
+                        last_error = f"gateway scp failed (code {res.returncode}): {err[:300]}"
+                        self._log(last_error, "WARNING")
+
+            if not success:
+                # Direct scp fallback from local via ProxyJump
+                try:
+                    self._log(f"Attempting direct scp from {seat_host}:{remote_path} to local...", "INFO")
+                    self.run_scp(
+                        local_path=local_path,
+                        remote_path=remote_path,
+                        seat_host=seat_host,
+                        mtc_password=mtc_password,
+                        to_remote=False,
+                        timeout=timeout,
+                    )
+                    if progress_callback:
+                        progress_callback("done", f"✓ Done downloading {basename}")
+                    return True
+                except Exception as e:
+                    last_error = str(e)
+                    self._log(f"Direct scp failed: {e}", "ERROR")
+                    raise _SeatSshError(f"Failed to copy from seat: {last_error}")
+
+            # Step 2: copy from gateway to local machine
+            if progress_callback:
+                progress_callback("gateway_to_local", f"Downloading {basename} from gateway to local…")
+            self._log(f"Downloading from gateway: {gw_staging} → {local_path}", "INFO")
+            self.run_scp_from_gateway(gw_staging, local_path, timeout=timeout)
+
+            if progress_callback:
+                progress_callback("done", f"✓ Done downloading {basename}")
+            return True
+        finally:
+            try:
+                self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=10)
+            except Exception:
+                pass
+
     def run_scp_via_bct(self, local_path, remote_path, seat_host, timeout=600,
                         progress_callback=None):
         """Copy a local file to the seat via the gateway's ``bct`` helper.
 
-        Two-stage hop:
-          1. ``scp local user@gateway:/tmp/...``  (local → gateway)
-          2. ``bct login -h <seat>`` then ``cp /tmp/... <remote>``
-             (gateway → seat, no mtc password needed)
-
-        Used as a fallback when the gateway blocks direct ``ssh mtc@<seat>``.
-        The gateway ssh is invoked locally with SSH_ASKPASS for passwordless
-        authentication; the seat-side hop is driven by the gateway's
-        interactive shell.
-
-        Raises ``_SeatSshError`` on failure. Calls ``progress_callback`` (if
-        given) with ``(bytes_transferred, total_bytes)`` between stages.
+        First checks if the associated gateway has `bct`, copies the file
+        to gateway via regular scp, then runs `bct put -s ... -d ...` to seat
+        (or falls back to scp).
         """
-        import uuid as _uuid
-        # Stage 1: copy the local file to the gateway. The gateway ssh
-        # uses our existing SSH_ASKPASS plumbing (no mtc password needed
-        # because we're only talking to user@gateway).
-        gw_pw_file = None
-        askpass_file = None
-        try:
-            gw_basename = os.path.basename(local_path)
-            gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex}-{gw_basename}"
-
-            gw_pw_file = tempfile.NamedTemporaryFile(
-                mode="w", delete=False, prefix="adb_gw_pw_")
-            gw_pw_file.write(self._password)
-            gw_pw_file.close()
-            os.chmod(gw_pw_file.name, 0o600)
-
-            askpass_file = tempfile.NamedTemporaryFile(
-                mode="w", delete=False, prefix="adb_ssh_ap_", suffix=".sh")
-            askpass_file.write(
-                "#!/bin/sh\n"
-                f"case \"$1\" in\n"
-                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
-                "  *) echo \"yes\" ;;\n"
-                "esac\n"
-            )
-            askpass_file.close()
-            os.chmod(askpass_file.name, 0o700)
-
-            proxy_cmd = (
-                f"ssh -o StrictHostKeyChecking=no "
-                f"-o UserKnownHostsFile=/dev/null "
-                f"-p {self._port} "
-                f"-W %h:%p {self._user}@{self._host}"
-            ) if self._port != 22 else (
-                f"ssh -o StrictHostKeyChecking=no "
-                f"-o UserKnownHostsFile=/dev/null "
-                f"-W %h:%p {self._user}@{self._host}"
-            )
-
-            cmd = [
-                "scp", "-O",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=15",
-                "-o", f"ProxyCommand={proxy_cmd}",
-                local_path,
-                f"{self._user}@{self._host}:{gw_staging}",
-            ]
-
-            env = os.environ.copy()
-            env["SSH_ASKPASS"] = askpass_file.name
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            env["DISPLAY"] = ":0"
-            env.pop("SSHPASS", None)
-
-            self._log(f"BCT-SCP: stage 1 (local → gateway): {' '.join(cmd)}")
-            res = subprocess.run(cmd, env=env, capture_output=True,
-                                 text=True, timeout=timeout)
-            if res.returncode != 0:
-                raise _SeatSshError(
-                    f"scp to gateway failed (code {res.returncode}): "
-                    f"{(res.stderr or res.stdout or '').strip()[:300]}"
-                )
+        def _adapt_progress(stage, msg):
             if progress_callback:
                 total = os.path.getsize(local_path) if os.path.exists(local_path) else 0
-                progress_callback(total // 2, total)
+                if stage == "staging_to_gateway":
+                    progress_callback(total // 3, total)
+                elif stage in ("gateway_done_doing_bct", "gateway_done_doing_scp"):
+                    progress_callback(2 * total // 3, total)
+                elif stage == "done":
+                    progress_callback(total, total)
 
-            # Stage 2: hop the staged file from the gateway to the seat
-            # via `bct login -h <seat>`.
-            self._log(f"BCT-SCP: stage 2 (gateway → seat): cp {gw_staging} → {remote_path}")
-            cp_cmd = f"cp {shlex.quote(gw_staging)} {shlex.quote(remote_path)} && rm -f {shlex.quote(gw_staging)}"
-            self.run_remote_command_via_bct(seat_host, cp_cmd, timeout=timeout)
-            if progress_callback:
-                total = os.path.getsize(local_path) if os.path.exists(local_path) else 0
-                progress_callback(total, total)
-            self._log(f"BCT-SCP: transfer complete ({gw_basename})")
-        finally:
-            for f in (gw_pw_file, askpass_file):
-                if f:
-                    try: os.unlink(f.name)
-                    except: pass
+        return self.copy_to_seat_via_gateway(
+            local_path=local_path,
+            remote_path=remote_path,
+            seat_host=seat_host,
+            timeout=timeout,
+            progress_callback=_adapt_progress,
+        )
 
 
 class _ProcChannel:

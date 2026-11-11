@@ -371,135 +371,89 @@ class AppMixin:
             return False
 
         gateway_user, gateway_host = gateway.split('@', 1)
-        # Copy to /tmp on the seat (was previously /storage/emulated/0/, i.e. /sdcard/).
-        remote_path = f"/tmp/{apk_name}"
+        # Copy to /data/local/tmp on the seat
+        remote_path = f"/data/local/tmp/{apk_name}"
 
         self.log(f"Gateway: Copying {apk_name} → {seat_name}:{remote_path}", "INFO")
-        self.update_status(f"Gateway: Copying via SCP...")
+        self.update_status(f"Gateway: Preparing copy...")
 
         # Get mtc password - try cache (global fallback) or use provided
         if not mtc_password and hasattr(self, 'credential_manager'):
             mtc_password = self.credential_manager.get_mtc_password_with_fallback()
 
-        if not mtc_password:
-            self.log("No mtc password - falling back to adb push", "WARNING")
-            cmd = f"{self.get_device_flag()} push {shlex.quote(apk_path)} /sdcard/{apk_name}"
+        from .credentials import CredentialManager
+        creds = getattr(self, 'credential_manager', None) or CredentialManager()
+        gw_pw = creds.get_gateway_password_with_fallback(gateway_host, gateway_user)
+        if not gw_pw:
+            self.log(
+                f"Gateway password for {gateway_user}@{gateway_host} not "
+                f"cached — connect to the seat once to cache it, then "
+                f"retry. Falling back to adb push.",
+                "WARNING",
+            )
+            self.update_status("Gateway: Password missing — falling back to adb push")
+            cmd = f"{self.get_device_flag()} push {shlex.quote(apk_path)} /data/local/tmp/{apk_name}"
             result = self.adb.run_command(cmd, timeout=120)
             if not result['success']:
                 self.log("Push failed", "ERROR")
                 self.update_status("Gateway: Push failed")
                 return False
-            cmd = f"{self.get_device_flag()} shell pm install -r -d -t /sdcard/{apk_name}"
+            cmd = f"{self.get_device_flag()} shell pm install -r -d -t /data/local/tmp/{apk_name}"
             result = self.adb.run_command(cmd, timeout=180)
             if not result['success']:
                 self.log("Install failed", "ERROR")
                 self.update_status("Gateway: Install failed")
                 return False
             self.update_status("✅ Installed (fallback)")
-            # Mirror the success-path cleanup below so we don't leak
-            # /sdcard/<apk_name> on the seat.
             try:
                 self.adb.run_command(
-                    f"{self.get_device_flag()} shell rm -f /sdcard/{shlex.quote(apk_name)}",
+                    f"{self.get_device_flag()} shell rm -f /data/local/tmp/{shlex.quote(apk_name)}",
                     timeout=30,
                 )
             except Exception:
                 pass
             return True
 
-        # Establish jump host connection
+        # Establish jump host connection and copy via gateway (bct put or scp)
         try:
-            from .credentials import CredentialManager
-            creds = CredentialManager()
-            # Per-gateway entry, then global gateway fallback — any
-            # previously saved gateway password unblocks this lookup.
-            gw_pw = creds.get_gateway_password_with_fallback(gateway_host, gateway_user)
-            if not gw_pw:
-                # We can't prompt for the password here — we're on the
-                # install worker thread, and constructing a QInputDialog
-                # (or any QWidget) with parent=self would crash with
-                # "QObject::setParent: Cannot set parent, new parent is
-                # in a different thread" / "NSWindow should only be
-                # instantiated on the main thread". Normal flow caches
-                # the gateway password at seat-connect time, so this is
-                # rare. Tell the user how to fix it and fall back to
-                # adb-push.
-                self.log(
-                    f"Gateway password for {gateway_user}@{gateway_host} not "
-                    f"cached — connect to the seat once to cache it, then "
-                    f"retry. Falling back to adb push.",
-                    "WARNING",
-                )
-                self.update_status("Gateway: Password missing — connect seat first")
-                # Bail; the user can retry after connecting to the seat
-                # once to cache the gateway password.
-                raise _SeatSshError("gateway password not cached")
-
             jump = _SeatJumpHost(f"{gateway_user}@{gateway_host}", gw_pw, self.log)
 
-            # No modal progress dialog here — we are inside the install
-            # worker thread, so any QWidget (including QProgressDialog) we
-            # construct with parent=self would crash with
-            # "QObject::setParent: Cannot set parent, new parent is in a
-            # different thread" / "NSWindow should only be instantiated on
-            # the main thread". Use self.log / self.update_status (which
-            # already marshal to the GUI thread) for feedback instead.
+            def _on_stage(stage, msg):
+                if stage == "staging_to_gateway":
+                    self.update_status(f"Gateway: Copying {apk_name} to gateway…")
+                    self.log(f"Gateway: Copying {apk_name} to gateway via regular scp...", "INFO")
+                elif stage in ("gateway_done_doing_bct", "gateway_done_doing_scp"):
+                    self.update_status(f"Gateway: {msg}")
+                    self.log(f"Gateway: {msg}", "INFO")
 
-            try:
-                jump.run_scp(
-                    local_path=apk_path,
-                    remote_path=remote_path,
-                    seat_host=seat_name,
-                    mtc_password=mtc_password,
-                    timeout=300
-                )
-            except _SeatSshError as e:
-                # Direct `ssh mtc@<seat>` rejected by this gateway? Fall
-                # back to the bct-mediated path (see
-                # [[bct-login-fallback-for-mtc-ssh]]).
-                msg = str(e).lower()
-                if "mtc" in msg and ("rejected" in msg or "denied" in msg or "password" in msg):
-                    self.log(
-                        f"Direct ssh mtc@ failed ({e!r}); trying bct-mediated copy "
-                        f"to {seat_name}.",
-                        "WARNING",
-                    )
-                    jump.run_scp_via_bct(
-                        local_path=apk_path,
-                        remote_path=remote_path,
-                        seat_host=seat_name,
-                        timeout=300,
-                    )
-                else:
-                    raise
-            finally:
-                pass
+            # Check if gateway has bct, copy via regular scp to gateway,
+            # show progress that gateway copying is done, now doing bct / scp to seat,
+            # and copy to /data/local/tmp/ on seat!
+            jump.copy_to_seat_via_gateway(
+                local_path=apk_path,
+                remote_path=remote_path,
+                seat_host=seat_name,
+                mtc_password=mtc_password,
+                timeout=300,
+                progress_callback=_on_stage,
+            )
 
-            # scp-as-mtc leaves the file at 0600; pm install runs as the
-            # shell user and can't read it. chmod 644 via the gateway →
-            # seat ssh chain before installing.
+            # Ensure APK on seat is readable by pm install (chmod 644)
             try:
-                jump.run_remote_command(
-                    seat_host=seat_name,
-                    mtc_password=mtc_password,
-                    command=f"chmod 644 {shlex.quote(remote_path)}",
-                    timeout=30,
+                self.adb.run_command(
+                    f"{self.get_device_flag()} shell chmod 644 {shlex.quote(remote_path)}",
+                    timeout=15,
                 )
-            except _SeatSshError as e:
-                msg = str(e).lower()
-                if "mtc" in msg and ("rejected" in msg or "denied" in msg or "password" in msg):
-                    self.log(
-                        f"Direct ssh mtc@ failed for chmod; trying bct-mediated "
-                        f"path on {seat_name}.",
-                        "WARNING",
-                    )
-                    jump.run_remote_command_via_bct(
+            except Exception:
+                try:
+                    jump.run_remote_command(
                         seat_host=seat_name,
+                        mtc_password=mtc_password,
                         command=f"chmod 644 {shlex.quote(remote_path)}",
-                        timeout=30,
+                        timeout=15,
                     )
-                else:
-                    self.log(f"chmod on seat failed: {e}", "WARNING")
+                except Exception:
+                    pass
 
         except _SeatSshError as e:
             # Extract the actual error message from SCP output (not SSH debug)
@@ -556,10 +510,10 @@ class AppMixin:
         # Clean up APK files after successful installation to save space
         # Remove from seat and local APK if successful
         def _cleanup():
-            # Delete from seat's /tmp
+            # Delete from seat's /data/local/tmp
             try:
                 self.adb.run_command(f"{self.get_device_flag()} shell rm -f {shlex.quote(remote_path)}", timeout=30)
-                self.log(f"Cleaned up {apk_name} from seat /tmp", "DEBUG")
+                self.log(f"Cleaned up {apk_name} from seat /data/local/tmp", "DEBUG")
             except Exception:
                 pass
 
@@ -567,7 +521,7 @@ class AppMixin:
         # NOTE: QTimer.singleShot from a worker thread is silently dropped
         # on PyQt6 (see pyqt6-singleshot-worker-thread-dropped.md). Use
         # run_on_main_thread so the cleanup actually fires on the GUI thread.
-        self.log("Scheduling cleanup of APK file on seat /tmp", "DEBUG")
+        self.log("Scheduling cleanup of APK file on seat /data/local/tmp", "DEBUG")
         self.run_on_main_thread(lambda: (
             QTimer.singleShot(2000, _cleanup) if not getattr(self, '_closing', False) else None
         ))

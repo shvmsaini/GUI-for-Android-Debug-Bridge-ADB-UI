@@ -295,52 +295,21 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         pass
                     out, code = shell.run(cmd, timeout=20)
                     if code != 0:
-                        # Surface the failed command's stderr to the user.
-                        # The path is included so they can tell at a glance
-                        # whether they typoed, the dir doesn't exist, or
-                        # root can't read it. Strip the leading "cd: " /
-                        # "ls: " / "bash: cd: " prefix so the path doesn't
-                        # appear twice — the outer format already owns it.
                         first_line = next(
                             iter((out or "").strip().splitlines()), ""
                         )
-                        # Split on ": " and drop everything before the
-                        # last segment that looks like a path or a known
-                        # command ("cd", "ls", "bash"). Falls back to the
-                        # whole line if we can't find a clean split.
                         reason = first_line
                         if ": " in first_line:
                             parts = first_line.split(": ")
-                            # Walk from the right — the final segment is
-                            # always the human reason; preceding segments
-                            # are either the path, the command name, or
-                            # bash's "bash:" / "cd:" / "ls:" prefix.
-                            # Drop as many leading segments as look like
-                            # a command / bash prefix or echo back the
-                            # typed path verbatim.
                             stripped = parts[:]
-                            known_prefixes = (
-                                "bash", "cd", "ls", "sudo", "sh",
-                            )
+                            known_prefixes = ("bash", "cd", "ls", "sudo", "sh")
                             while len(stripped) > 1:
                                 head = stripped[0].strip()
-                                # "bash: cd: ..." — `head` is "bash".
-                                # "cd: /path: reason" — `head` is "cd".
-                                # "/path: reason" — `head` is "/path"
-                                #   (== our target); the second segment
-                                #   is the reason. Drop the path.
-                                # Anything else: keep it (it's part of the
-                                # human message, e.g. ls permission
-                                # errors that start with "ls: cannot
-                                # open directory '.': Perm...").
-                                if (
-                                    head in known_prefixes
-                                    or head == path
-                                ):
+                                if head in known_prefixes or head == path:
                                     stripped = stripped[1:]
                                 else:
                                     break
-                            if stripped and stripped != parts:
+                            if stripped:
                                 reason = ": ".join(stripped)
                         raise Exception(f"cd {p}: {reason}")
                     lines = (out or "").splitlines()
@@ -510,24 +479,60 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     basename = os.path.basename(f)
                     target_path = join_remote(dest, basename)
 
-                    parent.log(f"Copying {basename}…", "INFO")
-                    _set_progress(int(100 * i / total), f"Copying {basename}…")
+                    parent.log(f"Processing {basename}…", "INFO")
+
+                    def _on_stage(stage, msg):
+                        if stage == "staging_to_gateway":
+                            _set_progress(int(100 * i / total), f"Copying {basename} to gateway…")
+                            parent.update_status(f"Copying {basename} to gateway…")
+                        elif stage in ("gateway_done_doing_bct", "gateway_done_doing_scp"):
+                            _set_progress(int(100 * (i + 0.5) / total), msg)
+                            parent.update_status(msg)
+                        elif stage == "done":
+                            _set_progress(int(100 * (i + 1) / total), f"✓ {basename}")
+                            parent.update_status(f"✓ {basename}")
 
                     try:
-                        jump.run_scp(
+                        jump.copy_to_seat_via_gateway(
                             local_path=f,
-                            remote_path=shlex.quote(target_path),
+                            remote_path=target_path,
                             seat_host=seat_hostname,
                             mtc_password=mtc_password,
-                            timeout=300
+                            timeout=300,
+                            progress_callback=_on_stage,
                         )
                         ok += 1
                         parent.log(f"✓ {seat_hostname}:{target_path}", "INFO")
-                    except _SeatSshError as e:
-                        err = str(e).strip()
-                        failed += 1
-                        failed_items.append(f"{basename}: {err}")
-                        parent.log(f"✗ {basename}: {err[:200]}", "ERROR")
+                    except Exception as e:
+                        # Fallback for non-/data/local/tmp/ directories that may require root:
+                        # stage in /data/local/tmp/ and move with root shell
+                        staged_tmp = f"/data/local/tmp/{basename}"
+                        recovered = False
+                        if dest != "/data/local/tmp/":
+                            try:
+                                parent.log(f"Direct push to {dest} failed ({e}); retrying via /data/local/tmp/ and root mv…", "INFO")
+                                jump.copy_to_seat_via_gateway(
+                                    local_path=f,
+                                    remote_path=staged_tmp,
+                                    seat_host=seat_hostname,
+                                    mtc_password=mtc_password,
+                                    timeout=300,
+                                    progress_callback=_on_stage,
+                                )
+                                mv_cmd = f"cp -f {shlex.quote(staged_tmp)} {shlex.quote(target_path)} && rm -f {shlex.quote(staged_tmp)} && chmod 644 {shlex.quote(target_path)}"
+                                _, code_mv = shell.run(mv_cmd, timeout=30)
+                                if code_mv == 0:
+                                    ok += 1
+                                    recovered = True
+                                    parent.log(f"✓ {seat_hostname}:{target_path} (via root mv)", "INFO")
+                            except Exception:
+                                pass
+
+                        if not recovered:
+                            err = str(e).strip()
+                            failed += 1
+                            failed_items.append(f"{basename}: {err}")
+                            parent.log(f"✗ {basename}: {err[:200]}", "ERROR")
 
                 def done():
                     try:
@@ -543,13 +548,8 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         box.setText(summary)
                         if failed_items:
                             if len(failed_items) <= 3:
-                                # Short — just show inline
-                                box.setInformativeText(
-                                    "Errors:\n" + "\n".join(failed_items)
-                                )
+                                box.setInformativeText("Errors:\n" + "\n".join(failed_items))
                             else:
-                                # Longer — first 3 inline, the rest in the
-                                # collapsible "Show Details…" expander.
                                 box.setInformativeText(
                                     "Errors (first 3):\n"
                                     + "\n".join(failed_items[:3])
@@ -634,10 +634,18 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         remote_path = join_remote(current_path(), raw)
                         local_path = os.path.join(dest_dir, raw)
 
-                        _set_progress(int(100 * i / total), f"Downloading {raw}…")
+                        def _on_stage(stage, msg):
+                            if stage.startswith("seat_to_gateway"):
+                                _set_progress(int(100 * i / total), f"Downloading {raw} from seat to gateway…")
+                                parent.update_status(f"Downloading {raw} to gateway…")
+                            elif stage == "gateway_to_local":
+                                _set_progress(int(100 * (i + 0.5) / total), f"Downloading {raw} from gateway to local…")
+                                parent.update_status(f"Downloading {raw} to local…")
+                            elif stage == "done":
+                                _set_progress(int(100 * (i + 1) / total), f"✓ {raw}")
+                                parent.update_status(f"✓ {raw}")
 
                         if is_dir:
-                            # Stage directory into a tarball in /tmp, then pull
                             tar_cmd = (
                                 f"tar cf {shlex.quote(tmp_remote)} "
                                 f"-C {shlex.quote(os.path.dirname(remote_path) or '/')} "
@@ -648,13 +656,13 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                                 raise Exception(f"tar stage failed with code {code_tar}")
 
                             local_tar = os.path.join(dest_dir, f".tmp-{uuid.uuid4().hex}.tar")
-                            jump.run_scp(
-                                local_path=local_tar,
+                            jump.copy_from_seat_via_gateway(
                                 remote_path=tmp_remote,
+                                local_path=local_tar,
                                 seat_host=seat_hostname,
                                 mtc_password=mtc_password,
-                                to_remote=False,
-                                timeout=600
+                                timeout=600,
+                                progress_callback=_on_stage
                             )
 
                             try:
@@ -664,19 +672,18 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                                 if os.path.exists(local_tar):
                                     os.unlink(local_tar)
                         else:
-                            # Copy file to /tmp so mtc can read it
                             cp_cmd = f"cp {shlex.quote(remote_path)} {shlex.quote(tmp_remote)} && chmod 644 {shlex.quote(tmp_remote)}"
                             _, code_cp = shell.run(cp_cmd, timeout=30)
                             if code_cp != 0:
                                 raise Exception(f"sudo cp to /tmp failed with code {code_cp}")
 
-                            jump.run_scp(
-                                local_path=local_path,
+                            jump.copy_from_seat_via_gateway(
                                 remote_path=tmp_remote,
+                                local_path=local_path,
                                 seat_host=seat_hostname,
                                 mtc_password=mtc_password,
-                                to_remote=False,
-                                timeout=600
+                                timeout=600,
+                                progress_callback=_on_stage
                             )
 
                         ok += 1
@@ -685,10 +692,9 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         failed += 1
                         failed_items.append(f"{raw}: {e}")
                     finally:
-                        # Cleanup temp file on seat
                         try:
                             shell.run(f"rm -f {shlex.quote(tmp_remote)}", timeout=5)
-                        except:
+                        except Exception:
                             pass
 
                 def _finish():
@@ -853,14 +859,13 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     if code_cp != 0:
                         raise Exception(f"sudo cp to /tmp failed (code {code_cp})")
 
-                    # Pull via SCP
-                    jump.run_scp(
-                        local_path=local_tmp,
+                    # Pull: seat -> gateway -> local
+                    jump.copy_from_seat_via_gateway(
                         remote_path=tmp_remote,
+                        local_path=local_tmp,
                         seat_host=seat_hostname,
                         mtc_password=mtc_password,
-                        to_remote=False,
-                        timeout=60
+                        timeout=60,
                     )
 
                     with open(local_tmp, 'r', encoding='utf-8', errors='replace') as f:
@@ -903,13 +908,13 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             with open(local_tmp, 'w', encoding='utf-8') as f:
                                 f.write(new_content)
 
-                            # SCP to /tmp
-                            jump.run_scp(
+                            # Push: local -> gateway -> seat
+                            jump.copy_to_seat_via_gateway(
                                 local_path=local_tmp,
                                 remote_path=tmp_remote,
                                 seat_host=seat_hostname,
                                 mtc_password=mtc_password,
-                                timeout=60
+                                timeout=60,
                             )
 
                             # sudo mv to target
