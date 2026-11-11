@@ -858,7 +858,7 @@ class ScrcpyMirrorWindow(QMainWindow):
 
             # Construct command
             adb_bin = self.adb_path if self.adb_path else 'adb'
-            cmd = [adb_bin, '-s', self.device_id, 'install', '-r', '-t', apk_path]
+            cmd = [adb_bin, '-s', self.device_id, 'install', '-r', '-d', '-t', apk_path]
             print(f"🔍 DEBUG: Running: {' '.join(cmd)}")
 
             # Connect output signal for real-time progress

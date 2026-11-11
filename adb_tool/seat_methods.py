@@ -1410,31 +1410,103 @@ def _push_adb_key(sh, adb_keys, log):
 
     f = _ADB_KEYS_FILE
 
+    # Make sure the parent dir exists. ``/data/misc/adb`` is normally
+    # created by adbd on first start, but on a freshly-imaged seat (or
+    # one where adbd never ran) it can be missing entirely. The caller
+    # already runs ``mkdir -p /data/misc/adb`` before invoking us, but
+    # we double-check defensively so a regression in the caller can't
+    # turn into a silent "key not installed" report.
+    sh.run("mkdir -p /data/misc/adb", timeout=15)
+
+    # Make sure the *file* exists. On shells where ``>>`` is supposed to
+    # create the file, that relies on the redirect happening before the
+    # ``echo`` body — and we've seen seat images where the chained
+    # redirect below silently exits 0 without creating the file when
+    # the path didn't exist beforehand. Explicitly create an empty file
+    # only if it's missing; never truncate an existing one (it may
+    # already hold other hosts' keys).
+    #
+    # We probe with ``test -e`` directly (its exit code is the marker
+    # we capture via _SeatShell.run, so it's unambiguous), rather than
+    # the more obvious ``[ -e f ] && echo X || echo Y`` form — that
+    # one can match BOTH markers in the buffered output if the shell
+    # echoes the whole conditional, and the rightmost match wins, which
+    # is the wrong one. Using ``test -e`` lets the marker echo capture
+    # the actual exit code 0 (exists) or 1 (missing).
+    _, exists_code = sh.run(f"test -e {f}", timeout=15)
+    if exists_code != 0:
+        # ``install`` copies /dev/null to the target, creating an empty
+        # file with the requested mode in one atomic step. It also fails
+        # loudly (non-zero exit) on permission/SELinux errors, unlike
+        # the bare-redirect form which has been observed to succeed-
+        # without-effect on some seat shells.
+        _, mk_code = sh.run(f"install -m 644 /dev/null {f}", timeout=15)
+        if mk_code != 0:
+            # Last-ditch fallback: ``>>`` from /dev/null on a missing
+            # path is *supposed* to create the file but has been
+            # observed to fail silently on some seat shells. Surface a
+            # clear error rather than report "key installed" while the
+            # file is still missing.
+            raise _SeatSshError(
+                f"Could not create {f} on seat — install returned {mk_code}. "
+                "Check that /data is writable and SELinux isn't blocking it."
+            )
+        log(f"KEYS: created empty {f}", "INFO")
+
     # Dedup check: `grep -qF` exits 0 if found. Different hosts' keys share
     # the same key type but differ in the base64 blob, so we compare the
-    # full line — that's the only reliable dedup.
+    # full line — that's the only reliable dedup. ``2>/dev/null`` suppresses
+    # the "No such file" error (we've already ensured the file exists above),
+    # but we still want grep's exit code 2 (file missing) to flow through as
+    # "not found" so the append branch runs.
     _, code = sh.run(f"grep -qF '{line}' {f} 2>/dev/null", timeout=15)
     if code == 0:
         log("KEYS: key already on seat — running post-install setup", "INFO")
         _run_post_install_setup(sh, log)
         return False  # Key was already present, not freshly installed
+    if code not in (1, 2):
+        # 1 = no match, 2 = file missing — both legitimate "not found".
+        # Anything else (e.g. permission denied, grep broken on this seat)
+        # is unexpected and should not silently fall through.
+        log(f"KEYS: dedup grep returned unexpected exit code {code}", "WARNING")
     log("KEYS: key not on seat, appending...", "INFO")
 
-    # Make sure the file ends with a newline so the new key isn't glued to
-    # the previous one.
-    sh.run(
-        f'[ -s {f} ] && [ "$(tail -c1 {f} | wc -l)" -eq 0 ] && echo >> {f}',
-        timeout=15,
+    # Append the key. We use a printf+tee pipeline instead of plain
+    # ``echo '...' >> {f}`` because we've seen the bare-redirect form
+    # fail silently on some seat shells when the file was just created
+    # — the redirect opens an empty file but ``echo`` somehow returns 0
+    # without writing. ``tee -a`` is more explicit: it writes its stdin
+    # to the file in append mode and reports its own exit code, so we
+    # get a clear failure signal if the write didn't happen.
+    #
+    # printf (not echo) avoids a trailing-newline surprise: echo on some
+    # shells expands \n sequences, others don't. printf "%s\n" gives us
+    # exactly one newline at the end, every time.
+    append_cmd = (
+        f"printf '%s\\n' '{line}' | tee -a {f} >/dev/null"
     )
-    _, code = sh.run(f"echo '{line}' >> {f}", timeout=15)
+    _, code = sh.run(append_cmd, timeout=15)
     if code != 0:
-        raise _SeatSshError(f"Could not write the key to {f}")
+        raise _SeatSshError(
+            f"Could not write the key to {f} (tee exit {code}). "
+            "Check filesystem permissions and SELinux policy on /data."
+        )
     sh.run(f"chmod 644 {f}", timeout=15)
 
-    # Verify by reading it back.
+    # Verify by reading it back. If this fails after a "successful" write,
+    # the write silently didn't land — surface that with as much context
+    # as we can capture.
     _, code = sh.run(f"grep -qF '{line}' {f}", timeout=15)
     if code != 0:
-        raise _SeatSshError(f"Could not verify the key in {f}")
+        # Get diagnostic info: does the file exist? Is it empty? Any
+        # obvious errors in the output buffer?
+        ls_out, _ = sh.run(f"ls -la {f} 2>&1", timeout=10)
+        head_out, _ = sh.run(f"head -c 200 {f} 2>&1", timeout=10)
+        raise _SeatSshError(
+            f"Could not verify the key in {f}. "
+            f"ls says: {ls_out.strip()[:200]!r}; "
+            f"head says: {head_out.strip()[:200]!r}"
+        )
     log("KEYS: key written and verified", "INFO")
 
     _run_post_install_setup(sh, log)
@@ -3755,6 +3827,32 @@ class SeatMixin:
                     # Never fail connect because pre-cleanup hiccuped.
                     self.log(f"Pre-connect disconnect failed (non-fatal): {_pre_dc_err}", "DEBUG")
 
+                # Pre-connect: install the ADB key BEFORE ``seat.sh
+                # auto-connect`` brings up the SSH tunnel. The current
+                # ordering matters: if we ran auto-connect first, the
+                # device would come up as 'unauthorized' (yellow 🟡)
+                # because adbd doesn't trust the host's public key yet,
+                # the seizure prompt would fire, and the user would
+                # have to manually accept it. By installing first we
+                # write the key to /data/misc/adb/adb_keys and restart
+                # adbd so it re-reads the file — the subsequent
+                # auto-connect binds ``localhost:<port>`` against an
+                # adbd that already trusts the host, and the device
+                # comes up as 'device' with no prompt.
+                #
+                # This is the only case where order matters: it's safe
+                # to install even when the user didn't check the box
+                # (the helper no-ops), and it's safe to skip even when
+                # they did (in which case the post-connect path still
+                # picks it up via the seizure-decline branch).
+                if install_adb_key:
+                    self._install_adb_key_pre_connect(
+                        seat, gateway, adb_key,
+                        gateway_password=password,
+                        mtc_password=mtc_password or password,
+                        root_password=root_password,
+                    )
+
                 cmd = [script_path, 'auto-connect', seat, gateway]
                 # IMPORTANT: redirect stdout/stderr to temp files instead of
                 # using capture_output=True. seat.sh runs `ssh -f -N -L ...`
@@ -4042,7 +4140,8 @@ class SeatMixin:
         threading.Thread(target=do_connect, daemon=True).start()
 
     def _install_adb_key_on_seat(self, seat, gateway, adb_key,
-                                 gateway_password, mtc_password, root_password=None):
+                                 gateway_password, mtc_password, root_password=None,
+                                 restart_adbd=True, pre_connect=False):
         """Install the user's ADB public key on the seat.
 
         Flow (per the user's preference — three passwords: gateway for SSH
@@ -4064,6 +4163,24 @@ class SeatMixin:
         If ``root_password`` is None, falls back to ``mtc_password`` so
         older seat images (where mtc and root shared a credential) still
         work.
+
+        ``restart_adbd`` (default True) controls whether the seat's adbd is
+        restarted (``setprop ctl.restart adbd``) after the key is written.
+        Restarting adbd is what makes the freshly-appended key take effect
+        on the running device — but it also drops any other user's adb
+        connection to the seat. Pass False when the user has explicitly
+        declined a seizure prompt but still wants their key installed for
+        the next connect: the key gets written, but adbd keeps running so
+        the other user's session isn't disturbed.
+
+        ``pre_connect`` (default False) controls whether the install runs
+        BEFORE ``seat.sh auto-connect`` (in which case the SSH tunnel
+        isn't up yet — there's no ``localhost:<port>`` to reconnect to,
+        so we skip the host-side ``adb disconnect && adb connect``) or
+        AFTER (the original flow, where we reconnect to pick up the new
+        key). Pre-connect mode also runs the install synchronously in the
+        caller's thread instead of spawning a worker, so the connect
+        flow can wait for the key to land before bringing up the tunnel.
         """
         if paramiko is None:
             self.log(
@@ -4104,16 +4221,50 @@ class SeatMixin:
                 # We do NOT use `adb kill-server` on the host — that would drop
                 # every other connected device. Restarting adbd on the device
                 # only kills the seat's tunnel, which is exactly what we want.
-                out, code = sh.run("setprop ctl.restart adbd", timeout=10)
-                self.log(f"KEYS: setprop ctl.restart adbd exit={code} "
-                         f"out={out.strip()!r}", "DEBUG")
-                # After appending the key, reconnect on the host side so the
-                # adb client re-handshakes with the freshly-restarted adbd.
-                # Marshal to GUI thread — PyQt6 silently drops
-                # QTimer.singleShot() from worker threads.
-                self.run_on_main_thread(
-                    lambda: self._reconnect_seat_device_after_install(seat_dev),
-                )
+                #
+                # ``restart_adbd=False`` skips this step — used when the user
+                # declined a seizure prompt but still wants the key written
+                # (the key is in place for the next adbd restart; the other
+                # user's adbd session isn't disturbed right now).
+                if restart_adbd:
+                    out, code = sh.run("setprop ctl.restart adbd", timeout=10)
+                    self.log(f"KEYS: setprop ctl.restart adbd exit={code} "
+                             f"out={out.strip()!r}", "DEBUG")
+                    if pre_connect:
+                        # Pre-connect: the seat.sh SSH tunnel isn't up yet,
+                        # so there's no ``localhost:<port>`` to reconnect
+                        # to. ``seat.sh auto-connect`` runs immediately
+                        # after we return, and adbd has already been
+                        # restarted with the new key — the freshly-bound
+                        # ``localhost:<port>`` will accept the host's
+                        # handshake as 'device', no reconnect needed.
+                        self.log(
+                            f"KEYS: adbd restarted on seat {seat} — "
+                            "next seat.sh auto-connect will pick up the new key",
+                            "DEBUG",
+                        )
+                    else:
+                        # Post-connect: reconnect on the host side so the
+                        # adb client re-handshakes with the freshly-
+                        # restarted adbd. Marshal to GUI thread — PyQt6
+                        # silently drops QTimer.singleShot() from worker
+                        # threads.
+                        self.run_on_main_thread(
+                            lambda: self._reconnect_seat_device_after_install(seat_dev),
+                        )
+                else:
+                    # Key written but adbd not restarted. The new key takes
+                    # effect on the next adbd restart (which the other user's
+                    # session triggers naturally — disconnect/reconnect, seat
+                    # reboot, etc). Log this clearly so the user understands
+                    # why the host side still shows 'unauthorized' for now.
+                    self.log(
+                        f"KEYS: key written to seat {seat} but adbd NOT restarted "
+                        "(seizure was declined) — the new key takes effect on the "
+                        "next adbd restart. Reconnect after the current user "
+                        "disconnects to pick it up.",
+                        "INFO",
+                    )
             except _SeatAuthError as e:
                 # Wrong mtc OR root password (cached or freshly typed).
                 # The ``kind`` attribute tells us which prompt to show —
@@ -4157,7 +4308,75 @@ class SeatMixin:
                     except Exception:
                         pass
 
-        threading.Thread(target=do_install, daemon=True).start()
+        # Pre-connect mode: run the install inline in the caller's thread so
+        # we block until the key is written (and adbd is restarted) before
+        # bringing up the seat.sh SSH tunnel. Without this, the connect
+        # flow would race ahead, the device would show up as 'unauthorized'
+        # before adbd finished restarting, and the user would get a spurious
+        # seizure prompt.
+        #
+        # Post-connect mode (the original flow): spawn a worker thread so
+        # the install doesn't block the caller. The caller is the GUI
+        # thread (via ``_start_adb_key_install`` from
+        # ``_finish_seat_connect_after_seizure_decision``), which needs to
+        # return promptly so it can start the watcher, refresh panels, etc.
+        if pre_connect:
+            do_install()
+        else:
+            threading.Thread(target=do_install, daemon=True).start()
+
+    def _install_adb_key_pre_connect(self, seat, gateway, adb_key,
+                                     gateway_password, mtc_password,
+                                     root_password=None):
+        """Synchronous wrapper around ``_install_adb_key_on_seat`` for the
+        pre-connect phase of ``connect_seat``.
+
+        Reads the same ``_pending_*`` state the post-connect helper
+        (``_start_adb_key_install``) does, and is a no-op (DEBUG log) if
+        the user didn't check the install box. Otherwise installs the
+        key BEFORE ``seat.sh auto-connect`` runs — this is the right
+        ordering when the device's adb_keys file is missing or out of
+        date: the key gets written and adbd restarts, and the subsequent
+        ``auto-connect`` brings up the tunnel against an adbd that
+        already trusts the host's public key. Without this, the device
+        shows up as ``unauthorized`` (yellow 🟡), the seizure prompt
+        fires, and the user has to manually accept the seizure — even
+        though no actual seizure is needed; the seat was just missing
+        the host's key.
+
+        Returns ``True`` if the install ran (regardless of whether the
+        key was freshly installed or already present), ``False`` if it
+        was skipped (no key requested or no credentials). The caller
+        can use this to decide whether to expect an immediate
+        'device' status after auto-connect.
+
+        MUST be called from a worker thread — this is a blocking call.
+        """
+        if not (adb_key and gateway_password and mtc_password):
+            # Demoted to DEBUG: the user explicitly asked to hide this.
+            self.log(
+                "Skipping pre-connect ADB-key install (no key or credentials)",
+                "DEBUG",
+            )
+            return False
+        self.update_status(
+            f"🔑 Installing ADB keys on seat {seat} before connecting..."
+        )
+        self.log(
+            f"Pre-connect: installing ADB keys on seat {seat} "
+            "before seat.sh auto-connect (so the device comes up "
+            "as 'device' instead of 'unauthorized')",
+            "INFO",
+        )
+        self._install_adb_key_on_seat(
+            seat, gateway, adb_key,
+            gateway_password=gateway_password,
+            mtc_password=mtc_password,
+            root_password=root_password,
+            restart_adbd=True,
+            pre_connect=True,
+        )
+        return True
 
     def _reconnect_seat_device_after_install(self, seat_dev):
         """Force adb to re-handshake the seat device so the freshly-appended
@@ -4224,6 +4443,12 @@ class SeatMixin:
         self._install_adb_key_on_seat(
             seat, gateway, adb_key, gateway_password, new_mtc,
             root_password=root_pw,
+            # Same restart policy as the original install — the retry is
+            # spawned from inside _install_adb_key_on_seat's exception
+            # handler, which is itself triggered regardless of the
+            # seizure decision, so we inherit restart_adbd from the
+            # caller's intent by defaulting to True.
+            restart_adbd=True,
         )
 
     def _retry_install_adb_key_with_new_root_password(self, seat, gateway, adb_key,
@@ -4245,6 +4470,51 @@ class SeatMixin:
         self._install_adb_key_on_seat(
             seat, gateway, adb_key, gateway_password, mtc_password,
             root_password=new_root,
+            restart_adbd=True,
+        )
+
+    def _start_adb_key_install(self, seat, gateway, *, restart_adbd=True):
+        """Spawn the ADB-key-install worker thread if the user opted in.
+
+        Reads ``_pending_adb_key`` / ``_pending_device_password`` /
+        ``_pending_mtc_password`` / ``_pending_root_password`` (set by
+        ``connect_seat`` from the connect dialog). No-ops (with a DEBUG
+        log) if the user didn't check the box or credentials are missing.
+
+        ``restart_adbd`` is forwarded to ``_install_adb_key_on_seat`` —
+        see that method's docstring for the trade-off (True kicks any
+        current adb session on the seat, False leaves the other user's
+        session alone but the new key only takes effect on the next
+        adbd restart).
+
+        Safe to call from the GUI thread; the install itself runs in a
+        background thread and reports via ``self.log``.
+        """
+        adb_key = getattr(self, '_pending_adb_key', None)
+        device_password = getattr(self, '_pending_device_password', None)
+        mtc_password = getattr(self, '_pending_mtc_password', None)
+        root_password = getattr(self, '_pending_root_password', None)
+        if not (adb_key and device_password and mtc_password):
+            # Demoted to DEBUG: the user explicitly asked to hide this.
+            # They want to see ONLY the "installing ADB key" log when an
+            # install is actually happening — not a constant
+            # "not installing" line on every normal seat connect.
+            self.log("Not installing ADB key (missing credentials or flag)", "DEBUG")
+            return
+        # Wait for the seat port forward (5555) to become available so
+        # adb devices shows the device IP. The dialog may have eaten
+        # some of this delay, but the tunnel can take a moment to
+        # settle after a fresh auto-connect, so keep a short floor.
+        time.sleep(2)
+        threading.Thread(
+            target=self._install_adb_key_on_seat,
+            args=(seat, gateway, adb_key, device_password, mtc_password),
+            kwargs={"root_password": root_password, "restart_adbd": restart_adbd},
+            daemon=True,
+        ).start()
+        self.log(
+            f"ADB key installation thread started (restart_adbd={restart_adbd})",
+            "INFO",
         )
 
     def takeover_seat(self, seat, gateway=None, silent=True, on_ready=None):
@@ -4640,12 +4910,42 @@ class SeatMixin:
 
                 self.log(
                     f"Seizure declined for seat {seat}; device status is "
-                    f"{_now_status!r} — tearing down connection",
+                    f"{_now_status!r} — leaving seat alone (no teardown)",
                     "INFO",
                 )
-                # Tear down the half-state connection so we don't leak the
-                # SSH tunnel or leave the seat panel showing as connected.
-                self._abort_seat_connect_after_seizure_decline(seat, gateway, port, device_id)
+                # User explicitly declined to take over — leave the seat and
+                # any pre-existing adb device connection untouched. We still
+                # need to release the busy token and refresh panels so the
+                # connect button un-stalls and the UI reflects the (unchanged)
+                # state, but we do NOT call seat.sh disconnect, do NOT kill
+                # any SSH tunnel, and do NOT `adb disconnect` the device.
+                # Whatever was there before this connect_seat attempt stays
+                # exactly as it was.
+                #
+                # BUT: if the user opted into "Install ADB keys on seat",
+                # honour that intent. The install is a seat-side SSH file
+                # write that doesn't touch the host-side adb connection.
+                # We pass ``restart_adbd=False`` so we DO NOT kick the
+                # other user's session — the key gets written, and takes
+                # effect on the next adbd restart (which the other user
+                # triggers naturally when they disconnect / reconnect, or
+                # which happens on the next seat reboot). If the user
+                # wants to actually use the device right now, they should
+                # accept the seizure prompt instead of declining.
+                self._start_adb_key_install(
+                    seat, gateway, restart_adbd=False,
+                )
+                self.update_status(
+                    f"❌ Seizure declined — left seat {seat} as-is"
+                )
+                try:
+                    self._sync_refresh_panels()
+                except Exception:
+                    pass
+                try:
+                    self._finalize_seat_connect_busy()
+                except Exception:
+                    pass
                 return
 
             self.log(f"Reconnecting to {seat}...", "INFO")
@@ -4731,33 +5031,23 @@ class SeatMixin:
         Runs on the GUI thread (deferred from the connect_seat worker thread).
         Installs the ADB key if requested, starts the device watcher, and
         updates the UI panels + busy-token release.
+
+        Note: in the common path the install has already run
+        ``pre-connect`` (``_install_adb_key_pre_connect``) before
+        ``seat.sh auto-connect`` — this call is a no-op (the dedup
+        check in ``_push_adb_key`` returns ``False`` because the key
+        is already on the seat). It still acts as a fallback if the
+        pre-connect install failed (paramiko missing, auth error, etc.).
         """
         # Install ADB key if requested. Needs gateway, mtc and root
         # passwords (root is separate from mtc — see
-        # [[separation-of-gateway-mtc-and-root-passwords]]).
-        adb_key = getattr(self, '_pending_adb_key', None)
-        device_password = getattr(self, '_pending_device_password', None)
-        mtc_password = getattr(self, '_pending_mtc_password', None)
-        root_password = getattr(self, '_pending_root_password', None)
-        if adb_key and device_password and mtc_password:
-            # Wait for the seat port forward (5555) to become available so
-            # adb devices shows the device IP. The dialog may have eaten
-            # some of this delay, but the tunnel can take a moment to
-            # settle after a fresh auto-connect, so keep a short floor.
-            time.sleep(2)
-            threading.Thread(
-                target=self._install_adb_key_on_seat,
-                args=(seat, gateway, adb_key, device_password, mtc_password),
-                kwargs={"root_password": root_password},
-                daemon=True,
-            ).start()
-            self.log("ADB key installation thread started", "INFO")
-        else:
-            # Demoted to DEBUG: the user explicitly asked to hide this.
-            # They want to see ONLY the "installing ADB key" log when an
-            # install is actually happening — not a constant
-            # "not installing" line on every normal seat connect.
-            self.log("Not installing ADB key (missing credentials or flag)", "DEBUG")
+        # [[separation-of-gateway-mtc-and-root-passwords]]). The
+        # helper handles the "user didn't check the box" no-op case
+        # itself; restart_adbd=True is correct here because the device
+        # is fully ours at this point (either no seizure was needed,
+        # or the user accepted seizure, or it settled to 'device' on
+        # its own).
+        self._start_adb_key_install(seat, gateway, restart_adbd=True)
 
         # Mark this seat so the device watcher auto-opens the mirror window
         # the first time it observes status='device'. Set BEFORE the

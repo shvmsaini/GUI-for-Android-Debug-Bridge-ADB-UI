@@ -161,6 +161,7 @@ class FileMixin:
 
         up_btn = QPushButton("⬆️ Up")
         top_row.addWidget(up_btn)
+        up_btn.setAutoDefault(False)  # Prevent trigger on Enter
 
         refresh_btn = QPushButton("🔄 Refresh")
         top_row.addWidget(refresh_btn)
@@ -658,7 +659,7 @@ class FileMixin:
                         # Use adb shell pm install so the device handles the file itself.
                         # Quotes inside the shell command are needed for paths with spaces.
                         shell_path = shlex.quote(apk_path)
-                        cmd = f"{self.get_device_flag()} shell pm install -r -t {shell_path}"
+                        cmd = f"{self.get_device_flag()} shell pm install -r -d -t {shell_path}"
                         res = self.adb.run_command(cmd, timeout=120)
                         stdout = (res.get('stdout') or '').strip()
                         stderr = (res.get('stderr') or '').strip()

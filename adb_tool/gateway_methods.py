@@ -728,6 +728,7 @@ class GatewayMixin:
 
         up_btn = QPushButton("⬆️ Up")
         top_row.addWidget(up_btn)
+        up_btn.setAutoDefault(False)  # Prevent trigger on Enter
 
         refresh_btn = QPushButton("🔄 Refresh")
         top_row.addWidget(refresh_btn)

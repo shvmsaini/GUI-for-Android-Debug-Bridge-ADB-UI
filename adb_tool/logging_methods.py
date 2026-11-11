@@ -216,9 +216,10 @@ class LoggingMixin:
         self.logcat_text.insertPlainText(message + "\n")
         # Trim if too many lines (memory safeguard)
         self._trim_logcat_if_needed()
-        # Auto-scroll to bottom
+        # Auto-scroll to bottom only if user was already at/near bottom
         scrollbar = self.logcat_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if scrollbar.value() >= scrollbar.maximum() - 20:  # 20px tolerance
+            scrollbar.setValue(scrollbar.maximum())
 
     def _trim_logcat_if_needed(self):
         """Trim logcat content to prevent unbounded memory growth."""
@@ -264,9 +265,10 @@ class LoggingMixin:
             self.logcat_text.insertPlainText("\n".join(lines) + "\n")
         # Trim widget content
         self._trim_logcat_if_needed()
-        # Auto-scroll to bottom
+        # Auto-scroll to bottom only if user was already at/near bottom
         scrollbar = self.logcat_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if scrollbar.value() >= scrollbar.maximum() - 20:
+            scrollbar.setValue(scrollbar.maximum())
 
     def _filter_logcat(self):
         """Filter logcat output based on the filter text.

@@ -57,7 +57,7 @@ class AppMixin:
         # Show dialog first to let user choose deployment method
         dialog = QDialog(self)
         dialog.setWindowTitle("Install APK")
-        dialog.setMinimumWidth(450)
+        dialog.setMinimumWidth(480)
 
         layout = QVBoxLayout(dialog)
         layout.setSpacing(10)
@@ -78,9 +78,19 @@ class AppMixin:
         layout.addWidget(browse_btn)
 
         # Gateway checkbox - enabled, will prompt for mtc password if needed
-        gateway_checkbox = QCheckBox("Deploy using seat device (scp + pm)")
+        gateway_checkbox = QCheckBox("Install using seat device (scp/bct + pm)")
         gateway_checkbox.setToolTip("Uses SCP tunnel to copy APK directly to seat and pm install.")
         layout.addWidget(gateway_checkbox)
+
+        # Hint: installs run with -r -d (replace existing, allow downgrade).
+        # Covers both `adb install` and `pm install` code paths.
+        flags_hint = QLabel(
+            "Installs can replace or downgrade to the selected lower version apk."
+        )
+        flags_hint.setTextFormat(Qt.TextFormat.RichText)
+        flags_hint.setWordWrap(True)
+        flags_hint.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(flags_hint)
 
         # Buttons
         button_box = QDialogButtonBox(
@@ -364,7 +374,7 @@ class AppMixin:
             cmd = f"{self.get_device_flag()} push {shlex.quote(apk_path)} /sdcard/{apk_name}"
             result = self.adb.run_command(cmd, timeout=120)
             if result['success']:
-                cmd = f"{self.get_device_flag()} shell pm install -r -t /sdcard/{apk_name}"
+                cmd = f"{self.get_device_flag()} shell pm install -r -d -t /sdcard/{apk_name}"
                 result = self.adb.run_command(cmd, timeout=180)
                 if result['success']:
                     self.update_status("✅ Installed (fallback)")
@@ -503,7 +513,7 @@ class AppMixin:
         # Install via pm install
         self.update_status(f"Gateway: Installing {apk_name}...")
         self.log("Running pm install...", "INFO")
-        cmd = f"{self.get_device_flag()} shell pm install -r -t {shlex.quote(remote_path)}"
+        cmd = f"{self.get_device_flag()} shell pm install -r -d -t {shlex.quote(remote_path)}"
         result = self.adb.run_command(cmd, timeout=180)
 
         # Clean up APK files after successful installation to save space
@@ -1558,10 +1568,10 @@ class AppMixin:
                     # Install multiple APKs using install-multiple
                     # Use shlex.quote to properly handle paths with spaces
                     apk_list = ' '.join(shlex.quote(apk) for apk in local_apks)
-                    result = self.adb.run_command(f"{self.get_device_flag()} install-multiple {apk_list}", timeout=180)
+                    result = self.adb.run_command(f"{self.get_device_flag()} install-multiple -d {apk_list}", timeout=180)
                 else:
                     # Single APK - use regular install
-                    result = self.adb.run_command(f"{self.get_device_flag()} install {shlex.quote(local_apks[0])}", timeout=120)
+                    result = self.adb.run_command(f"{self.get_device_flag()} install -d {shlex.quote(local_apks[0])}", timeout=120)
                 
                 if result['success']:
                     self.log("App reinstalled successfully")

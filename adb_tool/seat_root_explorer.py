@@ -191,6 +191,9 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         if not hasattr(parent, '_seat_root_windows'):
             parent._seat_root_windows = []
         parent._seat_root_windows.append(explorer)
+        # Epoch counter: prevents stale thread from overwriting newer navigation
+        explorer._latest_epoch_nosync = 0
+
 
         layout = QVBoxLayout(explorer)
         layout.setSpacing(8)
@@ -201,6 +204,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         path_entry = QLineEdit("/")
         top_row.addWidget(path_entry, 1)
         up_btn = QPushButton("⬆️ Up")
+        up_btn.setAutoDefault(False)  # Prevent accidental trigger on Enter
         top_row.addWidget(up_btn)
         refresh_btn = QPushButton("🔄 Refresh")
         top_row.addWidget(refresh_btn)
@@ -234,7 +238,9 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         ui = _UICaller(parent)
 
         def current_path():
-            p = path_entry.text().strip() or "/"
+            raw = path_entry.text()
+            p = raw.strip() or "/"
+            parent.log(f"Seat Root: current_path() read {raw!r} → {p!r}", "DEBUG")
             return p.rstrip('/') if p not in ('/', '.') else '/'
 
         def join_remote(base, name):
@@ -258,16 +264,77 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
 
         # File list via ls -la parsing
         def refresh_listing():
+            explorer._latest_epoch_nosync += 1
+            # Prevent concurrent threads from running (causes duplicate listings)
+            if getattr(explorer, '_ls_in_progress', False):
+                parent.log(f"Seat Root: skip concurrent refresh", "DEBUG")
+                return
+            explorer._ls_in_progress = True
             p = current_path()
+            parent.log(f"Seat Root: refresh path={p}", "DEBUG")
             listbox.setRowCount(0)
             listbox.setRowCount(1)
             listbox.setItem(0, 0, QTableWidgetItem("Loading…"))
             def do_ls():
                 try:
-                    cmd = f"cd {shlex.quote(p)} 2>/dev/null ; LC_ALL=C ls -la"
+                    quoted = shlex.quote(p)
+                    cmd = f"cd {quoted} && LC_ALL=C ls -la"
+                    parent.log(f"Seat Root: running {cmd!r}", "DEBUG")
+                    # Flush any stale channel data so it doesn't mix with new output
+                    try:
+                        shell.drain(quiet=0.5, maxwait=3)
+                    except Exception:
+                        pass
                     out, code = shell.run(cmd, timeout=20)
                     if code != 0:
-                        raise Exception("ls failed")
+                        # Surface the failed command's stderr to the user.
+                        # The path is included so they can tell at a glance
+                        # whether they typoed, the dir doesn't exist, or
+                        # root can't read it. Strip the leading "cd: " /
+                        # "ls: " / "bash: cd: " prefix so the path doesn't
+                        # appear twice — the outer format already owns it.
+                        first_line = next(
+                            iter((out or "").strip().splitlines()), ""
+                        )
+                        # Split on ": " and drop everything before the
+                        # last segment that looks like a path or a known
+                        # command ("cd", "ls", "bash"). Falls back to the
+                        # whole line if we can't find a clean split.
+                        reason = first_line
+                        if ": " in first_line:
+                            parts = first_line.split(": ")
+                            # Walk from the right — the final segment is
+                            # always the human reason; preceding segments
+                            # are either the path, the command name, or
+                            # bash's "bash:" / "cd:" / "ls:" prefix.
+                            # Drop as many leading segments as look like
+                            # a command / bash prefix or echo back the
+                            # typed path verbatim.
+                            stripped = parts[:]
+                            known_prefixes = (
+                                "bash", "cd", "ls", "sudo", "sh",
+                            )
+                            while len(stripped) > 1:
+                                head = stripped[0].strip()
+                                # "bash: cd: ..." — `head` is "bash".
+                                # "cd: /path: reason" — `head` is "cd".
+                                # "/path: reason" — `head` is "/path"
+                                #   (== our target); the second segment
+                                #   is the reason. Drop the path.
+                                # Anything else: keep it (it's part of the
+                                # human message, e.g. ls permission
+                                # errors that start with "ls: cannot
+                                # open directory '.': Perm...").
+                                if (
+                                    head in known_prefixes
+                                    or head == path
+                                ):
+                                    stripped = stripped[1:]
+                                else:
+                                    break
+                            if stripped and stripped != parts:
+                                reason = ": ".join(stripped)
+                        raise Exception(f"cd {p}: {reason}")
                     lines = (out or "").splitlines()
                     rows = []
                     for line in lines:
@@ -306,6 +373,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         listbox.setRowCount(1)
                         listbox.setItem(0, 0, QTableWidgetItem(f"[Error] {str(e)}"))
                     ui.call.emit(apply_err)
+                    explorer._ls_in_progress = False  # allow next refresh
                     return
                 def apply():
                     listbox.setRowCount(len(rows))
@@ -316,6 +384,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                         listbox.setItem(i, 0, name_item)
                         listbox.setItem(i, 1, size_item)
+                    explorer._ls_in_progress = False  # done, allow next refresh
                 ui.call.emit(apply)
             threading.Thread(target=do_ls, daemon=True).start()
 
@@ -323,9 +392,9 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             p = current_path()
             if p == "/":
                 return
-            parent = os.path.dirname(p.rstrip("/"))
-            parent = "/" if not parent else parent
-            path_entry.setText(parent)
+            parent_dir = os.path.dirname(p.rstrip("/"))
+            parent_dir = "/" if not parent_dir else parent_dir
+            path_entry.setText(parent_dir)
             refresh_listing()
 
         def on_double_click(row, col):
@@ -341,16 +410,27 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                 path_entry.setText(target)
                 refresh_listing()
                 return
-            # Check if it's a directory
+            # Capture the current epoch so we can verify this thread's result
+            # is still valid when it finally returns. If a newer navigation
+            # happened (epoch incremented), this older request is stale.
+            capture_epoch = explorer._latest_epoch_nosync
             def check():
                 cmd = f"test -d {shlex.quote(target)} && echo DIR || echo FILE"
-                parent.log(f"Seat Root: checking type of {target}", "DEBUG")
+                parent.log(f"Seat Root: checking type of {target} (epoch={capture_epoch})", "DEBUG")
                 try:
                     out, code = shell.run(cmd, timeout=10)
-                    parent.log(f"Seat Root: got type {out}", "DEBUG")
+                    parent.log(f"Seat Root: got type {out} (epoch={capture_epoch}, latest={explorer._latest_epoch_nosync})", "DEBUG")
                     if out.strip() == "DIR":
-                        ui.call.emit(lambda: path_entry.setText(target))
-                        ui.call.emit(refresh_listing)
+                        # Only apply if no newer navigation occurred.
+                        if capture_epoch == explorer._latest_epoch_nosync:
+                            ui.call.emit(lambda: path_entry.setText(target))
+                            ui.call.emit(refresh_listing)
+                        else:
+                            parent.log(
+                                f"Seat Root: skipping stale path update to {target} "
+                                f"(epoch {capture_epoch} < latest {explorer._latest_epoch_nosync})",
+                                "DEBUG",
+                            )
                 except Exception:
                     pass
             threading.Thread(target=check, daemon=True).start()
@@ -826,6 +906,20 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         run_btn.clicked.connect(run_command)
         refresh_btn.clicked.connect(refresh_listing)
         up_btn.clicked.connect(go_up)
+        # Pressing Enter in the path bar navigates to the typed path.
+        # Without this, typing `/data/local` and hitting Return would leave
+        # the listing stuck at the previous directory — the user would have
+        # to either click 🔄 Refresh or ⬆️ Up + double-click each segment.
+        path_entry.returnPressed.connect(refresh_listing)
+        # Trace path text changes to diagnose unexpected truncations like
+        # "typing /data/local/tmp takes me to /data/local".
+        def _on_text_changed(new_text):
+            parent.log(f"Seat Root: path → {new_text}", "DEBUG")
+            parent.log("".join(["  "] + [
+                "  " if i < 10 else "*" if i < 20 else "?" if i < len(new_text) else " "
+                for i in range(len(new_text))
+            ]), "DEBUG")
+        path_entry.textChanged.connect(_on_text_changed)
         listbox.cellDoubleClicked.connect(on_double_click)
         close_btn.clicked.connect(explorer.accept)
 
@@ -872,25 +966,36 @@ def _gather_paired_entries(parent):
     options: paired strings seat → gateway_opt (user@host) for a single combobox.
     live ones first, then all history, so current connections are on top.
     default_label and default_gateway point at the current/last-used pair.
+
+    Each (seat, gateway) pair appears AT MOST ONCE — if the same pair shows
+    up in connected, seat.sh, AND history, it's listed once and the most
+    authoritative source wins (connected > seat.sh > history). Otherwise a
+    user with the same seat in all three buckets would see it three times
+    in the dropdown, which is just clutter.
     """
     spm = parent.seat_port_manager
 
-    # Live and history seat/gateway pairs (no dedup yet).
-    pairs = []
+    # Collect (seat, gateway) → best source. Higher rank wins on collision.
+    source_rank = {'connected': 0, 'seat.sh': 1, 'history': 2}
+    pairs_by_key = {}  # (seat, gateway) -> (source, original_list_order)
+
+    def _add(seat, gw, source):
+        if not seat or not gw:
+            return
+        key = (seat, gw)
+        existing = pairs_by_key.get(key)
+        if existing is None or source_rank[source] < source_rank[existing[0]]:
+            pairs_by_key[key] = (source, len(pairs_by_key))
 
     # Preferred: currently connected in our internal state
     connected = getattr(spm, 'connected_seats', {}) or {}
     for seat, gw in connected.items():
-        if seat and gw:
-            pairs.append({'seat': seat, 'gateway': gw, 'source': 'connected'})
+        _add(seat, gw, 'connected')
 
     # Next: live from seat.sh devices
     try:
         for d in (spm.get_devices_from_seat_sh() or []):
-            s = d.get('seat')
-            gw = d.get('gateway')
-            if s and gw:
-                pairs.append({'seat': s, 'gateway': gw, 'source': 'seat.sh'})
+            _add(d.get('seat'), d.get('gateway'), 'seat.sh')
     except Exception:
         pass
 
@@ -900,24 +1005,26 @@ def _gather_paired_entries(parent):
     except Exception:
         history = []
     for entry in history:
-        s = entry.get('seat')
-        gw = entry.get('gateway')
-        if s and gw:
-            pairs.append({'seat': s, 'gateway': gw, 'source': 'history'})
+        _add(entry.get('seat'), entry.get('gateway'), 'history')
 
-    # Order: connected (reversed so most recent first), seat.sh, history.
-    connected_sorted = [p for p in pairs if p['source'] == 'connected'][::-1]
-    seat_sh_sorted = [p for p in pairs if p['source'] == 'seat.sh']
-    history_sorted = [p for p in pairs if p['source'] == 'history']
-    pairs_sorted = connected_sorted + seat_sh_sorted + history_sorted
+    # Stable, source-ordered list:
+    #   connected (reversed so most recent connected seat first),
+    #   then seat.sh (in the order seat.sh reported them),
+    #   then history (newest-first, since get_top_entries already sorts).
+    by_source = {'connected': [], 'seat.sh': [], 'history': []}
+    for key, (source, order) in pairs_by_key.items():
+        by_source[source].append((order, key))
+    pairs_sorted = (
+        [(k, 'connected') for _, k in sorted(by_source['connected'], reverse=True)]
+        + [(k, 'seat.sh') for _, k in sorted(by_source['seat.sh'])]
+        + [(k, 'history') for _, k in sorted(by_source['history'])]
+    )
 
     # Build labels and gateway lookup
     labels = []
     label_to_gateway = {}
-    for p in pairs_sorted:
-        s = p['seat']
-        gw = p['gateway']
-        label = f"{s} {gw}"
+    for (seat, gw), _source in pairs_sorted:
+        label = f"{seat} {gw}"
         labels.append(label)
         label_to_gateway[label] = gw
 
@@ -942,10 +1049,11 @@ def _gather_paired_entries(parent):
             default_gateway = label_to_gateway[label]
             break
 
-    # Finally fallback to first history entry
-    if not default_label and history_sorted:
-        default_label = f"{history_sorted[0]['seat']} {history_sorted[0]['gateway']}"
-        default_gateway = history_sorted[0]['gateway']
+    # Finally fallback to first entry in the (already ordered) list —
+    # connected (reversed) → seat.sh → history.
+    if not default_label and labels:
+        default_label = labels[0]
+        default_gateway = label_to_gateway[default_label]
 
     # If nothing exists, return NO defaults
     if not labels:
