@@ -312,36 +312,23 @@ class DeviceMixin:
                     and (
                         seat_to_disconnect in getattr(self, '_connecting_seats', set())
                         or seat_to_disconnect in getattr(self, '_seat_was_seized', {})
+                        or seat_to_disconnect in getattr(self, '_seat_offline_in_progress', set())
+                        or seat_to_disconnect in getattr(self, '_seat_offline_dialog_open', set())
+                        or seat_to_disconnect in getattr(self, '_seat_offline_prompt_pending', set())
+                        or seat_to_disconnect in getattr(self, '_seat_seized_dialog_open', set())
                     )
                 )
                 if seat_in_recovery:
                     self.log(
                         f"Skipping offline-seat prompt for {dev_id} ({seat_to_disconnect}) — "
-                        "connect/recovery already in progress; watcher will handle seizure",
+                        "recovery or dialog already in progress",
                         "DEBUG",
                     )
                     continue
 
-                # For seat-bound offline devices, prompt the user before
-                # tearing down the SSH tunnel / adb binding. The device may
-                # just be transiently offline (network blip, brief USB
-                # disconnect); silently yanking the seat leaves the user
-                # wondering why their previously-connected seat vanished.
                 if seat_to_disconnect:
-                    if seat_to_disconnect in self._seat_offline_prompt_pending:
-                        # A popup is already open (or just closed without a
-                        # choice) for this seat. Skip until the user acts
-                        # — otherwise the next refresh re-prompts and we
-                        # stack modals.
-                        self.log(
-                            f"Skipping offline-seat prompt for {seat_to_disconnect} "
-                            "— already pending user decision",
-                            "DEBUG",
-                        )
-                        continue
-                    self._seat_offline_prompt_pending.add(seat_to_disconnect)
-                    self._prompt_offline_seat_reconnect(
-                        seat_to_disconnect, seat_gateway, dev_id,
+                    self._show_seat_offline_dialog(
+                        seat_to_disconnect, gateway=seat_gateway, device_id=dev_id,
                     )
                     continue
 
@@ -659,186 +646,9 @@ class DeviceMixin:
                     self.log("No devices found. Make sure USB debugging is enabled and device is connected.", "WARNING")
 
     def _prompt_offline_seat_reconnect(self, seat, gateway, device_id):
-        """Show a Yes/No popup asking whether to reconnect or disconnect an
-        offline seat that was previously online.
-
-        Reconnect  -> re-run the SSH tunnel + adb handshake via connect_seat.
-                      The existing mirror window (if any) stays open — its
-                      internal auto-retry restarts the SDK client when the
-                      device reappears, so the stream resumes in-place.
-                      A defensive mirror snapshot is also taken so we can
-                      force-reopen if the watcher's auto-resume misses.
-        Disconnect -> tear down the seat (adb disconnect, reap SSH tunnel,
-                      clear ever-online flag, drop any mirror snapshot) —
-                      same as the old silent path.
-        Dismissed  -> leave the seat as-is; the next refresh will re-detect
-                      the offline state and re-prompt (since we cleared the
-                      pending flag on dialog close).
-
-        Runs on the GUI thread (_apply_device_refresh is invoked from the
-        _finish_background slot), so a modal dialog is safe here.
-        """
-        from .safe_dialog import safe_question
-
-        # Guard against stacking with a more-specific seizure dialog
-        # (which has better wording about "another user seized this seat").
-        if hasattr(self, '_seat_seized_dialog_open') and seat in self._seat_seized_dialog_open:
-            self.log(
-                f"Skipping duplicate offline-seat prompt for {seat} — "
-                "seizure dialog already open",
-                "DEBUG",
-            )
-            self._seat_offline_prompt_pending.discard(seat)
-            return
-
-        # Snapshot the open mirror (if any) BEFORE the user clicks anything.
-        # The watcher (in _start_seat_device_watcher) also snapshots on its
-        # 2-second poll cycle, but there is a race: this popup fires from
-        # the device-refresh path which can run before the watcher has had
-        # a chance to see the offline transition. Capturing here means the
-        # auto-resume data exists regardless of watcher timing.
-        #
-        # We only snapshot if no snapshot exists yet — the watcher may
-        # have already taken one with the same params, and we don't want
-        # to overwrite a snapshot the watcher is about to pop.
-        #
-        # IMPORTANT: do NOT close the existing mirror window. The mirror
-        # has its own internal auto-retry (ScrcpyMirrorWindow._on_auto_retry
-        # in adb_tool/scrcpy_mirror.py) which silently restarts the SDK
-        # client on socket/connection errors with 0/1/2/5/5... second
-        # backoff. When the SSH tunnel + adb handshake comes back online,
-        # the mirror's listener thread sees the device reappear and
-        # resumes streaming in-place — the same window, the same frame,
-        # no popup, no re-init. Closing it would lose that for nothing.
-        if (hasattr(self, '_capture_mirror_for_auto_resume')
-                and hasattr(self, '_mirror_auto_resume')
-                and device_id not in self._mirror_auto_resume):
-            try:
-                self._capture_mirror_for_auto_resume(device_id)
-            except Exception as e:
-                self.log(f"Snapshot mirror for auto-resume failed: {e}", "DEBUG")
-
-        # Use a default button of No so an accidental Enter / Return doesn't
-        # immediately re-establish an SSH tunnel the user didn't ask for.
-        title = "Seat went offline"
-        message = (
-            f"Seat {seat} is offline (device {device_id} was previously online). "
-            "Reconnect?"
-        )
-        # Poll the cached device snapshot every second while the dialog
-        # is open. If the seat's device is back to status='device' (the
-        # auto-refresh saw it recover) — or if the device is gone from
-        # the cache entirely (treat as 'not our problem anymore') —
-        # auto-close the dialog with the Yes outcome so the user
-        # doesn't have to dismiss it themselves when the system has
-        # already self-healed. Returns False on any error so the dialog
-        # stays open and the user can decide.
-        def _auto_close_check():
-            try:
-                # Check if the seat watcher has detected a seizure.
-                # If so, let the seizure dialog take priority — close
-                # this generic offline prompt so we don't show duplicate
-                # modals.
-                if seat in getattr(self, '_seat_was_seized', {}):
-                    self.log(
-                        f"Auto-closing offline prompt for {seat} — "
-                        "seizure dialog will be shown instead",
-                        "DEBUG",
-                    )
-                    return True
-
-                cached = getattr(self, 'cached_devices', None) or []
-                now_dev = next(
-                    (d for d in cached if d.get('id') == device_id),
-                    None,
-                )
-                if now_dev is None:
-                    # Device vanished from `adb devices` entirely
-                    # (rare: SSH tunnel torn down out from under us).
-                    # Don't auto-close — let the user decide whether
-                    # to reconnect through the regular path.
-                    return False
-                return now_dev.get('status') == 'device'
-            except Exception:
-                return False
-
-        try:
-            reconnect = safe_question(
-                self, title, message,
-                auto_close_check=_auto_close_check,
-            )
-        except Exception as e:
-            # Don't let a dialog failure block cleanup — fall back to the
-            # old silent disconnect path so the seat doesn't sit forever
-            # in a zombie state.
-            self.log(f"Offline-seat reconnect prompt failed: {e}", "ERROR")
-            reconnect = False
-        finally:
-            # Whichever path the user takes (or if they dismiss), clear
-            # the pending flag so a *new* offline event later can prompt
-            # again — but the *current* offline detection won't re-prompt
-            # until the user does something about it.
-            try:
-                self._seat_offline_prompt_pending.discard(seat)
-            except Exception:
-                pass
-
-        if reconnect:
-            self.log(f"User chose to reconnect seat {seat} ({device_id})", "INFO")
-            self.update_status(f"🔌 Reconnecting seat {seat}...")
-            # connect_seat registers the seat in _connecting_seats so the
-            # auto-disconnect logic above won't tear the half-state
-            # handshake down before the watcher starts. It also starts
-            # the watcher via _finish_seat_connect_after_seizure_decision
-            # which will eventually call _try_auto_resume_mirror when it
-            # sees status='device'.
-            try:
-                self.connect_seat(seat, gateway)
-            except Exception as e:
-                self.log(f"Failed to reconnect seat {seat}: {e}", "ERROR")
-                return
-
-            # Belt-and-braces: schedule an explicit mirror auto-resume so
-            # the mirror comes back even if the watcher's first
-            # status='device' poll is delayed (the SSH tunnel + adb
-            # handshake typically takes ~3-7s, and the watcher polls every
-            # 2s). If the watcher beats us to it, _try_auto_resume_mirror
-            # pops the snapshot and the QTimer call becomes a no-op.
-            if hasattr(self, '_try_auto_resume_mirror'):
-                QTimer.singleShot(
-                    5000,
-                    lambda did=device_id: self._safe_try_auto_resume_mirror(did),
-                )
-            return
-
-        # No (or dialog dismissed) — leave the seat as-is. We used to
-        # silently tear down the SSH tunnel + adb binding here, but the
-        # user explicitly asked us to stop doing that: dismissing the
-        # prompt should not destroy a working half-state connection that
-        # the user might still want to investigate. Clear the ever-
-        # online flag so the next refresh treats this as a fresh offline
-        # observation (won't auto-disconnect during the post-dismiss
-        # grace period) and drop any mirror auto-resume snapshot (the
-        # user explicitly dismissed the prompt, so we shouldn't reopen
-        # the mirror on the next reconnect without a clear action).
-        self.log(
-            f"User dismissed offline-seat prompt for {seat} ({device_id}) — "
-            "leaving seat untouched",
-            "INFO",
-        )
-        # Clear the ever-online flag so the auto-disconnect logic above
-        # doesn't immediately flag this device as a stale connection
-        # and tear it down on the *next* refresh.
-        if device_id and device_id in self._device_ever_online:
-            del self._device_ever_online[device_id]
-        # Drop the snapshot — the user dismissed the prompt, we don't
-        # want a later reconnect to surprise them by reopening the
-        # mirror.
-        if hasattr(self, '_clear_mirror_auto_resume'):
-            try:
-                self._clear_mirror_auto_resume(device_id)
-            except Exception:
-                pass
+        """Unified entry point for offline seat reconnects: delegates to _show_seat_offline_dialog."""
+        if hasattr(self, '_show_seat_offline_dialog'):
+            return self._show_seat_offline_dialog(seat, gateway=gateway, device_id=device_id)
 
     def _safe_try_auto_resume_mirror(self, device_id):
         """Wrapper around _try_auto_resume_mirror that swallows errors.

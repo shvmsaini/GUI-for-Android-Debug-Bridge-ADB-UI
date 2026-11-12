@@ -2835,8 +2835,8 @@ class SeatMixin:
                     # (don't auto-disconnect — the user explicitly wants
                     # to keep the existing seat state).
                     self.run_on_main_thread(
-                        lambda s=seat, g=gateway, w=watcher: self._show_seat_seized_dialog(
-                            s, gateway=g, watcher=w,
+                        lambda s=seat, g=gateway, w=watcher, sid=seat_device_id: self._show_seat_offline_dialog(
+                            s, gateway=g, device_id=sid, watcher=w,
                         )
                     )
                     return
@@ -2844,26 +2844,19 @@ class SeatMixin:
                     self.run_on_main_thread(lambda s=seat, w=watcher: self._show_seat_disconnected_dialog(s, watcher=w))
                     return
 
-            # Vysor-style fast siege: if device is offline OR missing
-            # (None in `adb devices` because someone else holds the
-            # adbd TCP socket — see seat-watcher-none-status-takeover
-            # memory), immediately ask user to take over. Show prompt
-            # on first detection (elapsed['secs'] >= 1 catches both 1s and 2s intervals).
-            #
-            # Skip this when seizure_mode=True — the watcher is being run
-            # immediately after a successful takeover, where the user
-            # already approved the seizure and the device will report
-            # `offline` (or be missing) for several seconds while adbd
-            # restarts and the phone re-handshakes. Re-prompting here
-            # stacks a second "do you want to take over?" modal on top of
-            # the one the user just answered.
+            # If device is offline OR missing on start, call the unified offline dialog
+            # Skip this when seizure_mode=True — user already approved takeover.
             if (
                 not seizure_mode
                 and seat_status in (None, 'offline')
-                and elapsed['secs'] >= 1
+                and elapsed['secs'] >= 2
                 and not first_device_seen['value']
             ):
-                self.run_on_main_thread(lambda: self._fast_seize_device(seat_device_id, gateway=gateway))
+                self.run_on_main_thread(
+                    lambda s=seat, g=gateway, w=watcher, sid=seat_device_id: self._show_seat_offline_dialog(
+                        s, gateway=g, device_id=sid, watcher=w,
+                    )
+                )
 
             # Mark that we've seen the device as 'device'
             if seat_status == 'device':
@@ -2896,175 +2889,198 @@ class SeatMixin:
         watcher.timeout.connect(tick)
         watcher.start()
 
-    def _show_seat_seized_dialog(self, seat, gateway=None, watcher=None):
-        """Show dialog when another user seizes a seat we were connected to.
+    def _show_seat_offline_dialog(self, seat, gateway=None, device_id=None, watcher=None,
+                                  on_success=None, on_decline=None):
+        """Unified dialog when a seat device goes offline or is held by another user.
 
-        If ``watcher`` is provided, the watcher is stopped on dialog close
-        (either outcome). When the user takes the seat back, ``takeover_seat``
-        starts a fresh watcher so the post-takeover state is monitored. When
-        the user declines, the seat is left untouched (no auto-disconnect).
+        Flow:
+        1. Show 'Seat Went Offline' dialog: asks if the user wants to reconnect.
+        2. If user confirms, first attempts a fast NORMAL reconnection.
+        3. If normal reconnection succeeds and device is online ('device'), connection
+           is restored cleanly without disrupting anyone.
+        4. If normal reconnection fails (still offline / held by another user), ask the
+           user if they want to Force Reconnect (which will seize the seat and sever other
+           sessions via takeover_seat).
         """
         from .safe_dialog import safe_question_multiline
 
-        # Prevent duplicate seizure dialogs for the same seat
-        if hasattr(self, '_seat_seized_dialog_open'):
-            self._seat_seized_dialog_open.add(seat)
-        else:
-            self._seat_seized_dialog_open = {seat}
-
-        # Prevent duplicate/modal stacking: if a generic offline-seat prompt is
-        # already open for this seat, let it take priority and skip the more
-        # specific seizure dialog. The user dismissing the offline prompt is
-        # enough to indicate they don't want to reconnect the seat just now.
-        if hasattr(self, '_seat_offline_prompt_pending') and seat in self._seat_offline_prompt_pending:
-            self._seat_seized_dialog_open.discard(seat)
-            self.log(
-                f"Skipping duplicate seizure dialog for {seat} — "
-                "generic offline-seat prompt already pending/active",
-                "DEBUG",
-            )
+        if not seat:
             return
 
-        # If gateway not provided, try to look it up from current connection state
+        # Initialize progress and dialog tracking sets
+        if not hasattr(self, '_seat_offline_in_progress'):
+            self._seat_offline_in_progress = set()
+        if not hasattr(self, '_seat_offline_dialog_open'):
+            self._seat_offline_dialog_open = set()
+        if not hasattr(self, '_seat_offline_prompt_pending'):
+            self._seat_offline_prompt_pending = set()
+        if not hasattr(self, '_seat_seized_dialog_open'):
+            self._seat_seized_dialog_open = set()
+
+        # If already in progress or dialog open, strictly skip to prevent duplicates
+        if (seat in self._seat_offline_in_progress
+                or seat in self._seat_offline_dialog_open
+                or seat in self._seat_offline_prompt_pending
+                or seat in self._seat_seized_dialog_open):
+            self.log(f"Skipping duplicate offline dialog for {seat} — already in progress", "DEBUG")
+            return
+
+        self._seat_offline_in_progress.add(seat)
+        self._seat_offline_dialog_open.add(seat)
+        self._seat_offline_prompt_pending.add(seat)
+        self._seat_seized_dialog_open.add(seat)
+
+        def _cleanup():
+            self._seat_offline_in_progress.discard(seat)
+            self._seat_offline_dialog_open.discard(seat)
+            self._seat_offline_prompt_pending.discard(seat)
+            self._seat_seized_dialog_open.discard(seat)
+
         if not gateway:
             gateway = self.seat_port_manager.connected_seats.get(seat)
 
-        # Auto-close check: if the seat device reappears, close the dialog
-        # We derive the expected device_id from the seat (localhost:<port>)
-        seat_device_id = None
-        try:
-            seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
-            for dev_info in seat_sh_devices:
-                if dev_info.get('seat') == seat:
-                    seat_device_id = dev_info.get('device')
-                    break
-        except Exception:
-            pass
+        # Resolve device_id if not provided
+        if not device_id:
+            try:
+                seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+                for dev_info in seat_sh_devices:
+                    if dev_info.get('seat') == seat:
+                        device_id = dev_info.get('device')
+                        break
+            except Exception:
+                pass
+        if not device_id:
+            port = self.seat_port_manager.get_seat_port(seat)
+            if port:
+                device_id = f"localhost:{port}"
 
         def auto_close_poll():
             try:
-                # If we have a known device_id, check that specific device
-                if seat_device_id:
-                    cached = getattr(self, 'cached_devices', None) or []
-                    for dev in cached:
-                        if dev.get('id') == seat_device_id and dev.get('status') == 'device':
-                            self.log(
-                                f"Seat {seat} (device {seat_device_id}) reconnected while "
-                                "seizure dialog was open — auto-closing dialog",
-                                "INFO",
-                            )
-                            return True
-                    return False
-                # Otherwise check by seat metadata
                 cached = getattr(self, 'cached_devices', None) or []
+                if device_id:
+                    for dev in cached:
+                        if dev.get('id') == device_id and dev.get('status') == 'device':
+                            return True
                 for dev in cached:
                     if dev.get('seat') == seat and dev.get('status') == 'device':
-                        self.log(
-                            f"Seat {seat} reconnected while seizure dialog was open — "
-                            "auto-closing dialog",
-                            "INFO",
-                        )
                         return True
                 return False
             except Exception:
                 return False
 
-        confirmed = safe_question_multiline(
-            self,
-            "Device Disconnected",
-            f"The device for seat '{seat}' has gone offline.\n"
-            "Do you want to retry connecting?",
-            yes_label="Retry",
-            no_label="Cancel",
-            auto_close_check=auto_close_poll,
-        )
-        # Clean up tracking set regardless of outcome
-        self._seat_seized_dialog_open.discard(seat)
-        if confirmed:
-            self.takeover_seat(seat, gateway=gateway, silent=False)
-            # takeover_seat starts a fresh watcher, so stop the old one
-            self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
-        else:
-            # User declined — leave the seat alone (don't auto-disconnect).
-            # The user may want to investigate the half-state or reconnect
-            # manually. Only stop the watcher so we don't keep re-prompting.
-            self.log(
-                f"User declined seizure for {seat} — leaving seat untouched",
-                "INFO",
+        try:
+            confirmed = safe_question_multiline(
+                self,
+                "Seat Went Offline",
+                f"The device for seat '{seat}' has gone offline.\n\n"
+                "Do you want to reconnect?",
+                yes_label="Reconnect",
+                no_label="Cancel",
+                auto_close_check=auto_close_poll,
             )
-            self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
-
-    def _on_manual_seizure_clicked(self, entry):
-        """Handle manual seizure button click - explicitly attempt to take over a seat"""
-        seat = entry.get('seat', '')
-        gateway = entry.get('gateway', '')
-
-        if not seat:
-            return
-
-        # Prevent showing duplicate takeover dialogs for the same seat
-        already_open = False
-        if hasattr(self, '_seat_seized_dialog_open') and seat in self._seat_seized_dialog_open:
-            already_open = True
-        elif hasattr(self, '_seat_offline_prompt_pending') and seat in self._seat_offline_prompt_pending:
-            already_open = True
-        elif hasattr(self, '_connecting_seats') and seat in self._connecting_seats:
-            already_open = True
-        elif hasattr(self, '_seat_was_seized') and seat in self._seat_was_seized:
-            already_open = True
-
-        if already_open:
-            self.log(f"Skipping duplicate seizure dialog for {seat} — dialog or action already in progress", "DEBUG")
-            return
-
-        # Confirm with user before attempting takeover
-        from .safe_dialog import safe_question_multiline
-        confirmed = safe_question_multiline(
-            self,
-            "Confirm Seat Takeover",
-            f"Manually take control of {seat} via {gateway}?\n"
-            "This will forcibly disconnect any other user currently using this device.\n"
-        )
+        except Exception as e:
+            self.log(f"Error showing offline dialog for {seat}: {e}", "DEBUG")
+            confirmed = False
 
         if not confirmed:
-            self.log(f"Manual seizure cancelled by user for seat {seat}", "DEBUG")
+            _cleanup()
+            self.log(f"User declined reconnect for seat {seat}", "INFO")
+            if watcher:
+                self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
+            if on_decline:
+                on_decline()
             return
 
-        self.log(f"Reconnecting to {seat}...", "INFO")
-        self.update_status(f"Reconnecting to {seat}...")
+        # User clicked Reconnect -> Step 1: Normal Reconnection (Fast)
+        self.update_status(f"Attempting normal reconnection to {seat}...")
+        self.log(f"Seat {seat} went offline — attempting normal reconnection...", "INFO")
 
-        # Find the current device for this seat
-        def find_and_seize():
-            seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
-            device_id = None
-            for dev_info in seat_sh_devices:
-                if dev_info.get('seat') == seat:
-                    device_id = dev_info.get('device')
-                    break
+        def do_reconnect_flow():
+            normal_success = False
 
-            if not device_id:
-                from .safe_dialog import safe_warning
-                self.run_on_main_thread(lambda: safe_warning(
-                    self, "No Device Found",
-                    f"Could not find device ID for seat {seat}.\n\n"
-                    "The seat may already be disconnected or the device info is not available."
-                ))
+            if device_id:
+                try:
+                    self.adb.run_command(f"-s {device_id} reconnect device", timeout=3)
+                    time.sleep(0.3)
+                    self.adb.run_command(f"disconnect {device_id}", timeout=3)
+                    time.sleep(0.2)
+                    self.adb.run_command(f"connect {device_id}", timeout=4)
+                    time.sleep(0.8)
+                    devices = self.adb.get_devices(silent=True)
+                    status = next((d.get('status') for d in devices if d.get('id') == device_id), None)
+                    if status == 'device':
+                        normal_success = True
+                except Exception as e:
+                    self.log(f"Fast local reconnect failed for {seat}: {e}", "DEBUG")
+
+            if normal_success:
+                _cleanup()
+                self.log(f"✓ Seat {seat} reconnected successfully via normal reconnection", "INFO")
+                self.update_status(f"Connected to {seat}")
+                self.seat_port_manager.mark_seat_connected(seat, gateway)
+                self.run_on_main_thread(self.refresh_devices)
+                self.run_on_main_thread(self.refresh_seat_port_lists)
+                if device_id:
+                    self.run_on_main_thread(lambda: self._try_auto_resume_mirror(device_id))
+                if on_success:
+                    self.run_on_main_thread(on_success)
                 return
 
-            # Mark that we're actively seizing so the watcher can update UI appropriately
-            getattr(self, '_seat_was_seized', {}).setdefault(seat, True)
+            # Step 2: Normal reconnection failed -> Ask user for Force Reconnection (seizure)
+            self.log(f"Normal reconnection failed for {seat} — asking user for force reconnection (seizure)", "INFO")
 
-            # Attempt takeover with full credentials (will prompt if needed)
-            self.takeover_seat(
-                seat,
-                gateway=gateway,
-                silent=False,  # Show warnings and dialogs
-                on_ready=lambda dev: self.run_on_main_thread(
-                    lambda: self.update_status(f"Successfully seized {seat}")
-                )
-            )
+            def prompt_force_reconnect():
+                try:
+                    force_confirmed = safe_question_multiline(
+                        self,
+                        "Force Reconnect",
+                        f"Normal reconnection to seat '{seat}' did not succeed (device is still offline).\n\n"
+                        "This may mean another user is actively using this device.\n\n"
+                        "Do you want to Force Reconnect? This will seize the seat and disconnect the other user.",
+                        yes_label="Force Reconnect",
+                        no_label="Cancel",
+                    )
+                    if force_confirmed:
+                        self.log(f"User confirmed force reconnection (seizure) for {seat}", "INFO")
+                        self.update_status(f"Force reconnecting to {seat} (seizing seat)...")
+                        if not hasattr(self, '_seat_was_seized'):
+                            self._seat_was_seized = {}
+                        self._seat_was_seized[seat] = True
+                        if watcher:
+                            self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
+                        self.takeover_seat(
+                            seat,
+                            gateway=gateway,
+                            silent=False,
+                            on_ready=lambda dev: self.run_on_main_thread(lambda: (
+                                self.update_status(f"Successfully seized and connected to {seat}"),
+                                on_success() if on_success else None
+                            ))
+                        )
+                    else:
+                        self.log(f"User declined force reconnection for {seat}", "INFO")
+                        if watcher:
+                            self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
+                        if on_decline:
+                            on_decline()
+                finally:
+                    _cleanup()
 
-        threading.Thread(target=find_and_seize, daemon=True).start()
+            self.run_on_main_thread(prompt_force_reconnect)
+
+        threading.Thread(target=do_reconnect_flow, daemon=True).start()
+
+    def _show_seat_seized_dialog(self, seat, gateway=None, watcher=None):
+        """Backward-compatible alias to unified _show_seat_offline_dialog."""
+        self._show_seat_offline_dialog(seat, gateway=gateway, watcher=watcher)
+
+    def _on_manual_seizure_clicked(self, entry):
+        """Handle manual seizure button click - invoke unified offline reconnect flow."""
+        seat = entry.get('seat', '')
+        gateway = entry.get('gateway', '')
+        if not seat:
+            return
+        self._show_seat_offline_dialog(seat, gateway=gateway)
 
     def _show_seat_disconnected_dialog(self, seat, watcher=None):
         """Show dialog when a seat disconnects unexpectedly.
@@ -5530,182 +5546,48 @@ class SeatMixin:
             self.log(f"Could not send seizure notification to {device_id}: {e}", "DEBUG")
 
     def _confirm_and_seize_during_connect(self, seat, gateway, port, device_id, needs_seizure):
-        """GUI-thread continuation of ``connect_seat``'s connect path.
-
-        Called after ``seat.sh auto-connect`` succeeded but BEFORE we install
-        the ADB key / start the watcher. If ``needs_seizure`` is True (an
-        active ADB device is already on ``localhost:<port>`` — held by
-        another user), prompt the user before kicking them off. If they
-        decline, tear down the half-state connection cleanly so they don't
-        end up with a "connected" seat panel but a working device held by
-        someone else.
-
-        On Yes, we go straight to the FULL takeover path
-        (``takeover_seat``) — SSH into the gateway, restart adbd on the
-        device, race the local adb client for the freshly-restarted TCP
-        socket. The fast path (``adb disconnect`` alone) doesn't free the
-        remote adbd's accepted socket when someone else is connected, so
-        it never actually wins the seat. The user already confirmed at
-        this prompt, so we pass ``silent=True`` to skip takeover_seat's
-        own warning dialog and we don't start the watcher here —
-        takeover_seat restarts it on a successful race.
-
-        If ``needs_seizure`` is False (the device was offline / missing
-        from `adb devices` when we checked), just proceed with the normal
-        post-connect flow.
-        """
-        if needs_seizure:
-            from .safe_dialog import safe_question_multiline
-            self.log(
-                f"Seat {seat} has an active ADB device ({device_id}) — asking "
-                "user whether to seize it",
-                "INFO",
-            )
-
-            def _auto_close_check():
-                try:
-                    cached = getattr(self, 'cached_devices', None) or []
-                    now_dev = next(
-                        (d for d in cached if d.get('id') == device_id),
-                        None,
-                    )
-                    if now_dev is None:
-                        return False
-                    return now_dev.get('status') == 'device'
-                except Exception:
-                    return False
-
-            confirmed = safe_question_multiline(
-                self,
-                "Device Connection Transfer",
-                f"The device {device_id} / seat {seat} was found in `adb devices` (status may be "
-                f"offline/missing — could be another user, or the device may be dead).\n\n"
-                "Attempt to take over this seat? This will disconnect any other user.\n",
-                auto_close_check=_auto_close_check,
-            )
-            if not confirmed:
-                # The user said No — but the device may have settled to
-                # 'device' status between the original check (in the worker
-                # thread, before this modal was queued) and now. The modal
-                # blocks the GUI thread for several seconds, plenty of
-                # time for the device-side handshake to finish on its own.
-                # Re-query `adb devices` before tearing down — if the seat
-                # port is now 'device', the user just answered a stale
-                # prompt defensively and the connection is actually fine.
-                # Only proceed with the tear-down if the device is still
-                # not fully online (offline / None / missing).
-                try:
-                    _devices_now = self.adb.get_devices(silent=True)
-                    _existing_now = next(
-                        (d for d in _devices_now if d.get('id') == device_id),
-                        None,
-                    )
-                    _now_status = (
-                        _existing_now.get('status') if _existing_now is not None
-                        else 'missing'
-                    )
-                except Exception as _check_err:
-                    _devices_now = None
-                    _now_status = 'unknown'
-                    self.log(
-                        f"Re-check of seat {seat} device status failed "
-                        f"after seizure decline: {_check_err}",
-                        "DEBUG",
-                    )
-
-                if _now_status == 'device':
-                    self.log(
-                        f"Seizure declined for seat {seat}, but device is now "
-                        f"online ({device_id} status='device') — proceeding "
-                        "with normal connect flow instead of tearing down",
-                        "INFO",
-                    )
-                    self.update_status(
-                        f"✅ Connected to {seat} (device online — prompt was stale)"
-                    )
-                    self._finish_seat_connect_after_seizure_decision(
-                        seat, gateway, port,
-                    )
-                    return
-
-                self.log(
-                    f"Seizure declined for seat {seat}; device status is "
-                    f"{_now_status!r} — leaving seat alone (no teardown)",
-                    "INFO",
-                )
-                # User explicitly declined to take over — leave the seat and
-                # any pre-existing adb device connection untouched. We still
-                # need to release the busy token and refresh panels so the
-                # connect button un-stalls and the UI reflects the (unchanged)
-                # state, but we do NOT call seat.sh disconnect, do NOT kill
-                # any SSH tunnel, and do NOT `adb disconnect` the device.
-                # Whatever was there before this connect_seat attempt stays
-                # exactly as it was.
-                #
-                # BUT: if the user opted into "Install ADB keys on seat",
-                # honour that intent. The install is a seat-side SSH file
-                # write that doesn't touch the host-side adb connection.
-                # We pass ``restart_adbd=False`` so we DO NOT kick the
-                # other user's session — the key gets written, and takes
-                # effect on the next adbd restart (which the other user
-                # triggers naturally when they disconnect / reconnect, or
-                # which happens on the next seat reboot). If the user
-                # wants to actually use the device right now, they should
-                # accept the seizure prompt instead of declining.
-                self._start_adb_key_install(
-                    seat, gateway, restart_adbd=False,
-                )
-                self.update_status(
-                    f"❌ Seizure declined — left seat {seat} as-is"
-                )
-                try:
-                    self._sync_refresh_panels()
-                except Exception:
-                    pass
-                try:
-                    self._finalize_seat_connect_busy()
-                except Exception:
-                    pass
-                return
-
-            self.log(f"Reconnecting to {seat}...", "INFO")
-            self.update_status(f"Reconnecting to {seat}...")
-            # Mark the seat as seized NOW (before kicking off takeover_seat) so
-            # the offline-refresh loop in _apply_device_refresh doesn't see the
-            # device report `offline` mid-takeover (which it will, for several
-            # seconds while adbd restarts + the phone re-handshakes), mistake
-            # it for a fresh offline event, and fire a SECOND _prompt_offline
-            # _seat_reconnect — which the user would answer Yes to, kicking
-            # off a second connect_seat that races the in-flight takeover.
-            # The watcher clears _seat_was_seized once it sees status='device'.
-            if not hasattr(self, '_seat_was_seized'):
-                self._seat_was_seized = {}
-            self._seat_was_seized[seat] = True
-            # Run the full takeover path immediately. silent=True skips the
-            # takeover-warning dialog (the user already confirmed at this
-            # prompt). takeover_seat restarts the watcher on a successful
-            # race; on a failed race it logs a clear "click ⚡ to retry"
-            # message and surfaces the seat panel — we don't fall back to
-            # the watcher here because we want the user to see the ⚡
-            # button without a half-state watcher polling in the
-            # background.
-            self.takeover_seat(
-                seat,
-                gateway=gateway,
-                silent=True,
-            )
-            # Release the connect button busy token — takeover_seat will
-            # restart the watcher itself on a successful race. If the race
-            # loses, the watcher stays stopped and the user can hit ⚡.
-            try:
-                self._finalize_seat_connect_busy()
-            except Exception:
-                pass
+        """GUI-thread continuation of ``connect_seat``'s connect path."""
+        if not needs_seizure:
+            self._finish_seat_connect_after_seizure_decision(seat, gateway, port)
             return
 
-        # No seizure needed — proceed with the normal post-connect flow
-        # (install ADB key, start watcher, refresh UI).
-        self._finish_seat_connect_after_seizure_decision(seat, gateway, port)
+        # If an offline reconnect flow is already active for this seat, do not stack another dialog
+        if seat in getattr(self, '_seat_offline_in_progress', set()):
+            self.log(f"Seat {seat} offline recovery already in progress — skipping connect-time dialog", "DEBUG")
+            return
+
+        # Quick local kick: see if adb reconnect brings it to 'device' without prompting
+        if device_id:
+            try:
+                self.adb.run_command(f"-s {device_id} reconnect device", timeout=2)
+                time.sleep(0.2)
+                self.adb.run_command(f"disconnect {device_id}", timeout=2)
+                time.sleep(0.2)
+                self.adb.run_command(f"connect {device_id}", timeout=3)
+                time.sleep(0.5)
+                devs = self.adb.get_devices(silent=True)
+                now_status = next((d.get('status') for d in devs if d.get('id') == device_id), None)
+                if now_status == 'device':
+                    self.log(f"Seat {seat} device came online after quick connect kick", "INFO")
+                    self._finish_seat_connect_after_seizure_decision(seat, gateway, port)
+                    return
+            except Exception:
+                pass
+
+        # Device is still offline / held by another user -> prompt for Force Reconnect directly
+        from .safe_dialog import safe_question_multiline
+        confirmed = safe_question_multiline(
+            self,
+            "Force Reconnect",
+            f"Seat '{seat}' ({device_id}) is offline or in use by another user.\n\n"
+            "Do you want to Force Reconnect? This will seize the seat and disconnect the other user.",
+            yes_label="Force Reconnect",
+            no_label="Cancel",
+        )
+        if confirmed:
+            self.takeover_seat(seat, gateway=gateway, silent=True)
+        else:
+            self._abort_seat_connect_after_seizure_decline(seat, gateway, port, device_id)
 
     def _abort_seat_connect_after_seizure_decline(self, seat, gateway, port, device_id):
         """Tear down the half-state seat connection when the user declines a seizure.
@@ -5808,118 +5690,26 @@ class SeatMixin:
             self.log(f"Failed to start seat device watcher for {seat}: {e}", "WARNING")
 
     def _fast_seize_device(self, device_id, gateway=None):
-        """Vysor-style fast seizure: force reconnect to an offline device.
-
-        When a device shows as 'offline' (connected but not authorized), this:
-        1. Asks user for confirmation
-        2. First tries fast local adb disconnect/reconnect (works if device is just stuck)
-        3. If that fails, esculates to full SSH takeover via takeover_seat() to
-           sever remote TCP sessions using setprop ctl.stop/start adbd
-
-        Args:
-            device_id: The ADB device ID to seize (e.g., 'localhost:50453')
-            gateway: The gateway to use for takeover
-        """
+        """Unified entry point for offline device handling, routing to _show_seat_offline_dialog."""
         if not device_id:
             return
-
-        # Prevent multiple concurrent seizure dialogs for the same device
-        if not hasattr(self, '_active_seizure_dialogs'):
-            self._active_seizure_dialogs = set()
-        if device_id in self._active_seizure_dialogs:
-            return
-        self._active_seizure_dialogs.add(device_id)
-
-        # Ask user for confirmation first - this needs to block until response
-        # because seizure is a disruptive action affecting other users
-        confirmed = {'result': None}
-
-        def ask_and_seize():
-            try:
-                from .safe_dialog import safe_question_multiline
-                def _auto_close_check():
-                    try:
-                        cached = getattr(self, 'cached_devices', None) or []
-                        now_dev = next(
-                            (d for d in cached if d.get('id') == device_id),
-                            None,
-                        )
-                        if now_dev is None:
-                            return False
-                        return now_dev.get('status') == 'device'
-                    except Exception:
-                        return False
-
-                response = safe_question_multiline(
-                    self,
-                    "Device Connection Transfer",
-                    f"The device {device_id} appears offline.\n"
-                    "This may mean it's being used by another user.\n\n"
-                    "Transfer control to this session?\n"
-                    "This will disconnect the other user immediately.",
-                    auto_close_check=_auto_close_check,
-                )
-
-                if not response:
-                    confirmed['result'] = False
-                    self.log(f"Seizure cancelled for {device_id}", "DEBUG")
-                    return
-
-                confirmed['result'] = True
-                self.log(f"Reconnecting to {device_id}...", "INFO")
-
-                # First try fast local reconnect
-                try:
-                    # `reconnect device` tells the device-side transport to drop its session
-                    self.adb.run_command(f"-s {device_id} reconnect device")
-                    time.sleep(0.3)
-                    self.adb.run_command(f"disconnect {device_id}")
-                    time.sleep(0.2)
-                    result = self.adb.run_command(f"connect {device_id}")
-                    if result.get('success', False):
-                        time.sleep(0.5)  # Give adbd moment to come online
-                        # Check if it's now 'device' not 'offline'
-                        devices = self.adb.get_devices(silent=True)
-                        dev_status = next((d.get('status') for d in devices if d.get('id') == device_id), None)
-                        if dev_status == 'device':
-                            self._notify_device_of_seizure(device_id)
-                            self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
-                            # Watcher is likely already running if this was called from tick()
-                            # and will detect 'device' on next tick, setting first_device_seen.
-                            return
-                except Exception as e:
-                    self.log(f"Fast seize failed for {device_id}: {e}", "DEBUG")
-
-                # Fast path didn't work - escalate to full SSH takeover
-                # This is the only way to sever a remote TCP session that we can't disconnect
-                self.log(f"Fast seize failed - escalating to full takeover for {device_id}", "DEBUG")
-                # Parse seat and port from device_id
-                if device_id and device_id.startswith('localhost:'):
-                    port = device_id.split(':', 1)[1]
-                    # Get seat for this port
-                    seat = None
-                    for dev in (self.seat_port_manager.get_devices_from_seat_sh() or []):
-                        if dev.get('port') == port:
-                            seat = dev.get('seat')
-                            break
-                    if seat:
-                        self.takeover_seat(seat, gateway=gateway, silent=False)
-                    else:
-                        self.log(f"Cannot takeover {device_id} - no seat found for port {port}", "WARNING")
-                        self.run_on_main_thread(lambda: self.refresh_devices(silent=False))
-                        return
-            finally:
-                self._active_seizure_dialogs.discard(device_id)
-
-        # Run in GUI thread to block until dialog closes
-        self.run_on_main_thread(ask_and_seize)
-
-        # Give the UI thread a moment to process the dialog
-        time.sleep(0.2)
-
-        # If user didn't confirm, abort
-        if confirmed['result'] is False:
-            return
+        seat = None
+        if device_id.startswith('localhost:'):
+            port = device_id.split(':', 1)[1]
+            for dev in (self.seat_port_manager.get_devices_from_seat_sh() or []):
+                if dev.get('port') == port:
+                    seat = dev.get('seat')
+                    break
+        if not seat:
+            cached = getattr(self, 'cached_devices', None) or []
+            for dev in cached:
+                if dev.get('id') == device_id and dev.get('seat'):
+                    seat = dev.get('seat')
+                    break
+        if seat:
+            self._show_seat_offline_dialog(seat, gateway=gateway, device_id=device_id)
+        else:
+            self.log(f"Cannot resolve seat for offline device {device_id}", "DEBUG")
 
     def _notify_device_of_seizure(self, device_id):
         """Send a notification to the device that its ADB connection was seized."""
