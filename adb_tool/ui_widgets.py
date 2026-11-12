@@ -35,10 +35,6 @@ class _SignalEmitter(QObject):
     call = pyqtSignal(object)
 
 
-# For backward compatibility - some code uses _UICaller
-_UICaller = _SignalEmitter
-
-
 # Bundled seat.sh / portforwardRack.sh
 from . import bundled_scripts
 
@@ -217,7 +213,11 @@ class DeviceFileTableWidget(QTableWidget):
 
 
 class _UICaller(QObject):
-    """Thread-safe UI callback helper."""
+    """Thread-safe UI callback helper.
+
+    Emits ``call`` from a worker thread; ``_safe_dispatch`` runs the payload
+    on the GUI thread via Qt's queued-connection signal mechanism.
+    """
 
     call = pyqtSignal(object)
 
@@ -226,6 +226,15 @@ class _UICaller(QObject):
         self.call.connect(self._safe_dispatch)
 
     def _safe_dispatch(self, fn):
+        if fn is None:
+            try:
+                import traceback
+                print("[_UICaller] dropped None callable; call site:",
+                      "".join(traceback.format_stack()[-4:-1]),
+                      file=sys.stderr)
+            except Exception:
+                pass
+            return
         try:
             fn()
         except RuntimeError:
