@@ -1265,12 +1265,11 @@ class _SeatJumpHost:
                 progress_callback("done", f"✓ Done copying {basename} to {seat_host}")
             return actual_seat_path
         finally:
-            def _async_cleanup(p=gw_staging):
+            if not success and getattr(self, '_password', None):
                 try:
-                    self.run_gateway_command(f"rm -f {shlex.quote(p)}", timeout=10)
+                    self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=5)
                 except Exception:
                     pass
-            threading.Thread(target=_async_cleanup, daemon=True).start()
 
     def copy_from_seat_via_gateway(self, remote_path, local_path, seat_host,
                                    mtc_password=None, timeout=600,
@@ -1385,12 +1384,11 @@ class _SeatJumpHost:
                 progress_callback("done", f"✓ Done downloading {basename}")
             return True
         finally:
-            def _async_cleanup(p=gw_staging):
+            if getattr(self, '_password', None):
                 try:
-                    self.run_gateway_command(f"rm -f {shlex.quote(p)}", timeout=10)
+                    self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=5)
                 except Exception:
                     pass
-            threading.Thread(target=_async_cleanup, daemon=True).start()
 
     def run_scp_via_bct(self, local_path, remote_path, seat_host, timeout=600,
                         progress_callback=None):

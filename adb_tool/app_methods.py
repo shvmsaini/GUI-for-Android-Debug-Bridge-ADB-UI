@@ -504,7 +504,7 @@ class AppMixin:
             except Exception:
                 pass
 
-        self.log("Scheduling cleanup of APK file on seat /data/local/tmp", "DEBUG")
+        self.log(f"Scheduling cleanup of APK file on seat: {actual_remote_path}", "DEBUG")
         self.run_on_main_thread(lambda: (
             QTimer.singleShot(2000, _cleanup) if not getattr(self, '_closing', False) else None
         ))

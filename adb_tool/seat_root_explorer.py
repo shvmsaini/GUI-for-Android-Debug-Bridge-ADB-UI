@@ -25,7 +25,7 @@ except ImportError:
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QFileDialog, QMessageBox, QTableWidgetItem, QInputDialog,
+    QLineEdit, QFileDialog, QTableWidgetItem, QInputDialog,
     QTextEdit, QComboBox, QDialogButtonBox, QCompleter, QSizePolicy,
     QProgressDialog
 )
@@ -37,6 +37,7 @@ from adb_tool.seat_methods import (
 )
 from adb_tool.credentials import CredentialManager
 from adb_tool.ui_widgets import DeviceFileTableWidget, _UICaller
+from adb_tool.safe_dialog import safe_info, safe_warning, safe_critical, safe_question
 
 try:
     from adb_tool.gateway_methods import _format_size
@@ -77,11 +78,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         _show_window(payload['shell'], payload['jump'])
 
     def _on_error(msg):
-        QMessageBox.warning(
-            parent, "Connection Failed",
-            f"Could not connect to {seat_hostname}:\n\n{msg}\n\n"
-            f"Tip: If this is a ProxyCommand (vrack) host, make sure you're on the VPN."
-        )
+        safe_warning(parent, "Connection Failed", f"Could not connect to {seat_hostname}: {msg}")
         parent.update_status("Connection failed")
 
     show_signal.call.connect(_on_show)
@@ -435,16 +432,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
 
             dest = current_path()
             if not current_dir_writable:
-                msg_box = QMessageBox(explorer)
-                msg_box.setIcon(QMessageBox.Icon.Warning)
-                msg_box.setWindowTitle("Directory Not Writable")
-                msg_box.setText(f"Current directory '{dest}' is not writable.")
-                msg_box.setInformativeText("Would you like to push files to '/data/local/tmp/' instead?")
-                msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
-                result = msg_box.exec()
-
-                if result == QMessageBox.StandardButton.Yes:
+                if safe_question(explorer, "Directory Not Writable", f"Current directory '{dest}' is not writable. Push to /data/local/tmp/ instead?"):
                     dest = "/data/local/tmp/"
                     parent.log(f"User chose alternate destination: {dest}", "INFO")
                 else:
@@ -537,50 +525,11 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     except Exception:
                         pass
                     if failed == len(files):
-                        summary = f"Failed to upload all files to {seat_hostname}:{dest}"
-                        box = QMessageBox(explorer)
-                        box.setIcon(QMessageBox.Icon.Warning)
-                        box.setWindowTitle("Upload Failed")
-                        box.setText(summary)
-                        if failed_items:
-                            if len(failed_items) <= 3:
-                                box.setInformativeText("Errors:\n" + "\n".join(failed_items))
-                            else:
-                                box.setInformativeText(
-                                    "Errors (first 3):\n"
-                                    + "\n".join(failed_items[:3])
-                                    + f"\n…and {len(failed_items) - 3} more"
-                                )
-                                box.setDetailedText("\n".join(failed_items))
-                        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-                        box.exec()
+                        safe_warning(explorer, "Upload Failed", f"Failed to upload all files to {seat_hostname}:{dest}")
                     elif failed > 0:
-                        summary = (
-                            f"Copied: {ok}\n"
-                            f"Failed: {failed}\n\n"
-                            f"Destination: {seat_hostname}:{dest}"
-                        )
-                        box = QMessageBox(explorer)
-                        box.setIcon(QMessageBox.Icon.Warning)
-                        box.setWindowTitle("Upload Complete with Errors")
-                        box.setText(summary)
-                        if failed_items:
-                            if len(failed_items) <= 3:
-                                box.setInformativeText(
-                                    "Errors:\n" + "\n".join(failed_items)
-                                )
-                            else:
-                                box.setInformativeText(
-                                    "Errors (first 3):\n"
-                                    + "\n".join(failed_items[:3])
-                                    + f"\n…and {len(failed_items) - 3} more"
-                                )
-                                box.setDetailedText("\n".join(failed_items))
-                        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-                        box.exec()
+                        safe_warning(explorer, "Upload Complete with Errors", f"Copied: {ok}, Failed: {failed} to {seat_hostname}:{dest}")
                     else:
-                        QMessageBox.information(explorer, "Upload Complete",
-                            f"Copied {ok} file(s) to:\n{seat_hostname}:{dest}")
+                        safe_info(explorer, "Upload Complete", f"Copied {ok} file(s) to {seat_hostname}:{dest}")
                     if ok:
                         refresh_listing()
 
@@ -589,10 +538,9 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
             threading.Thread(target=do_upload, daemon=True).start()
 
         def pull():
-            """Download selected files from the seat to a local directory via SCP."""
             sel = selected()
             if not sel:
-                QMessageBox.information(explorer, "Download", "Select files to download first.")
+                safe_info(explorer, "Download", "Select files to download first.")
                 return
             dest_dir = QFileDialog.getExistingDirectory(explorer, "Download to…")
             if not dest_dir:
@@ -724,12 +672,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         f"Pulled {ok} item(s)" + (f", {failed} failed" if failed else "")
                     )
                     if ok or failed:
-                        msg = f"Pulled: {ok}\nFailed: {failed}\n\nDestination:\n{dest_dir}"
-                        if failed_items:
-                            msg += "\n\nFailures:\n" + "\n".join(failed_items[:5])
-                            if len(failed_items) > 5:
-                                msg += f"\n…and {len(failed_items) - 5} more"
-                        QMessageBox.information(explorer, "Pull complete", msg)
+                        safe_info(explorer, "Pull Complete", f"Pulled {ok} item(s) to {dest_dir}" + (f" ({failed} failed)" if failed else ""))
                     if ok:
                         refresh_listing()
 
@@ -745,15 +688,10 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         def delete():
             sel = selected()
             if not sel:
-                QMessageBox.information(explorer, "Delete", "Select items to delete first.")
+                safe_info(explorer, "Delete", "Select items to delete first.")
                 return
             names = [r[2] for r in sel]
-            reply = QMessageBox.question(
-                explorer, "Confirm Delete",
-                f"Delete {len(names)} item(s) as root?\n" + "\n".join(names[:10])
-                + ("…" if len(names) > 10 else ""),
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+            if not safe_question(explorer, "Confirm Delete", f"Delete {len(names)} item(s) as root?"):
                 return
             parent.update_status("Deleting as root…")
             def do_delete():
@@ -785,7 +723,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         def rename():
             sel = selected()
             if len(sel) != 1:
-                QMessageBox.information(explorer, "Rename", "Select exactly one item.")
+                safe_info(explorer, "Rename", "Select exactly one item.")
                 return
             raw = sel[0][2]
             new_name, ok = QInputDialog.getText(explorer, "Rename", "New name:", text=raw)
@@ -858,11 +796,11 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
         def edit_file():
             sel = selected()
             if len(sel) != 1:
-                QMessageBox.information(explorer, "Edit", "Select exactly one file to edit.")
+                safe_info(explorer, "Edit", "Select exactly one file to edit.")
                 return
             raw = sel[0][2]
-            if sel[0][3]:  # is_dir
-                QMessageBox.information(explorer, "Edit", "Cannot edit a directory.")
+            if sel[0][3]:
+                safe_info(explorer, "Edit", "Cannot edit a directory.")
                 return
             remote_path = join_remote(current_path(), raw)
 
@@ -870,13 +808,11 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                 tmp_remote = f"/tmp/.seat-root-edit-{uuid.uuid4().hex}"
                 local_tmp = os.path.join(tempfile.gettempdir(), f"seat-edit-{uuid.uuid4().hex}")
                 try:
-                    # sudo cp to /tmp to ensure mtc can read it for scp
                     cp_cmd = f"cp {shlex.quote(remote_path)} {shlex.quote(tmp_remote)} && chmod 644 {shlex.quote(tmp_remote)}"
                     _, code_cp = shell.run(cp_cmd, timeout=30)
                     if code_cp != 0:
                         raise Exception(f"sudo cp to /tmp failed (code {code_cp})")
 
-                    # Pull: seat -> gateway -> local
                     jump.copy_from_seat_via_gateway(
                         remote_path=tmp_remote,
                         local_path=local_tmp,
@@ -891,7 +827,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     ui.call.emit(lambda: _show_editor(content))
                 except Exception as e:
                     err = str(e)
-                    ui.call.emit(lambda: QMessageBox.warning(explorer, "Edit", f"Failed to read: {err}"))
+                    ui.call.emit(lambda: safe_warning(explorer, "Edit", f"Failed to read: {err}"))
                 finally:
                     if os.path.exists(local_tmp):
                         try: os.unlink(local_tmp)
@@ -925,7 +861,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             with open(local_tmp, 'w', encoding='utf-8') as f:
                                 f.write(new_content)
 
-                            # Push: local -> gateway -> seat
                             jump.copy_to_seat_via_gateway(
                                 local_path=local_tmp,
                                 remote_path=tmp_remote,
@@ -934,7 +869,6 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                                 timeout=60,
                             )
 
-                            # sudo mv to target
                             move_cmd = f"mv {shlex.quote(tmp_remote)} {shlex.quote(remote_path)} && chmod 644 {shlex.quote(remote_path)}"
                             _, code_mv = shell.run(move_cmd, timeout=30)
                             if code_mv != 0:
@@ -944,7 +878,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             ui.call.emit(editor.accept)
                         except Exception as e:
                             err = str(e)
-                            ui.call.emit(lambda: QMessageBox.warning(editor, "Save Failed", err))
+                            ui.call.emit(lambda: safe_warning(editor, "Save Failed", err))
                         finally:
                             if os.path.exists(local_tmp):
                                 try: os.unlink(local_tmp)
@@ -1031,11 +965,6 @@ def _find_seat_gateway_for_device(parent, device_id):
         return None, None
 
     devices = getattr(parent, '_cached_seat_sh_devices', None) or []
-    if not devices:
-        try:
-            devices = spm.get_devices_from_seat_sh() or []
-        except Exception:
-            devices = []
     for d in devices:
         if d.get('device') == device_id and d.get('seat') and d.get('gateway'):
             return d.get('seat').strip(), d.get('gateway').strip()
@@ -1166,36 +1095,34 @@ def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
     layout.setSpacing(10)
     layout.setContentsMargins(12, 12, 12, 12)
 
-    hint = QLabel(
-        "Select or type a seat and its gateway. Format: 172.17.132.2 user@gateway"
-    )
-    hint.setWordWrap(True)
+    hint = QLabel("Select or type a seat and its gateway. Format: 172.17.132.2 user@gateway", dialog)
+    hint.setWordWrap(False)
     hint.setStyleSheet("color: gray; font-size: 9pt;")
     layout.addWidget(hint)
 
-    combo = QComboBox()
+    combo = QComboBox(dialog)
     combo.setEditable(True)
     combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-    combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding,
-                                     QSizePolicy.Policy.Fixed))
+    combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
     combo.addItems(labels)
+
+    completer = QCompleter(labels, combo)
+    completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    combo.setCompleter(completer)
+    combo._completer = completer
 
     if default_label and default_label in labels:
         idx = labels.index(default_label)
         combo.setCurrentIndex(idx)
-        combo.setEditText(default_label)
     elif default_label:
         combo.setEditText(default_label)
-
-    completer = QCompleter(labels)
-    completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-    combo.setCompleter(completer)
 
     layout.addWidget(combo)
     layout.addStretch()
 
     button_box = QDialogButtonBox(
-        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+        dialog
     )
     button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Connect")
     button_box.accepted.connect(dialog.accept)
@@ -1203,7 +1130,8 @@ def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
     layout.addWidget(button_box)
 
     combo.setFocus()
-    combo.lineEdit().setPlaceholderText("e.g., 172.17.132.2 user@gateway")
+    if combo.lineEdit():
+        combo.lineEdit().setPlaceholderText("e.g., 172.17.132.2 user@gateway")
 
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None, None
@@ -1212,7 +1140,6 @@ def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
     if not text:
         return None, None
 
-    # Parse the entered string or selected label format: "seat gateway"
     seat = None
     gateway = None
     parts = text.split() if text else None
@@ -1220,9 +1147,7 @@ def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
         seat = parts[0].strip()
         gateway = parts[1].strip()
     else:
-        # probable manual entry without arrow; scan labels to see if any matches
-        # at least toss an error
-        QMessageBox.warning(parent, "Input Error", "Please enter: seat gateway")
+        safe_warning(parent, "Input Error", "Please enter: seat gateway")
         return None, None
 
     if not seat or not gateway:
