@@ -349,6 +349,10 @@ class AppMixin:
             "Installed successfully" + an auto-launch prompt.
         """
         device_id = self.current_device
+        # IMPORTANT: Resolve device flag now to avoid race if user switches
+        # focus to another device during the install. The entire install (copy
+        # through pm install) must target the same device.
+        device_flag = self.get_device_flag()
 
         # Get seat info
         seat_name = ""
@@ -393,13 +397,13 @@ class AppMixin:
                 "WARNING",
             )
             self.update_status("Gateway: Password missing — falling back to adb push")
-            cmd = f"{self.get_device_flag()} push {shlex.quote(apk_path)} /data/local/tmp/{apk_name}"
+            cmd = f"{device_flag} push {shlex.quote(apk_path)} /data/local/tmp/{apk_name}"
             result = self.adb.run_command(cmd, timeout=120)
             if not result['success']:
                 self.log("Push failed", "ERROR")
                 self.update_status("Gateway: Push failed")
                 return False
-            cmd = f"{self.get_device_flag()} shell pm install -r -d -t /data/local/tmp/{apk_name}"
+            cmd = f"{device_flag} shell pm install -r -d -t /data/local/tmp/{apk_name}"
             result = self.adb.run_command(cmd, timeout=180)
             if not result['success']:
                 self.log("Install failed", "ERROR")
@@ -408,7 +412,7 @@ class AppMixin:
             self.update_status("✅ Installed (fallback)")
             try:
                 self.adb.run_command(
-                    f"{self.get_device_flag()} shell rm -f /data/local/tmp/{shlex.quote(apk_name)}",
+                    f"{device_flag} shell rm -f /data/local/tmp/{shlex.quote(apk_name)}",
                     timeout=30,
                 )
             except Exception:
@@ -440,7 +444,7 @@ class AppMixin:
 
             try:
                 self.adb.run_command(
-                    f"{self.get_device_flag()} shell chmod 644 {shlex.quote(actual_remote_path)}",
+                    f"{device_flag} shell chmod 644 {shlex.quote(actual_remote_path)}",
                     timeout=15,
                 )
             except Exception:
@@ -483,7 +487,7 @@ class AppMixin:
 
         self.update_status(f"Gateway: Installing {apk_name}...")
         self.log("Running pm install...", "INFO")
-        cmd = f"{self.get_device_flag()} shell pm install -r -d -t {shlex.quote(actual_remote_path)}"
+        cmd = f"{device_flag} shell pm install -r -d -t {shlex.quote(actual_remote_path)}"
         result = self.adb.run_command(cmd, timeout=180)
         if not result['success']:
             stderr = (result.get('stderr') or '').strip() or (result.get('stdout') or '').strip()
@@ -491,7 +495,7 @@ class AppMixin:
             self.update_status(f"Gateway: pm install failed - {stderr[:80]}")
             try:
                 self.adb.run_command(
-                    f"{self.get_device_flag()} shell rm -f {shlex.quote(actual_remote_path)}",
+                    f"{device_flag} shell rm -f {shlex.quote(actual_remote_path)}",
                     timeout=30,
                 )
             except Exception:
@@ -500,7 +504,7 @@ class AppMixin:
 
         def _cleanup():
             try:
-                self.adb.run_command(f"{self.get_device_flag()} shell rm -f {shlex.quote(actual_remote_path)}", timeout=30)
+                self.adb.run_command(f"{device_flag} shell rm -f {shlex.quote(actual_remote_path)}", timeout=30)
             except Exception:
                 pass
 
