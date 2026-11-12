@@ -254,10 +254,9 @@ class VideoDisplayWidget(QWidget):
 
         # Check if we're in disconnected state
         if hasattr(self, '_disconnected') and self._disconnected:
-            # High-contrast dark background with a saturated red accent so
-            # the message is legible even on small mirror windows.
-            painter.fillRect(rect, QColor("#1a0f0f"))
-            painter.setPen(QColor("#ff5c5c"))
+            # Neutral dark background with clean, legible text (not harsh red)
+            painter.fillRect(rect, QColor("#1e1e1e"))
+            painter.setPen(QColor("#e0e0e0"))
             main_font = painter.font()
             main_font.setPointSize(max(14, min(20, rect.width() // 18)))
             main_font.setBold(True)
@@ -275,7 +274,7 @@ class VideoDisplayWidget(QWidget):
                 sub_font.setBold(False)
                 sub_font.setPointSize(max(10, main_font.pointSize() - 4))
                 painter.setFont(sub_font)
-                painter.setPen(QColor("#d0d0d0"))
+                painter.setPen(QColor("#a0a0a0"))
                 sub_rect = rect.adjusted(0, rect.height() // 3, 0, 0)
                 painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, sub)
             return
@@ -1568,19 +1567,29 @@ class ScrcpyMirrorWindow(QMainWindow):
                     self.signal.frame_ready.emit(frame)
                     return True
 
-                # Set a frame timeout to detect socket disconnections early.
-                # Use longer timeout for seat/remote connections (localhost:port)
-                # vs shorter timeout for local USB devices.
-                # If no frame arrives within this time, the socket has likely stalled.
-                if self.device_id.startswith('localhost:'):
-                    # Seat/remote connection: longer timeout for network latency
-                    frame_timeout = 60.0
-                else:
-                    # Local USB device: shorter timeout, should be fast
-                    frame_timeout = 30.0
-
-                self._log("DEBUG", f"listen() starting — frame_timeout={frame_timeout}s")
-                self._client.listen(on_frame, timeout=frame_timeout)
+                # Scrcpy only sends frames when the screen changes (event-driven).
+                # A static screen produces no frames, which is completely normal.
+                # Use timeout=None so static screens do not trigger false timeouts
+                # or restart cycles. Genuine socket disconnections are detected
+                # by the decode reader thread setting client.reader_error and
+                # by the watchdog.
+                self._log("DEBUG", f"listen() starting for {self.device_id}")
+                while not self._closing and (self._client is not None and not self._client.stop_event.is_set()):
+                    try:
+                        self._client.listen(on_frame, timeout=None)
+                        break
+                    except Exception as e:
+                        if self._closing:
+                            return
+                        msg = str(e)
+                        exc_type = type(e).__name__
+                        is_timeout = (exc_type == "ScrcpyTimeoutError" or "timeout" in msg.lower())
+                        if is_timeout:
+                            # Frame timeout on static screen — continue waiting without teardown
+                            if self._client is not None and not getattr(self._client, 'reader_error', None):
+                                self._log("DEBUG", f"Frame wait timeout for {self.device_id} (static screen) — resuming listener")
+                                continue
+                        raise
                 self._log("DEBUG", f"listen() returned normally (stream ended cleanly) for {self.device_id}")
 
             except Exception as e:
@@ -1596,15 +1605,13 @@ class ScrcpyMirrorWindow(QMainWindow):
 
                 # Frame timeouts are a *handled* condition, not an error:
                 # scrcpy only emits a frame when the picture changes, so
-                # a static screen is normal.  We log it at DEBUG and let
-                # the handler below restart the listener silently.  Only
-                # unknown errors go to the GUI log panel at ERROR.
+                # a static screen is normal.
                 if is_timeout:
                     self._log(
                         "DEBUG",
-                        f"Frame timeout for {self.device_id}: "
-                        f"{exc_type}: {msg} (screen may be static — restarting listener)",
+                        f"Frame timeout for {self.device_id} (screen static) — ignoring without retry",
                     )
+                    return
                 else:
                     self._log(
                         "ERROR",
@@ -1619,16 +1626,9 @@ class ScrcpyMirrorWindow(QMainWindow):
                     self._log("DEBUG", "Socket closed during shutdown — ignoring")
                     return
 
-                # Frame timeout — the SDK's per-frame wait expired
-                # without a new frame arriving.  This happens when the
-                # device screen is static (scrcpy only sends frames when
-                # the picture changes), which is *normal* — not an
-                # error.  Don't tear down a working connection; just
-                # restart the listener loop so it can wait again.  If
-                # the socket is genuinely dead the decode thread will
-                # set reader_error, which we pick up on the next tick.
+                # Frame timeout on a static screen was already handled above; if it
+                # bubbles here, simply ignore without tearing down the working connection.
                 if is_timeout:
-                    self.signal.auto_retry.emit("timeout")
                     return
 
                 # Device disconnected — silently restart the client.
@@ -1860,29 +1860,27 @@ class ScrcpyMirrorWindow(QMainWindow):
             f"_on_auto_retry ({reason}): restart {when} (attempt {self._retry_count})",
         )
 
-        # Visual feedback in the mirror window itself: while we wait
-        # between retries, replace the frozen frame with a "Reconnecting…"
-        # overlay so the user can see the window is still alive and
-        # working. update_frame() will clear this overlay automatically
-        # the moment a real frame arrives (line ~202: self._disconnected
-        # = False). The status bar is left alone — it's the wrong place
-        # for this info since it scrolls off and isn't visible on small
-        # mirror windows.
-        #
-        # Keep the overlay minimal — no attempt counter, no reason
-        # string. The user doesn't need to know how many retries we've
-        # burned through; the mirror either resumes or the window stays
-        # in this overlay state. Verbose retry info is logged at DEBUG
-        # only.
-        if hasattr(self, 'video') and self.video is not None:
+        # Show status in status bar
+        try:
+            self.status.showMessage(f"Reconnecting… ({when})" if delay > 0 else "Reconnecting…")
+        except Exception:
+            pass
+
+        # Only replace the video frame with a disconnected overlay if we have
+        # no frame at all yet, or if we have failed many retries (> 5).
+        # Keeping the last frame visible during transient retries prevents the
+        # jarring red/disconnected screen flash.
+        has_frame = (
+            hasattr(self, 'video') and self.video is not None and
+            (getattr(self.video, '_pixmap', None) is not None or getattr(self.video, '_last_frame_buf', None) is not None)
+        )
+        if hasattr(self, 'video') and self.video is not None and (not has_frame or self._retry_count > 5):
             try:
                 self.video.set_disconnected(
                     title="Reconnecting…",
                     subtitle=None,
                 )
             except RuntimeError:
-                # Widget already torn down — keep going, the restart is
-                # what matters.
                 pass
 
         def _restart():

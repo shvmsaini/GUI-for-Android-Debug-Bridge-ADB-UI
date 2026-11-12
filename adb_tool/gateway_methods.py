@@ -31,6 +31,8 @@ from .adb_manager import ADBManager
 from .ui_widgets import _UICaller, _SignalEmitter, DeviceFileTableWidget
 from .seat_manager import SeatPortManager
 from .credentials import CredentialManager
+from .seat_methods import _SeatJumpHost, _seat_root_shell_via_mtc
+from .safe_dialog import safe_info, safe_warning, safe_critical, safe_question
 from . import bundled_scripts
 
 
@@ -637,7 +639,7 @@ class GatewayMixin:
             self.log(f"Gateway Manager: SSH+ SFTP ready, opening explorer for {user}@{host}…", "INFO")
             # Hand the connection over to the explorer on the GUI thread.
             # Keep args on self so the closure can't be GC'd before the timer fires.
-            self._pending_gateway_explorer_args = (host, user, client, sftp_or_err)
+            self._pending_gateway_explorer_args = (host, user, client, sftp_or_err, password)
             self.log(f"Gateway Manager: posting _show_gateway_explorer to GUI thread", "DEBUG")
             # Marshal to GUI thread — PyQt6 silently drops
             # QTimer.singleShot() from worker threads. Use a bound method
@@ -654,11 +656,17 @@ class GatewayMixin:
             self.log("Gateway Manager: pending args missing, aborting", "ERROR")
             return
         self._pending_gateway_explorer_args = None
-        host, user, client, sftp = args
-        self._show_gateway_explorer(host, user, client, sftp)
+        if len(args) == 5:
+            host, user, client, sftp, password = args
+        else:
+            host, user, client, sftp = args
+            password = None
+        self._show_gateway_explorer(host, user, client, sftp, gateway_password=password)
 
-    def _show_gateway_explorer(self, host, user, ssh_client, sftp):
+    def _show_gateway_explorer(self, host, user, ssh_client, sftp, gateway_password=None):
         """Open the SFTP file explorer dialog (must be called on the GUI thread)."""
+        if not gateway_password:
+            gateway_password = self.credential_manager.get_gateway_password_with_fallback(host, user)
         self.update_status(f"Connected to {host}")
         ui = _UICaller(self)
 
@@ -1282,102 +1290,113 @@ class GatewayMixin:
             else:
                 sftp.remove(path)
 
-        def _sftp_download_to_seat(remote_path, local_temp_dir, progress_callback=None):
-            """Download the identified file from the gateway and send it to the connected seat device.
-
-            Args:
-                remote_path: Path on gateway to download
-                local_temp_dir: Temporary directory to store the file
-                progress_callback: Optional func(transferred, total_bytes) for SFTP phase.
-                                   Will also be called with (total, total) to signal adb push phase.
-            """
-            # First pull via SFTP to a local temp dir
-            ensure_dir(local_temp_dir)
-            local_file = os.path.join(local_temp_dir, os.path.basename(remote_path))
-            # Get file size for progress reporting
-            file_size = _sftp_size(sftp, remote_path, is_dir=False)
-            sftp.get(remote_path, local_file, callback=progress_callback)
-            # Signal transition to adb push phase
-            if progress_callback:
-                progress_callback(file_size, file_size)
-            # Then push to seat using ADB (use currently selected device)
-            try:
-                device_id = getattr(self, 'current_device', None)
-                if not device_id:
-                    # Fallback: pick the first device returned by `adb devices`
-                    devs = self.adb.get_devices(silent=True) or []
-                    device_id = devs[0] if devs else None
-                if not device_id:
-                    return False, "No connected device"
-                cmd = f"-s {device_id} push {shlex.quote(local_file)} {shlex.quote('/sdcard/')}"
-                result = self.adb.run_command(cmd, timeout=300)
-                return result['success'], result['stderr']
-            finally:
-                try:
-                    os.remove(local_file)
-                except Exception:
-                    pass
-
         def copy_to_seat_clicked():
             items = selected_rows()
             if not items:
-                QMessageBox.warning(self, "No Selection", "Select one file to copy to the seat.")
+                safe_warning(explorer, "No Selection", "Select file(s) to copy to the seat.")
                 return
-            if len(items) > 1:
-                QMessageBox.warning(self, "Multiple Selection", "Select only one file at a time.")
-                return
-            row, display, raw_name, is_dir = items[0]
-            if is_dir:
-                QMessageBox.warning(self, "File Required", "Copying folders is not supported. Select a single file.")
-                return
-            remote_path = join_remote(current_path(), raw_name)
-            if not remote_path.startswith('/'):
-                remote_path = '/' + remote_path
+            files_to_copy = []
+            for row, display, raw_name, is_dir in items:
+                if is_dir:
+                    continue
+                remote_path = join_remote(current_path(), raw_name)
+                if not remote_path.startswith('/'):
+                    remote_path = '/' + remote_path
+                files_to_copy.append((raw_name, remote_path))
 
-            # Try to find the seat's actual IP/hostname (not localhost:port).
-            # The gateway runs SCP and needs to reach the seat over the LAN,
-            # so localhost:port won't work — we need the real seat address.
-            seat_host = None
+            if not files_to_copy:
+                safe_warning(explorer, "No Files Selected", "Please select at least one file to copy (directories cannot be copied).")
+                return
+
+            # Find candidate seats for this gateway (user@host or host)
+            candidate_seats = []
+            seen_seats = set()
             current_device = getattr(self, 'current_device', None)
-
+            default_seat = None
+            spm = getattr(self, 'seat_port_manager', None)
+            seat_sh_devices = getattr(self, '_cached_seat_sh_devices', None) or []
             if current_device and current_device.startswith('localhost:'):
                 port = current_device.split(':', 1)[1]
-                # Look up connected seat by port to find the actual seat name/IP
-                spm = getattr(self, 'seat_port_manager', None)
-                if spm:
-                    # Check seat.sh devices cache for matching port
-                    seat_sh_devices = getattr(self, '_cached_seat_sh_devices', None) or []
-                    for dev in seat_sh_devices:
-                        if dev.get('device', '').endswith(':' + port) and dev.get('gateway', '') == f"{user}@{host}":
-                            seat_host = dev.get('seat', '').strip()
-                            if seat_host:
-                                break
-                    # Fallback: scan connected_seats for the seat on this gateway
-                    if not seat_host:
-                        for seat, gw in (spm.connected_seats or {}).items():
-                            if gw == f"{user}@{host}":
-                                seat_host = seat
-                                break
+                for dev in seat_sh_devices:
+                    if dev.get('device', '').endswith(':' + port) and dev.get('gateway', '') == f"{user}@{host}":
+                        default_seat = dev.get('seat', '').strip()
+                        break
 
-            # If no current seat device, ask user
+            for dev in seat_sh_devices:
+                gw = dev.get('gateway', '').strip()
+                s = dev.get('seat', '').strip()
+                if s and (gw == f"{user}@{host}" or gw == host or (host in gw)):
+                    if s not in seen_seats:
+                        seen_seats.add(s)
+                        candidate_seats.append(s)
+
+            if spm:
+                for s, gw in (spm.connected_seats or {}).items():
+                    if s and (gw == f"{user}@{host}" or gw == host or (host in gw)):
+                        if s not in seen_seats:
+                            seen_seats.add(s)
+                            candidate_seats.append(s)
+                try:
+                    history = spm.get_top_entries('seat', 1000) or []
+                    for entry in history:
+                        s = entry.get('seat', '').strip()
+                        gw = entry.get('gateway', '').strip()
+                        if s and (gw == f"{user}@{host}" or gw == host or (host in gw)):
+                            if s not in seen_seats:
+                                seen_seats.add(s)
+                                candidate_seats.append(s)
+                except Exception:
+                    pass
+
+            if not default_seat and candidate_seats:
+                default_seat = candidate_seats[0]
+
+            dlg = QDialog(explorer)
+            dlg.setWindowTitle("Copy to Seat")
+            dlg.setMinimumWidth(400)
+            dlg_layout = QVBoxLayout(dlg)
+            dlg_layout.setSpacing(10)
+
+            dlg_layout.addWidget(QLabel("Seat (IP or hostname):"))
+            seat_combo = QComboBox(dlg)
+            seat_combo.setEditable(True)
+            seat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            seat_combo.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed))
+            seat_combo.addItems(candidate_seats)
+            if default_seat and default_seat in candidate_seats:
+                seat_combo.setCurrentIndex(candidate_seats.index(default_seat))
+            elif default_seat:
+                seat_combo.setEditText(default_seat)
+            elif candidate_seats:
+                seat_combo.setCurrentIndex(0)
+            if seat_combo.lineEdit():
+                seat_combo.lineEdit().setPlaceholderText("e.g., 172.17.144.5 or seat01")
+            dlg_layout.addWidget(seat_combo)
+
+            dlg_layout.addWidget(QLabel("Destination folder on seat:"))
+            dest_edit = QLineEdit(dlg)
+            dest_edit.setText("/data/local/tmp/")
+            dlg_layout.addWidget(dest_edit)
+
+            button_box = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+                dlg
+            )
+            button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Copy")
+            button_box.accepted.connect(dlg.accept)
+            button_box.rejected.connect(dlg.reject)
+            dlg_layout.addWidget(button_box)
+
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            seat_host = seat_combo.currentText().strip()
             if not seat_host:
-                seat_host, ok = QInputDialog.getText(
-                    explorer, "Copy to Seat",
-                    "Enter seat IP or hostname:\n(e.g., 172.17.144.5 or seat01)"
-                )
-                if not ok or not seat_host:
-                    return
+                return
+            dest_folder = dest_edit.text().strip() or "/data/local/tmp/"
+            if not dest_folder.endswith('/'):
+                dest_folder += '/'
 
-            # Determine destination path on the seat.
-            # mtc user's SSH shell is sandboxed: it can't write to
-            # /sdcard or /storage/emulated/0 (both require SAF permissions
-            # or privileged shell). The only reliable destination is
-            # /data/local/tmp/, which is owned by the system/shell group
-            # and writable by the mtc account.
-            dest_path = f"/data/local/tmp/{raw_name}"
-
-            # Get the mtc password — needed for SCP from gateway to seat.
-            # The mtc password is cached globally (same across all seats).
             creds = CredentialManager()
             mtc_password = creds.get_mtc_password_with_fallback()
             if not mtc_password:
@@ -1385,14 +1404,24 @@ class GatewayMixin:
                 if not mtc_password:
                     return
 
-            self.log(f"Gateway: copying {raw_name} to seat {seat_host}:{dest_path} via SCP on gateway", "INFO")
-            self.update_status(f"Copying to {seat_host}:{dest_path}…")
+            root_password = creds.get_global_root_password()
+            if not root_password:
+                root_password = mtc_password
+
+            gw_password = gateway_password or creds.get_gateway_password_with_fallback(host, user)
+            if not gw_password:
+                gw_password = creds.prompt_password(explorer, host, user)
+                if not gw_password:
+                    return
+
+            self.log(f"Gateway: copying {len(files_to_copy)} file(s) to seat {seat_host}:{dest_folder}", "INFO")
+            self.update_status(f"Copying to {seat_host}:{dest_folder}…")
 
             progress = QProgressDialog(
-                f"Copying to {seat_host}:{dest_path}…",
+                f"Copying to {seat_host}:{dest_folder}…",
                 None, 0, 100, explorer,
             )
-            progress.setWindowTitle(f"Copy to Seat — {dest_path}")
+            progress.setWindowTitle("Copy to Seat")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(500)
             progress.setValue(0)
@@ -1405,92 +1434,105 @@ class GatewayMixin:
                 ))
 
             def do_copy():
-                # Set up SSH_ASKPASS on the gateway so scp can authenticate
-                # to mtc@seat non-interactively. We write a small script to
-                # /tmp on the gateway that echoes the mtc password, then run
-                # scp with SSH_ASKPASS pointing at it.
-                askpass_path = f"/tmp/.adb-gui-askpass-{uuid.uuid4().hex}.sh"
-                askpass_script = (
-                    "#!/bin/sh\n"
-                    "case \"$1\" in\n"
-                    f"  *\"password:\"*|*\"Password:\"*) echo {shlex.quote(mtc_password)} ;;\n"
-                    "  *) echo \"yes\" ;;\n"
-                    "esac\n"
-                )
-
-                exit_code = -1
-                last_err = ""
+                ok = 0
+                failed = 0
+                failed_items = []
+                total = len(files_to_copy)
+                jump = None
+                shell = None
                 try:
-                    # Write askpass script to gateway
-                    stdin, stdout, stderr = ssh_client.exec_command(
-                        f"cat > {askpass_path} && chmod 700 {askpass_path}",
-                        timeout=10,
-                    )
-                    stdin.write(askpass_script)
-                    stdin.channel.shutdown_write()
-
-                    # Build the SCP command with SSH_ASKPASS env vars
-                    # SSH_ASKPASS_REQUIRE=force ensures ssh uses the askpass
-                    # helper even without a tty.
-                    scp_cmd = (
-                        f"SSH_ASKPASS={shlex.quote(askpass_path)} "
-                        f"SSH_ASKPASS_REQUIRE=force "
-                        f"DISPLAY=:0 "
-                        f"scp "
-                        f"-o StrictHostKeyChecking=no "
-                        f"-o UserKnownHostsFile=/dev/null "
-                        f"-o ConnectTimeout=15 "
-                        f"{shlex.quote(remote_path)} "
-                        f"mtc@{seat_host}:{shlex.quote(dest_path)}"
-                    )
-
-                    stdin, stdout, stderr = ssh_client.exec_command(scp_cmd, timeout=300)
-                    exit_code = stdout.channel.recv_exit_status()
-                    out = stdout.read().decode('utf-8', 'replace')
-                    err = stderr.read().decode('utf-8', 'replace')
-                except Exception as e:
-                    self.log(f"Failed to execute SCP on gateway: {e}", "ERROR")
-                    exit_code = -1
-                    last_err = str(e)
-                finally:
-                    # Clean up askpass script on gateway
+                    jump = _SeatJumpHost(f"{user}@{host}", gw_password, self.log)
                     try:
-                        ssh_client.exec_command(f"rm -f {askpass_path}", timeout=5)
-                    except Exception:
-                        pass
+                        shell = _seat_root_shell_via_mtc(
+                            jump, seat_host, mtc_password, self.log,
+                            root_password=root_password,
+                        )
+                    except Exception as e:
+                        self.log(f"Seat Root: root shell not opened ({e}), proceeding with mtc permissions", "DEBUG")
 
-                def done(success, message):
+                    for i, (basename, gw_path) in enumerate(files_to_copy):
+                        target_path = f"{dest_folder}{basename}"
+                        self.log(f"Processing {basename}…", "INFO")
+
+                        def _on_stage(stage, msg):
+                            if stage in ("doing_bct", "doing_scp"):
+                                _set_progress(int(100 * (i + 0.5) / total), msg)
+                                self.update_status(msg)
+                            elif stage == "done":
+                                _set_progress(int(100 * (i + 1) / total), f"✓ {basename}")
+                                self.update_status(f"✓ {basename}")
+
+                        try:
+                            jump.copy_gateway_file_to_seat(
+                                gateway_path=gw_path,
+                                remote_path=target_path,
+                                seat_host=seat_host,
+                                mtc_password=mtc_password,
+                                timeout=300,
+                                progress_callback=_on_stage,
+                                root_shell=shell,
+                            )
+                            ok += 1
+                            self.log(f"✓ {seat_host}:{target_path}", "INFO")
+                        except Exception as e:
+                            staged_tmp = f"/data/local/tmp/{basename}"
+                            recovered = False
+                            if dest_folder != "/data/local/tmp/" and shell:
+                                try:
+                                    self.log(f"Direct push to {dest_folder} failed ({e}); retrying via /data/local/tmp/ and root mv…", "INFO")
+                                    jump.copy_gateway_file_to_seat(
+                                        gateway_path=gw_path,
+                                        remote_path=staged_tmp,
+                                        seat_host=seat_host,
+                                        mtc_password=mtc_password,
+                                        timeout=300,
+                                        progress_callback=_on_stage,
+                                        root_shell=shell,
+                                    )
+                                    mv_cmd = f"cp -f {shlex.quote(staged_tmp)} {shlex.quote(target_path)} && rm -f {shlex.quote(staged_tmp)} && chmod 644 {shlex.quote(target_path)}"
+                                    _, code_mv = shell.run(mv_cmd, timeout=30)
+                                    if code_mv == 0:
+                                        ok += 1
+                                        recovered = True
+                                        self.log(f"✓ {seat_host}:{target_path} (via root mv)", "INFO")
+                                except Exception:
+                                    pass
+
+                            if not recovered:
+                                err = str(e).strip()
+                                clean_err = _strip_seat_banner(err)
+                                failed += 1
+                                failed_items.append(f"{basename}: {clean_err}")
+                                self.log(f"✗ {basename}: {clean_err[:200]}", "ERROR")
+                except Exception as e:
+                    failed = total - ok
+                    clean_err = _strip_seat_banner(str(e).strip())
+                    failed_items.append(f"Connection error: {clean_err}")
+                finally:
+                    if shell:
+                        try:
+                            shell.close()
+                        except Exception:
+                            pass
+                    if jump:
+                        try:
+                            jump.close()
+                        except Exception:
+                            pass
+
+                def finish():
                     try:
                         progress.close()
                     except Exception:
                         pass
-                    self.update_status(message)
-                    if success:
-                        self.log(
-                            f"Gateway: Copy-to-Seat succeeded to /data/local/tmp/{raw_name}",
-                            "INFO",
-                        )
-                        ui.call.emit(lambda: QMessageBox.information(
-                            self, "Copy Complete",
-                            f"Copied to seat:\n\n{seat_host}:{dest_path}\n\n"
-                            f"Command ran on {user}@{host}:\n"
-                            f"scp {raw_name} mtc@{seat_host}:/data/local/tmp/"
-                        ))
+                    self.update_status("Copy complete" if failed == 0 else "Copy failed")
+                    if failed == 0:
+                        safe_info(explorer, "Copy Complete", f"Successfully copied {ok} file(s) to {seat_host}:{dest_folder}")
                     else:
-                        self.log(f"Gateway Copy-to-Seat failed: {message}", "ERROR")
-                        # Strip the noisy warning banner from scp output so
-                        # the user sees just the actionable error.
-                        clean = _strip_seat_banner(message)
-                        ui.call.emit(lambda: QMessageBox.critical(
-                            self, "Copy Failed",
-                            f"Could not copy to seat:\n\n{clean}",
-                        ))
+                        summary = f"Copied {ok}/{total} file(s) successfully.\n\nFailed items:\n" + "\n".join(failed_items)
+                        safe_warning(explorer, "Copy Partially Failed" if ok > 0 else "Copy Failed", summary)
 
-                if exit_code == 0:
-                    ui.call.emit(lambda: done(True, "Copy complete"))
-                else:
-                    error_msg = last_err or f"Exit code {exit_code}"
-                    ui.call.emit(lambda: done(False, error_msg))
+                ui.call.emit(finish)
 
             threading.Thread(target=do_copy, daemon=True).start()
 
@@ -1565,7 +1607,7 @@ class GatewayMixin:
             edit_dlg.exec()
 
         def run_command_clicked():
-            """Run a shell command on the gateway and display output."""
+            """Run a shell command on the gateway and display only the command's output."""
             cmd, ok = QInputDialog.getMultiLineText(
                 explorer,
                 "Run Command",
@@ -1598,151 +1640,101 @@ class GatewayMixin:
             close_o.clicked.connect(output_dlg.accept)
             output_dlg.show()
 
-            def _ask_user(question_text, is_password):
-                box = {'answer': None}
+            target_dir = current_path() or default_path
 
-                def ask():
-                    if is_password:
-                        ans, ok2 = QInputDialog.getText(
-                            output_dlg, "Remote Prompt",
-                            question_text,
-                            QLineEdit.EchoMode.Password,
-                        )
-                    else:
-                        ans, ok2 = QInputDialog.getText(
-                            output_dlg, "Remote Prompt",
-                            question_text,
-                        )
-                    box['answer'] = ans if ok2 else None
-                    output_dlg.activateWindow()
-
-                QApplication.postEvent(output_dlg, _AskEvent(ask))
-                _ANSWER_READY.clear()
-                waiter = _AnswerWaiter(output_dlg)
-                QApplication.instance().installEventFilter(waiter)
-                _ANSWER_READY.wait()
-                QApplication.instance().removeEventFilter(waiter)
-                return box['answer']
-
-            PASSWORD_PROMPTS = re.compile(
-                r"(password[: ]|passphrase|enter.*password|"
-                r"sudo.*password|verification code|token:|"
-                r"\(yes\/no\)|yes\/no\)|continue connecting \(yes\/no)",
-                re.IGNORECASE,
-            )
-            IS_PASSWORD = re.compile(
-                r"(password[: ]|passphrase|sudo.*password|verification code|token:)",
-                re.IGNORECASE,
-            )
-            _CSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+            def _clean_cmd_output(s):
+                if not s:
+                    return ""
+                s = _strip_seat_banner(s)
+                # Strip bash job control / ioctl warnings emitted on non-tty
+                s = re.sub(r'(?mi)^bash:\s*cannot set terminal process group[^\n]*\n?', '', s)
+                s = re.sub(r'(?mi)^bash:\s*no job control in this shell[^\n]*\n?', '', s)
+                # Strip ANSI escape sequences
+                s = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', s)
+                s = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', s)
+                s = s.replace('\r\n', '\n').replace('\r', '\n')
+                return s
 
             def do_run():
-                channel = None
                 try:
-                    import uuid as _uuid
-                    import time as _time
-
-                    channel = ssh_client.invoke_shell(term='xterm', width=200, height=50)
-                    channel.settimeout(0.2)
-
-                    tag = _uuid.uuid4().hex[:12]
-                    sync_marker = f'__ADB_GUI_SYNC_{tag}__'
-                    end_marker_prefix = f'__ADB_GUI_END_{tag}_'
-
-                    # Disable PTY echo and blank prompts, then sync.
-                    # With echo off none of our sent lines appear in output —
-                    # only actual command stdout/stderr does.
-                    channel.send(
-                        f'stty -echo 2>/dev/null; export PS1="" PS2=""; echo {sync_marker}\n'
+                    # ── Step 1: discover where tools like bct live ──────────────────────
+                    # .bashrc on Ubuntu/Debian guards itself with:
+                    #   case $- in *i*) ;; *) return ;; esac
+                    # so sourcing it in bash -c (non-interactive) does nothing.
+                    # Instead we do a cheap pre-flight exec_command to discover PATH
+                    # entries that the interactive login shell would have set, then we
+                    # inject them directly — no sourcing of guarded rc files needed.
+                    discover_cmd = (
+                        # Static candidate dirs + dynamic search for bct specifically
+                        'printf "%s\n" '
+                        '  "$HOME/bin" "$HOME/.local/bin" /usr/local/bin /usr/bin /bin '
+                        '  /usr/sbin /sbin /opt/bin /opt/homebrew/bin '
+                        '  /mas/bin /usr/mas/bin /opt/mas/bin '
+                        '  2>/dev/null; '
+                        # Walk /etc/profile.d scripts (login-time PATH additions)
+                        'for p in /etc/profile.d/*.sh; do '
+                        '  [ -r "$p" ] || continue; '
+                        '  grep -Eo \'/[^:$"'"'"'[:space:]]+\' "$p" 2>/dev/null | '
+                        '  grep -Ev \'\\.(sh|conf)$\' | head -20; '
+                        'done; '
+                        # Try to find bct by name in likely mount-points
+                        'find /mas /usr/mas /opt/mas /tools /opt /usr/local /home '
+                        '  -maxdepth 5 -name bct -type f -perm /111 2>/dev/null | '
+                        '  head -5 | xargs -r dirname 2>/dev/null; '
+                        'echo __DISCOVER_DONE__'
                     )
-
-                    sync_buf = ''
-                    deadline = _time.time() + 15
-                    while _time.time() < deadline:
-                        if channel.recv_ready():
-                            try:
-                                sync_buf += channel.recv(4096).decode('utf-8', 'replace')
-                            except Exception:
-                                pass
-                            if sync_marker in sync_buf:
-                                break
-                        else:
-                            _time.sleep(0.05)
-
-                    target_dir = current_path() or default_path
-                    channel.send(
-                        f'cd {shlex.quote(target_dir)} >/dev/null 2>&1\n'
-                        f'{cmd}\n'
-                        f'echo "{end_marker_prefix}$?__"\n'
-                    )
-
-                    end_re = re.compile(rf'{re.escape(end_marker_prefix)}(\d+)__')
-                    full_buf = ''
-                    pending_prompt = False
-                    saw_any_output = False
-                    last_data_time = _time.time()
-                    end_match = None
-                    deadline = _time.time() + 300
-
-                    while _time.time() < deadline:
-                        if channel.recv_ready():
-                            try:
-                                chunk = channel.recv(4096).decode('utf-8', 'replace')
-                            except Exception:
-                                chunk = ''
-                            if chunk:
-                                saw_any_output = True
-                                last_data_time = _time.time()
-                                full_buf += chunk
-                                end_match = end_re.search(full_buf)
-                                if end_match:
-                                    break
-
-                                scrubbed = _CSI.sub('', chunk).lower()
-                                if not pending_prompt and PASSWORD_PROMPTS.search(scrubbed):
-                                    pending_prompt = True
-                                    is_pw = bool(IS_PASSWORD.search(scrubbed))
-                                    tail_visible = scrubbed.strip().split('\n')[-1] or "Password:"
-                                    if len(tail_visible) > 200:
-                                        tail_visible = tail_visible[-200:]
-                                    answer = _ask_user(tail_visible, is_pw)
-                                    if answer is None:
-                                        try:
-                                            channel.close()
-                                        except Exception:
-                                            pass
-                                        ui.call.emit(lambda: (
-                                            status.setText("❌ Cancelled"),
-                                            output.setPlainText("(cancelled by user)"),
-                                        ))
-                                        return
-                                    channel.send(answer + '\n')
-                                    continue
-                                if pending_prompt and '\n' in chunk:
-                                    pending_prompt = False
-                        if channel.exit_status_ready() and not channel.recv_ready():
-                            break
-                        if not channel.recv_ready():
-                            if saw_any_output and (_time.time() - last_data_time) > 30:
-                                break
-                            _time.sleep(0.05)
-
+                    extra_path_dirs = []
                     try:
-                        while channel.recv_ready():
-                            full_buf += channel.recv(4096).decode('utf-8', 'replace')
+                        _, dout, _ = ssh_client.exec_command(discover_cmd, timeout=15)
+                        disc_text = dout.read().decode('utf-8', 'replace')
+                        seen = set()
+                        for line in disc_text.splitlines():
+                            line = line.strip()
+                            if line == '__DISCOVER_DONE__':
+                                break
+                            if line.startswith('/') and line not in seen:
+                                seen.add(line)
+                                extra_path_dirs.append(line)
                     except Exception:
                         pass
 
-                    if end_match is None:
-                        end_match = end_re.search(full_buf)
+                    remote_script = (
+                        'shopt -s expand_aliases 2>/dev/null; '
+                        f"cd {shlex.quote(target_dir)} && (\n{cmd}\n)"
+                    )
+                    exec_cmd = f"bash -ic {shlex.quote(remote_script)}"
 
-                    combined = full_buf[:end_match.start()] if end_match else full_buf
-                    code = int(end_match.group(1)) if end_match else 0
+                    stdin, stdout, stderr = ssh_client.exec_command(exec_cmd, timeout=300)
+                    channel = stdout.channel
 
-                    combined = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', combined)
-                    combined = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', combined)
-                    combined = combined.replace('\r\n', '\n').replace('\r', '\n')
-                    combined = combined.strip()
+                    chunks = []
+                    while not channel.exit_status_ready():
+                        if channel.recv_ready():
+                            chunk = channel.recv(4096).decode('utf-8', 'replace')
+                            if chunk:
+                                chunks.append(chunk)
+                                ui.call.emit(lambda: (
+                                    output.setPlainText(_clean_cmd_output(''.join(chunks))),
+                                    output.moveCursor(QTextCursor.MoveOperation.End)
+                                ))
+                        if channel.recv_stderr_ready():
+                            chunk = channel.recv_stderr(4096).decode('utf-8', 'replace')
+                            if chunk:
+                                chunks.append(chunk)
+                                ui.call.emit(lambda: (
+                                    output.setPlainText(_clean_cmd_output(''.join(chunks))),
+                                    output.moveCursor(QTextCursor.MoveOperation.End)
+                                ))
+                        time.sleep(0.05)
+
+                    # Drain remaining output
+                    while channel.recv_ready():
+                        chunks.append(channel.recv(4096).decode('utf-8', 'replace'))
+                    while channel.recv_stderr_ready():
+                        chunks.append(channel.recv_stderr(4096).decode('utf-8', 'replace'))
+
+                    code = channel.recv_exit_status()
+                    combined = _clean_cmd_output(''.join(chunks)).strip()
 
                     self.log(f"Gateway: ran '{cmd.splitlines()[0][:60]}', exit={code}", "INFO")
 
@@ -1758,12 +1750,7 @@ class GatewayMixin:
                         output.setPlainText(err)
                     ui.call.emit(apply_err)
                     self.log(f"Gateway: run failed: {err}", "ERROR")
-                finally:
-                    if channel is not None:
-                        try:
-                            channel.close()
-                        except Exception:
-                            pass
+
             threading.Thread(target=do_run, daemon=True).start()
         def mkdir_clicked():
             folder, ok = QInputDialog.getText(self, "New Folder", "Folder name:")

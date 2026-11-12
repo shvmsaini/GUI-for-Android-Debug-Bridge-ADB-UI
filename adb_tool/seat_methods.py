@@ -953,16 +953,21 @@ class _SeatJumpHost:
             except Exception:
                 pass
 
-        # Otherwise probe via run_gateway_command using interactive login shell (bash -lic)
+        # Otherwise probe via run_gateway_command: search for bct by path
         try:
+            # Use find to locate bct binary directly — avoids .bashrc interactive guard
             probe_cmd = (
-                "bash -lic 'shopt -s expand_aliases 2>/dev/null; "
-                "[ -f /etc/profile ] && . /etc/profile 2>/dev/null; "
-                '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null; '
-                "command -v bct >/dev/null 2>&1 || which bct >/dev/null 2>&1 || type bct >/dev/null 2>&1 || "
-                "[ -x /usr/local/bin/bct ] || [ -x /opt/homebrew/bin/bct ] || [ -x $HOME/bin/bct ] || [ -x $HOME/.local/bin/bct ]'"
+                "bash -c '"
+                "command -v bct >/dev/null 2>&1 || "
+                "[ -x /usr/bin/bct ] || [ -x /usr/local/bin/bct ] || "
+                "[ -x /bin/bct ] || [ -x /mas/bin/bct ] || "
+                "[ -x /usr/mas/bin/bct ] || [ -x /opt/mas/bin/bct ] || "
+                "[ -x $HOME/bin/bct ] || [ -x $HOME/.local/bin/bct ] || "
+                "{ _f=$(find /mas /usr/mas /opt/mas /tools /opt /usr/local /home "
+                "          -maxdepth 6 -name bct -type f -perm /111 2>/dev/null | head -1); "
+                "  [ -n \"$_f\" ]; }'"
             )
-            res = self.run_gateway_command(probe_cmd, timeout=15)
+            res = self.run_gateway_command(probe_cmd, timeout=20)
             has_bct = (res.returncode == 0)
         except Exception as e:
             self._log(f"Probe bct failed: {e}", "DEBUG")
@@ -971,6 +976,65 @@ class _SeatJumpHost:
         self._has_bct = has_bct
         self._log(f"Gateway bct probe result: {has_bct}", "DEBUG")
         return has_bct
+
+    def _bct_path_prefix(self):
+        """Return a shell fragment 'export PATH=...; ' that puts bct's directory first.
+
+        Uses ``find`` rather than sourcing rc files so it works regardless of the
+        interactive-only guard (``case $- in *i*) ;; *) return;; esac``) that
+        most Linux gateways have in their .bashrc.
+
+        Result is cached on the instance.
+        """
+        cached = getattr(self, '_bct_path_str', None)
+        if cached is not None:
+            return cached
+
+        STATIC_DIRS = (
+            '/usr/bin', '/usr/local/bin', '/bin',
+            '/mas/bin', '/usr/mas/bin', '/opt/mas/bin',
+            '/opt/bin', '/opt/homebrew/bin',
+            '$HOME/bin', '$HOME/.local/bin',
+        )
+
+        discover_cmd = (
+            "bash -c '"
+            # 1) emit static candidates quickly
+            "printf \"%s\\n\" " + ' '.join(STATIC_DIRS) + "; "
+            # 2) emit dirs from /etc/profile.d (login-time PATH additions) silently
+            "for p in /etc/profile.d/*.sh; do "
+            "  [ -r \"$p\" ] || continue; "
+            "  grep -Eo '/[^:$\"' + \"'\" + '[:space:]]+' \"$p\" 2>/dev/null | "
+            "  grep -v '\\.sh$' | head -10; "
+            "done; "
+            # 3) find bct binary in likely mount-points
+            "find /mas /usr/mas /opt/mas /tools /opt /usr/local /home "
+            "  -maxdepth 6 -name bct -type f -perm /111 2>/dev/null | "
+            "  head -5 | xargs -r dirname 2>/dev/null; "
+            "echo __BCT_DISC_DONE__'"
+        )
+        try:
+            res = self.run_gateway_command(discover_cmd, timeout=20)
+            dirs = []
+            seen = set()
+            for line in (res.stdout or '').splitlines():
+                line = line.strip()
+                if line == '__BCT_DISC_DONE__':
+                    break
+                if line and line not in seen:
+                    seen.add(line)
+                    dirs.append(line)
+            if dirs:
+                path_val = ':'.join(dirs)
+                result = f'export PATH="{path_val}:$PATH"; '
+            else:
+                result = ''
+        except Exception as e:
+            self._log(f"bct path discovery failed: {e}", "DEBUG")
+            result = ''
+
+        self._bct_path_str = result
+        return result
 
     def run_remote_command_via_bct(self, seat_host, command, timeout=60):
         """Run ``command`` on the seat via the gateway's ``bct`` helper.
@@ -1079,20 +1143,9 @@ class _SeatJumpHost:
             if has_bct:
                 staging_dir = os.path.dirname(gw_stage) or "/tmp"
                 staging_name = os.path.basename(gw_stage)
+                path_prefix = self._bct_path_prefix()
                 bct_put_inner = (
-                    "export PS1='$ '; "
-                    "shopt -s expand_aliases 2>/dev/null; "
-                    '[ -f /etc/profile ] && . /etc/profile 2>/dev/null; '
-                    '[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null; '
-                    '[ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile" 2>/dev/null; '
-                    '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null; '
-                    '[ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc" 2>/dev/null; '
-                    'export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
-                    'if ! command -v bct >/dev/null 2>&1; then '
-                    '  for candidate in /usr/local/bin/bct /opt/*/bct /opt/*/*/bct /tools/*/bct /tools/*/*/bct $HOME/bin/bct $HOME/.local/bin/bct; do '
-                    '    if [ -x "$candidate" ]; then export PATH="$(dirname "$candidate"):$PATH"; break; fi; '
-                    '  done; '
-                    'fi; '
+                    path_prefix +
                     f'cd {shlex.quote(staging_dir)} && ('
                     f'bct put -s {shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")} || '
                     f'bct put -s ./{shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")} || '
@@ -1100,7 +1153,7 @@ class _SeatJumpHost:
                     # Only delete on success; on failure leave the file for the next fallback attempt
                     f'_RC=$?; [ $_RC -eq 0 ] && rm -f {shlex.quote(gw_stage)}; exit $_RC'
                 )
-                bct_put_cmd = f"bash -lic {shlex.quote(bct_put_inner)}"
+                bct_put_cmd = f"bash -c {shlex.quote(bct_put_inner)}"
                 self._log(f"BCT: bct put -s {staging_name} -d {seat_host}:{seat_dest_path}", "INFO")
                 res = self.run_gateway_command(bct_put_cmd, timeout=timeout)
                 if res.returncode == 0:
@@ -1271,6 +1324,184 @@ class _SeatJumpHost:
                 except Exception:
                     pass
 
+    def copy_gateway_file_to_seat(self, gateway_path, remote_path, seat_host,
+                                  mtc_password=None, timeout=600,
+                                  progress_callback=None, root_shell=None):
+        """Copy a file already residing on the gateway to the seat.
+
+        Unlike copy_to_seat_via_gateway, the file already exists on the gateway
+        and MUST NOT be deleted after transfer.
+        """
+        import uuid as _uuid
+        basename = os.path.basename(gateway_path)
+        if remote_path.endswith('/'):
+            remote_path = remote_path + basename
+
+        has_bct = self._probe_bct()
+        self._log(f"Copy gateway file to seat: gateway bct availability = {has_bct}", "INFO")
+
+        dest_dir = os.path.dirname(remote_path) or "/"
+        saved_dir = self.get_working_path(self._host, seat_host)
+        first_target = f"{saved_dir}/{basename}" if (saved_dir and saved_dir != dest_dir) else remote_path
+        if first_target != remote_path:
+            self._log(f"Gateway {self._host}: using saved working path {saved_dir} first", "INFO")
+
+        if has_bct:
+            msg = f"Doing bct to seat ({seat_host}:{first_target})…"
+            if progress_callback:
+                progress_callback("doing_bct", msg)
+            self._log(msg, "INFO")
+        else:
+            msg = f"Doing scp to seat ({seat_host}:{first_target})…"
+            if progress_callback:
+                progress_callback("doing_scp", msg)
+            self._log(msg, "INFO")
+
+        success = False
+        last_error = ""
+
+        def _try_transfer(seat_dest_path):
+            """Try bct put then gateway scp to seat_dest_path. Returns (ok, err_str).
+            gateway_path is NEVER deleted."""
+            if has_bct:
+                staging_dir = os.path.dirname(gateway_path) or "/tmp"
+                staging_name = os.path.basename(gateway_path)
+                path_prefix = self._bct_path_prefix()
+                bct_put_inner = (
+                    path_prefix +
+                    f'cd {shlex.quote(staging_dir)} && ('
+                    f'bct put -s {shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")} || '
+                    f'bct put -s ./{shlex.quote(staging_name)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")} || '
+                    f'bct put -s {shlex.quote(gateway_path)} -d {shlex.quote(f"{seat_host}:{seat_dest_path}")}); '
+                    f'exit $?'
+                )
+                bct_put_cmd = f"bash -c {shlex.quote(bct_put_inner)}"
+                self._log(f"BCT: bct put -s {staging_name} -d {seat_host}:{seat_dest_path}", "INFO")
+                res = self.run_gateway_command(bct_put_cmd, timeout=timeout)
+                if res.returncode == 0:
+                    return True, ""
+                err = (res.stderr or res.stdout or "").strip()
+                bct_err = f"bct put failed (code {res.returncode}): {err[:300]}"
+                self._log(f"{bct_err}; trying scp fallback...", "WARNING")
+                if progress_callback:
+                    progress_callback("fallback_doing_scp", "bct put failed, trying scp…")
+                if "permission denied" in err.lower():
+                    return False, bct_err
+
+            if mtc_password:
+                askpass_path = f"/tmp/.adb-gui-ap-{_uuid.uuid4().hex[:8]}.sh"
+                askpass_script = (
+                    "#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    f"  *\"password:\"*|*\"Password:\"*) echo {shlex.quote(mtc_password)} ;;\n"
+                    "  *) echo \"yes\" ;;\n"
+                    "esac\n"
+                )
+                scp_gw_cmd = (
+                    f"cat > {askpass_path} << 'EOF'\n{askpass_script}\nEOF\n"
+                    f"chmod 700 {askpass_path}\n"
+                    f"SSH_ASKPASS={shlex.quote(askpass_path)} SSH_ASKPASS_REQUIRE=force DISPLAY=:0 "
+                    f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "
+                    f"{shlex.quote(gateway_path)} mtc@{seat_host}:{shlex.quote(seat_dest_path)}\n"
+                    f"RET=$?\n"
+                    f"rm -f {askpass_path}\n"
+                    f"exit $RET"
+                )
+                self._log(f"Running scp on gateway: {gateway_path} → mtc@{seat_host}:{seat_dest_path}", "INFO")
+                res = self.run_gateway_command(scp_gw_cmd, timeout=timeout)
+                if res.returncode == 0:
+                    return True, ""
+                err = (res.stderr or res.stdout or "").strip()
+                return False, f"gateway scp failed (code {res.returncode}): {err[:300]}"
+
+            return False, "no mtc_password available for scp fallback"
+
+        def _is_perm_denied(err):
+            return "permission denied" in err.lower()
+
+        actual_seat_path = remote_path
+        try:
+            ok, last_error = _try_transfer(first_target)
+            if ok:
+                if first_target == remote_path:
+                    success = True
+                    actual_seat_path = remote_path
+                    self.set_working_path(self._host, dest_dir, seat_host)
+                elif root_shell:
+                    mv_cmd = (
+                        f"cp -f {shlex.quote(first_target)} {shlex.quote(remote_path)} && "
+                        f"rm -f {shlex.quote(first_target)} && "
+                        f"chmod 644 {shlex.quote(remote_path)}"
+                    )
+                    _, code_mv = root_shell.run(mv_cmd, timeout=30)
+                    if code_mv == 0:
+                        success = True
+                        actual_seat_path = remote_path
+                        self.set_working_path(self._host, saved_dir, seat_host)
+                        self._log(f"✓ Staged via {saved_dir}, root-moved to {remote_path}", "INFO")
+                else:
+                    success = True
+                    actual_seat_path = first_target
+                    self.set_working_path(self._host, saved_dir, seat_host)
+                    self._log(f"✓ Staged to {first_target} (saved gateway path)", "INFO")
+
+            if not success and _is_perm_denied(last_error):
+                staging_candidates = ["/data/local/tmp", "/tmp", "/sdcard", "/storage/emulated/0"]
+                if saved_dir and saved_dir in staging_candidates:
+                    staging_candidates.remove(saved_dir)
+                    staging_candidates.insert(0, saved_dir)
+                for staging_base in staging_candidates:
+                    stage_path = f"{staging_base}/{basename}"
+                    if stage_path == first_target or (os.path.dirname(stage_path) == dest_dir and first_target == remote_path):
+                        continue
+                    self._log(f"Trying staging via {staging_base}…", "INFO")
+                    if progress_callback:
+                        progress_callback(
+                            "doing_bct" if has_bct else "doing_scp",
+                            f"Staging to {staging_base}…"
+                        )
+                    stage_ok, stage_err = _try_transfer(stage_path)
+                    if stage_ok:
+                        if root_shell:
+                            mv_cmd = (
+                                f"cp -f {shlex.quote(stage_path)} {shlex.quote(remote_path)} && "
+                                f"rm -f {shlex.quote(stage_path)} && "
+                                f"chmod 644 {shlex.quote(remote_path)}"
+                            )
+                            _, code_mv = root_shell.run(mv_cmd, timeout=30)
+                            if code_mv == 0:
+                                success = True
+                                actual_seat_path = remote_path
+                                self.set_working_path(self._host, staging_base, seat_host)
+                                self._log(f"✓ Staged via {staging_base}, root-moved to {remote_path}", "INFO")
+                                break
+                            else:
+                                self._log(
+                                    f"Root mv from {stage_path} to {remote_path} failed (code {code_mv})",
+                                    "WARNING"
+                                )
+                                try:
+                                    root_shell.run(f"rm -f {shlex.quote(stage_path)}", timeout=5)
+                                except Exception:
+                                    pass
+                        else:
+                            success = True
+                            actual_seat_path = stage_path
+                            self.set_working_path(self._host, staging_base, seat_host)
+                            self._log(f"✓ Staged to {stage_path} (no root shell; using this path)", "INFO")
+                            break
+                    else:
+                        self._log(f"Staging to {staging_base} also failed: {stage_err[:200]}", "WARNING")
+
+            if not success:
+                raise _SeatSshError(f"Failed to copy to seat: {last_error}")
+
+            if progress_callback:
+                progress_callback("done", f"✓ Done copying {basename} to {seat_host}")
+            return actual_seat_path
+        except Exception:
+            raise
+
     def copy_from_seat_via_gateway(self, remote_path, local_path, seat_host,
                                    mtc_password=None, timeout=600,
                                    progress_callback=None):
@@ -1294,26 +1525,15 @@ class _SeatJumpHost:
 
         try:
             if has_bct:
+                path_prefix = self._bct_path_prefix()
                 bct_get_inner = (
-                    "export PS1='$ '; "
-                    "shopt -s expand_aliases 2>/dev/null; "
-                    '[ -f /etc/profile ] && . /etc/profile 2>/dev/null; '
-                    '[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null; '
-                    '[ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile" 2>/dev/null; '
-                    '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null; '
-                    '[ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc" 2>/dev/null; '
-                    'export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
-                    'if ! command -v bct >/dev/null 2>&1; then '
-                    '  for candidate in /usr/local/bin/bct /opt/*/bct /opt/*/*/bct /tools/*/bct /tools/*/*/bct $HOME/bin/bct $HOME/.local/bin/bct; do '
-                    '    if [ -x "$candidate" ]; then export PATH="$(dirname "$candidate"):$PATH"; break; fi; '
-                    '  done; '
-                    'fi; '
+                    path_prefix +
                     f'cd {shlex.quote(staging_dir)} && ('
                     f'bct get -s {shlex.quote(f"{seat_host}:{remote_path}")} -d . || '
                     f'bct get -s {shlex.quote(f"{seat_host}:{remote_path}")} -d {shlex.quote(staging_dir)} || '
                     f'bct get -s {shlex.quote(f"{seat_host}:{remote_path}")} -d {shlex.quote(gw_staging)})'
                 )
-                bct_get_cmd = f"bash -lic {shlex.quote(bct_get_inner)}"
+                bct_get_cmd = f"bash -c {shlex.quote(bct_get_inner)}"
                 self._log(f"BCT: bct get -s {seat_host}:{remote_path} -d .", "INFO")
                 res = self.run_gateway_command(bct_get_cmd, timeout=timeout)
                 if res.returncode == 0:
