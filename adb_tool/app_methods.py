@@ -371,8 +371,9 @@ class AppMixin:
             return False
 
         gateway_user, gateway_host = gateway.split('@', 1)
-        # Copy to /data/local/tmp on the seat
-        remote_path = f"/data/local/tmp/{apk_name}"
+        from .seat_methods import _SeatJumpHost
+        staged_base = _SeatJumpHost.get_working_path(gateway_host, seat_name) or "/data/local/tmp"
+        remote_path = f"{staged_base}/{apk_name}"
 
         self.log(f"Gateway: Copying {apk_name} → {seat_name}:{remote_path}", "INFO")
         self.update_status(f"Gateway: Preparing copy...")

@@ -28,6 +28,7 @@ if DEBUG_MODE:
     ADB_SEAT_PORTS_FILE = os.path.join(_DEBUG_HISTORY_DIR, "adb-seat-ports")
     PORTFORWARD_RACKS_FILE = os.path.join(_DEBUG_HISTORY_DIR, "portforward-racks")
     CUSTOM_GATEWAYS_FILE = os.path.join(_DEBUG_HISTORY_DIR, "adb-custom-gateways")
+    GATEWAY_WORKING_PATHS_FILE = os.path.join(_DEBUG_HISTORY_DIR, "adb-gateway-paths.json")
     _DEBUG_SETTINGS_DIR = os.path.join(_DEBUG_TEMP_DIR, "settings")
     os.makedirs(_DEBUG_SETTINGS_DIR, exist_ok=True)
 else:
@@ -35,9 +36,8 @@ else:
     _DEBUG_HISTORY_DIR = None
     ADB_SEAT_PORTS_FILE = os.path.join(os.path.expanduser("~/.cache"), "adb-seat-ports")
     PORTFORWARD_RACKS_FILE = os.path.join(os.path.expanduser("~/.cache"), "portforward-racks")
-    # Custom gateways the user typed into the Gateway Explorer — saved so
-    # they show up in the picker next session even without a seat history entry.
     CUSTOM_GATEWAYS_FILE = os.path.join(os.path.expanduser("~/.cache"), "adb-custom-gateways")
+    GATEWAY_WORKING_PATHS_FILE = os.path.join(os.path.expanduser("~/.cache"), "adb-gateway-paths.json")
     _DEBUG_SETTINGS_DIR = None
 
 # Determine the base directory for app data (used for both settings and crashes)

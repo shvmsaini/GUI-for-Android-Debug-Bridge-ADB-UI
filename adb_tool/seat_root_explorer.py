@@ -625,7 +625,8 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     if cancel_flag[0]:
                         break
 
-                    tmp_remote = f"/tmp/.seat-root-download-{uuid.uuid4().hex}"
+                    staged_dir = jump.get_working_path(gateway_host, seat_hostname) or "/tmp"
+                    tmp_remote = f"{staged_dir}/.seat-root-download-{uuid.uuid4().hex}"
                     try:
                         remote_path = join_remote(current_path(), raw)
                         local_path = os.path.join(dest_dir, raw)
@@ -649,6 +650,18 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             )
                             _, code_tar = shell.run(tar_cmd, timeout=300)
                             if code_tar != 0:
+                                alt_dir = "/data/local/tmp" if staged_dir == "/tmp" else "/tmp"
+                                alt_remote = f"{alt_dir}/.seat-root-download-{uuid.uuid4().hex}"
+                                alt_tar = (
+                                    f"tar cf {shlex.quote(alt_remote)} "
+                                    f"-C {shlex.quote(os.path.dirname(remote_path) or '/')} "
+                                    f"{shlex.quote(os.path.basename(remote_path))}"
+                                )
+                                _, alt_code = shell.run(alt_tar, timeout=300)
+                                if alt_code == 0:
+                                    tmp_remote = alt_remote
+                                    code_tar = 0
+                            if code_tar != 0:
                                 raise Exception(f"tar stage failed with code {code_tar}")
 
                             local_tar = os.path.join(dest_dir, f".tmp-{uuid.uuid4().hex}.tar")
@@ -671,7 +684,15 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                             cp_cmd = f"cp {shlex.quote(remote_path)} {shlex.quote(tmp_remote)} && chmod 644 {shlex.quote(tmp_remote)}"
                             _, code_cp = shell.run(cp_cmd, timeout=30)
                             if code_cp != 0:
-                                raise Exception(f"sudo cp to /tmp failed with code {code_cp}")
+                                alt_dir = "/data/local/tmp" if staged_dir == "/tmp" else "/tmp"
+                                alt_remote = f"{alt_dir}/.seat-root-download-{uuid.uuid4().hex}"
+                                alt_cp = f"cp {shlex.quote(remote_path)} {shlex.quote(alt_remote)} && chmod 644 {shlex.quote(alt_remote)}"
+                                _, alt_code = shell.run(alt_cp, timeout=30)
+                                if alt_code == 0:
+                                    tmp_remote = alt_remote
+                                    code_cp = 0
+                            if code_cp != 0:
+                                raise Exception(f"sudo cp to staging failed with code {code_cp}")
 
                             jump.copy_from_seat_via_gateway(
                                 remote_path=tmp_remote,
@@ -1002,24 +1023,60 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
     threading.Thread(target=do_connect, daemon=True).start()
 
 
+def _find_seat_gateway_for_device(parent, device_id):
+    if not device_id:
+        return None, None
+    spm = getattr(parent, 'seat_port_manager', None)
+    if not spm:
+        return None, None
+
+    devices = getattr(parent, '_cached_seat_sh_devices', None) or []
+    if not devices:
+        try:
+            devices = spm.get_devices_from_seat_sh() or []
+        except Exception:
+            devices = []
+    for d in devices:
+        if d.get('device') == device_id and d.get('seat') and d.get('gateway'):
+            return d.get('seat').strip(), d.get('gateway').strip()
+
+    port = device_id.split(':')[-1] if ':' in device_id else None
+    if port:
+        for d in devices:
+            if d.get('device', '').endswith(':' + port) and d.get('seat') and d.get('gateway'):
+                return d.get('seat').strip(), d.get('gateway').strip()
+        try:
+            history = spm.load_history('seat') or []
+            for entry in history:
+                if str(entry.get('port')) == port and entry.get('seat') and entry.get('gateway'):
+                    return entry.get('seat').strip(), entry.get('gateway').strip()
+        except Exception:
+            pass
+
+    connected = getattr(spm, 'connected_seats', {}) or {}
+    clean_dev = device_id.split(':')[0]
+    if clean_dev in connected:
+        return clean_dev, connected[clean_dev]
+    if device_id in connected:
+        return device_id, connected[device_id]
+
+    try:
+        history = spm.load_history('seat') or []
+        for entry in history:
+            s = entry.get('seat', '').strip()
+            g = entry.get('gateway', '').strip()
+            if s and g and s in (device_id, clean_dev):
+                return s, g
+    except Exception:
+        pass
+
+    return None, None
+
+
 def _gather_paired_entries(parent):
-    """Return (options, default_label, default_gateway).
-
-    options: paired strings seat → gateway_opt (user@host) for a single combobox.
-    live ones first, then all history, so current connections are on top.
-    default_label and default_gateway point at the current/last-used pair.
-
-    Each (seat, gateway) pair appears AT MOST ONCE — if the same pair shows
-    up in connected, seat.sh, AND history, it's listed once and the most
-    authoritative source wins (connected > seat.sh > history). Otherwise a
-    user with the same seat in all three buckets would see it three times
-    in the dropdown, which is just clutter.
-    """
     spm = parent.seat_port_manager
-
-    # Collect (seat, gateway) → best source. Higher rank wins on collision.
     source_rank = {'connected': 0, 'seat.sh': 1, 'history': 2}
-    pairs_by_key = {}  # (seat, gateway) -> (source, original_list_order)
+    pairs_by_key = {}
 
     def _add(seat, gw, source):
         if not seat or not gw:
@@ -1029,19 +1086,16 @@ def _gather_paired_entries(parent):
         if existing is None or source_rank[source] < source_rank[existing[0]]:
             pairs_by_key[key] = (source, len(pairs_by_key))
 
-    # Preferred: currently connected in our internal state
     connected = getattr(spm, 'connected_seats', {}) or {}
     for seat, gw in connected.items():
         _add(seat, gw, 'connected')
 
-    # Next: live from seat.sh devices
     try:
         for d in (spm.get_devices_from_seat_sh() or []):
             _add(d.get('seat'), d.get('gateway'), 'seat.sh')
     except Exception:
         pass
 
-    # Finally: history from file
     try:
         history = spm.get_top_entries('seat', 1000) or []
     except Exception:
@@ -1049,10 +1103,6 @@ def _gather_paired_entries(parent):
     for entry in history:
         _add(entry.get('seat'), entry.get('gateway'), 'history')
 
-    # Stable, source-ordered list:
-    #   connected (reversed so most recent connected seat first),
-    #   then seat.sh (in the order seat.sh reported them),
-    #   then history (newest-first, since get_top_entries already sorts).
     by_source = {'connected': [], 'seat.sh': [], 'history': []}
     for key, (source, order) in pairs_by_key.items():
         by_source[source].append((order, key))
@@ -1062,7 +1112,6 @@ def _gather_paired_entries(parent):
         + [(k, 'history') for _, k in sorted(by_source['history'])]
     )
 
-    # Build labels and gateway lookup
     labels = []
     label_to_gateway = {}
     for (seat, gw), _source in pairs_sorted:
@@ -1070,13 +1119,20 @@ def _gather_paired_entries(parent):
         labels.append(label)
         label_to_gateway[label] = gw
 
-    # Default: current/last-used seat from connected; if none, first history.
     default_label = None
     default_gateway = None
 
-    # Look for current/last-used from internal state
-    if connected:
-        # Pick the last (most recently) connected seat's label
+    cur_dev = getattr(parent, 'current_device', None)
+    cur_seat, cur_gw = _find_seat_gateway_for_device(parent, cur_dev) if cur_dev else (None, None)
+    if cur_seat and cur_gw:
+        target_label = f"{cur_seat} {cur_gw}"
+        if target_label not in labels:
+            labels.insert(0, target_label)
+            label_to_gateway[target_label] = cur_gw
+        default_label = target_label
+        default_gateway = cur_gw
+
+    if not default_label and connected:
         last_seat = next(reversed(list(connected.keys())))
         last_gw = connected[last_seat]
         candidate = f"{last_seat} {last_gw}"
@@ -1084,20 +1140,16 @@ def _gather_paired_entries(parent):
             default_label = candidate
             default_gateway = label_to_gateway[candidate]
 
-    # Fallback to first live entry
     for label in labels:
         if label.endswith(')') and not default_label:
             default_label = label
             default_gateway = label_to_gateway[label]
             break
 
-    # Finally fallback to first entry in the (already ordered) list —
-    # connected (reversed) → seat.sh → history.
     if not default_label and labels:
         default_label = labels[0]
         default_gateway = label_to_gateway[default_label]
 
-    # If nothing exists, return NO defaults
     if not labels:
         return [], None, None
 
@@ -1105,10 +1157,6 @@ def _gather_paired_entries(parent):
 
 
 def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
-    """Single combobox with editable/text field: user can select or type.
-
-    Returns (seat, gateway) or (None, None) on cancel.
-    """
     dialog = QDialog(parent)
     dialog.setWindowTitle("Seat Root Explorer")
     dialog.setMinimumWidth(480)
@@ -1135,6 +1183,7 @@ def _ask_seat_and_gateway(parent, labels, default_label, default_gateway):
     if default_label and default_label in labels:
         idx = labels.index(default_label)
         combo.setCurrentIndex(idx)
+        combo.setEditText(default_label)
     elif default_label:
         combo.setEditText(default_label)
 

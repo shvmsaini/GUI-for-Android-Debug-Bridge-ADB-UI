@@ -11,6 +11,7 @@ import re
 import tempfile
 import uuid
 import fnmatch
+import json
 from datetime import datetime
 from subprocess import TimeoutExpired
 
@@ -214,6 +215,63 @@ class _SeatJumpHost:
     Honours ``~/.ssh/config`` for ``User`` / ``Port`` (we don't need to
     parse ProxyCommand here — ssh itself reads it).
     """
+
+    _working_paths_cache = None
+
+    @classmethod
+    def _load_working_paths(cls):
+        if cls._working_paths_cache is not None:
+            return cls._working_paths_cache
+        cls._working_paths_cache = {}
+        try:
+            from .constants import GATEWAY_WORKING_PATHS_FILE
+            if os.path.exists(GATEWAY_WORKING_PATHS_FILE) and os.path.getsize(GATEWAY_WORKING_PATHS_FILE) > 0:
+                with open(GATEWAY_WORKING_PATHS_FILE, "r", encoding="utf-8") as f:
+                    cls._working_paths_cache = json.load(f)
+        except Exception:
+            pass
+        return cls._working_paths_cache
+
+    @classmethod
+    def get_working_path(cls, gateway_host, seat_host=None):
+        cache = cls._load_working_paths()
+        if gateway_host and seat_host:
+            pair_key = f"{gateway_host}:{seat_host}"
+            if pair_key in cache:
+                return cache[pair_key]
+        if gateway_host and gateway_host in cache:
+            return cache[gateway_host]
+        if seat_host and seat_host in cache:
+            return cache[seat_host]
+        return None
+
+    @classmethod
+    def set_working_path(cls, gateway_host, path, seat_host=None):
+        if not path:
+            return
+        cache = cls._load_working_paths()
+        changed = False
+        if gateway_host and cache.get(gateway_host) != path:
+            cache[gateway_host] = path
+            changed = True
+        if gateway_host and seat_host:
+            pair_key = f"{gateway_host}:{seat_host}"
+            if cache.get(pair_key) != path:
+                cache[pair_key] = path
+                changed = True
+        if seat_host and cache.get(seat_host) != path:
+            cache[seat_host] = path
+            changed = True
+        if changed:
+            try:
+                from .constants import GATEWAY_WORKING_PATHS_FILE
+                os.makedirs(os.path.dirname(GATEWAY_WORKING_PATHS_FILE), exist_ok=True)
+                tmp_file = f"{GATEWAY_WORKING_PATHS_FILE}.tmp.{os.getpid()}"
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2)
+                os.replace(tmp_file, GATEWAY_WORKING_PATHS_FILE)
+            except Exception:
+                pass
 
     def __init__(self, ssh_host, password, log):
         if not password:
@@ -995,13 +1053,19 @@ class _SeatJumpHost:
             gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex}"
             self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
 
+        dest_dir = os.path.dirname(remote_path) or "/"
+        saved_dir = self.get_working_path(self._host, seat_host)
+        first_target = f"{saved_dir}/{basename}" if (saved_dir and saved_dir != dest_dir) else remote_path
+        if first_target != remote_path:
+            self._log(f"Gateway {self._host}: using saved working path {saved_dir} first", "INFO")
+
         if has_bct:
-            msg = f"Gateway copying is done, now doing bct to seat ({seat_host}:{remote_path})…"
+            msg = f"Gateway copying is done, now doing bct to seat ({seat_host}:{first_target})…"
             if progress_callback:
                 progress_callback("gateway_done_doing_bct", msg)
             self._log(msg, "INFO")
         else:
-            msg = f"Gateway copying is done, now doing scp to seat ({seat_host}:{remote_path})…"
+            msg = f"Gateway copying is done, now doing scp to seat ({seat_host}:{first_target})…"
             if progress_callback:
                 progress_callback("gateway_done_doing_scp", msg)
             self._log(msg, "INFO")
@@ -1082,14 +1146,32 @@ class _SeatJumpHost:
         def _is_perm_denied(err):
             return "permission denied" in err.lower()
 
+        actual_seat_path = remote_path
         try:
-            ok, last_error = _try_transfer(remote_path)
+            ok, last_error = _try_transfer(first_target)
             if ok:
-                success = True
+                if first_target == remote_path:
+                    success = True
+                    actual_seat_path = remote_path
+                    self.set_working_path(self._host, dest_dir, seat_host)
+                elif root_shell:
+                    mv_cmd = (
+                        f"cp -f {shlex.quote(first_target)} {shlex.quote(remote_path)} && "
+                        f"rm -f {shlex.quote(first_target)} && "
+                        f"chmod 644 {shlex.quote(remote_path)}"
+                    )
+                    _, code_mv = root_shell.run(mv_cmd, timeout=30)
+                    if code_mv == 0:
+                        success = True
+                        actual_seat_path = remote_path
+                        self.set_working_path(self._host, saved_dir, seat_host)
+                        self._log(f"✓ Staged via {saved_dir}, root-moved to {remote_path}", "INFO")
+                else:
+                    success = True
+                    actual_seat_path = first_target
+                    self.set_working_path(self._host, saved_dir, seat_host)
+                    self._log(f"✓ Staged to {first_target} (saved gateway path)", "INFO")
 
-            # If bct/scp failed without an obvious "permission denied" in the error
-            # (can happen when SSL noise masks the real message), try direct scp to
-            # get a cleaner error before deciding whether to escalate.
             if not success and not _is_perm_denied(last_error):
                 try:
                     self._log(f"Attempting direct scp from local to {seat_host}:{remote_path}...", "INFO")
@@ -1101,24 +1183,23 @@ class _SeatJumpHost:
                         timeout=timeout,
                     )
                     success = True
+                    actual_seat_path = remote_path
+                    self.set_working_path(self._host, dest_dir, seat_host)
                     self._log(f"✓ direct scp succeeded: {seat_host}:{remote_path}", "INFO")
                 except Exception as e:
                     direct_err = str(e)
                     self._log(f"Direct scp failed: {direct_err[:200]}", "ERROR")
                     if _is_perm_denied(direct_err):
-                        last_error = direct_err  # surface the cleaner error
+                        last_error = direct_err
 
-            # Permission denied: try staging via alternative seat directories.
-            # Seat images vary: some lock /data/local/tmp, others lock /tmp.
-            # With root_shell: mv to the final destination after staging.
-            # Without root_shell: leave the file at the staging path and return it.
-            actual_seat_path = remote_path
             if not success and _is_perm_denied(last_error):
-                dest_dir = os.path.dirname(remote_path) or "/"
                 staging_candidates = ["/data/local/tmp", "/tmp", "/sdcard", "/storage/emulated/0"]
+                if saved_dir and saved_dir in staging_candidates:
+                    staging_candidates.remove(saved_dir)
+                    staging_candidates.insert(0, saved_dir)
                 for staging_base in staging_candidates:
                     stage_path = f"{staging_base}/{basename}"
-                    if os.path.dirname(stage_path) == dest_dir:
+                    if stage_path == first_target or (os.path.dirname(stage_path) == dest_dir and first_target == remote_path):
                         continue
                     self._log(f"Trying staging via {staging_base}…", "INFO")
                     if progress_callback:
@@ -1138,6 +1219,7 @@ class _SeatJumpHost:
                             if code_mv == 0:
                                 success = True
                                 actual_seat_path = remote_path
+                                self.set_working_path(self._host, staging_base, seat_host)
                                 self._log(f"✓ Staged via {staging_base}, root-moved to {remote_path}", "INFO")
                                 break
                             else:
@@ -1152,12 +1234,12 @@ class _SeatJumpHost:
                         else:
                             success = True
                             actual_seat_path = stage_path
+                            self.set_working_path(self._host, staging_base, seat_host)
                             self._log(f"✓ Staged to {stage_path} (no root shell; using this path)", "INFO")
                             break
                     else:
                         self._log(f"Staging to {staging_base} also failed: {stage_err[:200]}", "WARNING")
 
-            # Final direct-scp attempt (only if not already tried above)
             if not success and not _is_perm_denied(last_error):
                 try:
                     self._log(f"Attempting direct scp from local to {seat_host}:{remote_path}...", "INFO")
@@ -1170,6 +1252,7 @@ class _SeatJumpHost:
                     )
                     success = True
                     actual_seat_path = remote_path
+                    self.set_working_path(self._host, dest_dir, seat_host)
                     self._log(f"✓ direct scp succeeded: {seat_host}:{remote_path}", "INFO")
                 except Exception as e:
                     last_error = str(e)
