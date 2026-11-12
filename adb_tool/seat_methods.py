@@ -2150,12 +2150,16 @@ def _seat_root_shell_via_mtc(jump, seat, mtc_password, log, root_password=None):
         raise
 
 
-def _push_adb_key(sh, adb_keys, log):
+def _push_adb_key(sh, adb_keys, log, exclusive=False):
     """Append the user's adb public key to /data/misc/adb/adb_keys and run
     the post-install setup so the seat's adbd trusts the new key.
 
+    If exclusive is True (used during force seizure), backups any existing
+    keys and writes ONLY the caller's key so competing clients are evicted
+    and cannot reconnect.
+
     Dedups by the full key line so re-running is idempotent. Preserves any
-    other entries already on the device.
+    other entries already on the device when exclusive is False.
 
     Post-install steps (per the user's request — these run as root on the
     seat and are best-effort; failures are logged but don't abort):
@@ -2166,6 +2170,8 @@ def _push_adb_key(sh, adb_keys, log):
            operations on large /data files
       3. setprop persist.service.adb.enable 1
          — ensures adbd is enabled across reboots
+      4. setprop service.adb.tcp.port 5555
+         — ensures adbd binds to TCP port 5555
 
     After these, ``setprop ctl.restart adbd`` is issued by the caller
     (see ``_install_adb_key_on_seat``) so adbd re-reads the freshly-appended
@@ -2191,40 +2197,32 @@ def _push_adb_key(sh, adb_keys, log):
     # turn into a silent "key not installed" report.
     sh.run("mkdir -p /data/misc/adb", timeout=15)
 
-    # Make sure the *file* exists. On shells where ``>>`` is supposed to
-    # create the file, that relies on the redirect happening before the
-    # ``echo`` body — and we've seen seat images where the chained
-    # redirect below silently exits 0 without creating the file when
-    # the path didn't exist beforehand. Explicitly create an empty file
-    # only if it's missing; never truncate an existing one (it may
-    # already hold other hosts' keys).
-    #
-    # We probe with ``test -e`` directly (its exit code is the marker
-    # we capture via _SeatShell.run, so it's unambiguous), rather than
-    # the more obvious ``[ -e f ] && echo X || echo Y`` form — that
-    # one can match BOTH markers in the buffered output if the shell
-    # echoes the whole conditional, and the rightmost match wins, which
-    # is the wrong one. Using ``test -e`` lets the marker echo capture
-    # the actual exit code 0 (exists) or 1 (missing).
+    # Make sure the *file* exists.
     _, exists_code = sh.run(f"test -e {f}", timeout=15)
     if exists_code != 0:
-        # ``install`` copies /dev/null to the target, creating an empty
-        # file with the requested mode in one atomic step. It also fails
-        # loudly (non-zero exit) on permission/SELinux errors, unlike
-        # the bare-redirect form which has been observed to succeed-
-        # without-effect on some seat shells.
         _, mk_code = sh.run(f"install -m 644 /dev/null {f}", timeout=15)
         if mk_code != 0:
-            # Last-ditch fallback: ``>>`` from /dev/null on a missing
-            # path is *supposed* to create the file but has been
-            # observed to fail silently on some seat shells. Surface a
-            # clear error rather than report "key installed" while the
-            # file is still missing.
             raise _SeatSshError(
                 f"Could not create {f} on seat — install returned {mk_code}. "
                 "Check that /data is writable and SELinux isn't blocking it."
             )
         log(f"KEYS: created empty {f}", "INFO")
+
+    if exclusive:
+        # For force seizure: backup existing keys, then overwrite with ONLY our key
+        log(f"KEYS: writing exclusive seizure key to {f}", "INFO")
+        sh.run(f"cp {f} {f}.bak 2>/dev/null || true", timeout=15)
+        write_cmd = f"printf '%s\\n' '{line}' | tee {f} >/dev/null"
+        _, code = sh.run(write_cmd, timeout=15)
+        if code != 0:
+            raise _SeatSshError(
+                f"Could not write exclusive key to {f} (tee exit {code}). "
+                "Check filesystem permissions and SELinux policy on /data."
+            )
+        sh.run(f"chmod 644 {f}", timeout=15)
+        sh.run(f"chown system:system {f} 2>/dev/null || true", timeout=15)
+        _run_post_install_setup(sh, log)
+        return True
 
     # Dedup check: `grep -qF` exits 0 if found. Different hosts' keys share
     # the same key type but differ in the base64 blob, so we compare the
@@ -2311,7 +2309,12 @@ def _run_post_install_setup(sh, log):
     #    reboots on seat images that default to disabled.
     out, code = sh.run("setprop persist.service.adb.enable 1", timeout=10)
     if code != 0:
-        log(f"KEYS: post-install setprop failed: {out.strip()}", "WARNING")
+        log(f"KEYS: post-install setprop persist.service.adb.enable failed: {out.strip()}", "WARNING")
+
+    # 4. service.adb.tcp.port 5555 — ensure adbd listens on TCP port 5555
+    out, code = sh.run("setprop service.adb.tcp.port 5555", timeout=10)
+    if code != 0:
+        log(f"KEYS: post-install setprop service.adb.tcp.port failed: {out.strip()}", "WARNING")
     else:
         log("KEYS: post-install setup complete", "INFO")
 
@@ -5256,15 +5259,41 @@ class SeatMixin:
             "INFO",
         )
 
+    def _get_local_adb_pubkey(self):
+        """Retrieve local ADB public key contents, auto-generating via adb if missing."""
+        key = getattr(self, '_pending_adb_key', None)
+        if key and key.strip():
+            return key.strip()
+        pub_path = os.path.expanduser("~/.android/adbkey.pub")
+        if not os.path.exists(pub_path):
+            try:
+                key_path = os.path.expanduser("~/.android/adbkey")
+                self.adb.run_command(f"keygen {key_path}", timeout=5)
+            except Exception:
+                pass
+        if os.path.exists(pub_path):
+            try:
+                with open(pub_path, "r") as f:
+                    content = f.read().strip()
+                    if content:
+                        return content
+            except Exception:
+                pass
+        env_key = os.environ.get("ADB_PUBKEY", "").strip()
+        if env_key:
+            return env_key
+        return None
+
     def takeover_seat(self, seat, gateway=None, silent=True, on_ready=None):
         """Forcefully take over a seat from another user or competing connection (Vysor mode).
 
         Fast Path:
           1. Kicks local ADB transport using `reconnect device` then reconnects (under 300ms).
         Full Path (if occupied by remote TCP socket):
-          2. Connects to seat host via SSH and triggers `setprop ctl.restart adbd`.
-             This severs the competing user's TCP connection instantly.
-          3. Reconnects local ADB port and notifies `on_ready`.
+          2. Connects to seat host via SSH, installs caller's ADB key exclusively into
+             /data/misc/adb/adb_keys (evicting other users' keys so they cannot reconnect),
+             sets service.adb.tcp.port 5555, and restarts adbd cleanly.
+          3. Reconnects local ADB port, starts the device watcher, and notifies `on_ready`.
         """
         # Resolve gateway if not explicitly supplied
         if not gateway:
@@ -5298,20 +5327,15 @@ class SeatMixin:
 
         def do_takeover():
             # ── Fast path: aggressive local reconnect ───────────────────────────
-            # Before doing the heavy SSH-based adbd restart, try the aggressive
-            # non-root "reconnect device" command. This tells the device-side
-            # transport to drop its current session and restart, which can
-            # evict other users without needing root or SSH.
             self.log(f"⚡ Fast-seizing {seat_dev} via reconnect device...", "DEBUG")
             try:
-                # `reconnect device` kicks the device-side transport
                 self.adb.run_command(f"-s {seat_dev} reconnect device")
                 time.sleep(0.3)
                 self.adb.run_command(f"disconnect {seat_dev}")
                 time.sleep(0.2)
                 result = self.adb.run_command(f"connect {seat_dev}")
                 if result.get('success', False):
-                    time.sleep(0.5)
+                    time.sleep(0.6)
                     devs = self.adb.get_devices(silent=True)
                     if any(d.get('id') == seat_dev and d.get('status') == 'device' for d in devs):
                         self.log(f"Fast-seizure successful for {seat_dev}", "INFO")
@@ -5319,26 +5343,22 @@ class SeatMixin:
                         self._notify_device_of_seizure(seat_dev)
                         self.run_on_main_thread(lambda: self.refresh_devices())
                         self.run_on_main_thread(self.refresh_seat_port_lists)
-                        if on_ready:
-                            self.run_on_main_thread(lambda: on_ready(seat_dev))
-                        # Restart persistent watcher to monitor for future seizures
                         self.run_on_main_thread(
                             lambda s=seat, p=port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, seizure_mode=True)
                         )
+                        if on_ready:
+                            self.run_on_main_thread(lambda: on_ready(seat_dev))
                         return
             except Exception as e:
                 self.log(f"Fast path failed for {seat_dev}: {e}", "DEBUG")
 
             # ── Full path: remote adbd reset via seat SSH ───────────────────────
-            # When adbd is occupied by another user's TCP session and fast path
-            # fails, the only way to evict them is to restart adbd on the device
-            # over SSH.
-            # The "fast path" (adb reconnect/disconnect/connect) above recycles
-            # our local ADB daemon state and tries to kick the remote transport.
-            # If that failed, we go straight to SSH + setprop ctl.restart adbd.
-
             if not gateway:
                 self.log(f"Cannot take over seat {seat}: gateway not found", "ERROR")
+                try:
+                    self.run_on_main_thread(self._finalize_seat_connect_busy)
+                except Exception:
+                    pass
                 return
 
             gateway_norm = gateway.strip()
@@ -5349,12 +5369,6 @@ class SeatMixin:
             gateway_host = parts[1] if len(parts) == 2 else gateway_norm
 
             gateway_password = self.credential_manager.get_gateway_password_with_fallback(gateway_host, user)
-
-            # Fall back to the password used during the most-recent connect
-            # attempt (stored as _pending_*). This covers the common case
-            # where the user just connected successfully and the takeover is
-            # triggered moments later — the Keychain entry exists from that
-            # session and we can reuse it without re-prompting.
             if not gateway_password:
                 gateway_password = getattr(self, '_pending_device_password', None)
 
@@ -5362,13 +5376,9 @@ class SeatMixin:
                 self.credential_manager.get_global_mtc_password()
                 or self.credential_manager.get_password("mtc_global", "mtc")
                 or getattr(self, '_pending_mtc_password', None)
-                or gateway_password  # last resort: try same cred as gateway
+                or gateway_password
             )
 
-            # Root password is used by ``su -`` on the seat — distinct
-            # from the mtc password. All seats share one global root
-            # password. Falls back to mtc_password for backwards
-            # compatibility with seat images where root == mtc.
             root_password = (
                 self.credential_manager.get_global_root_password()
                 or getattr(self, '_pending_root_password', None)
@@ -5382,16 +5392,22 @@ class SeatMixin:
                         "Keychain or recent session. Connect manually first.",
                         "WARNING",
                     )
+                    try:
+                        self.run_on_main_thread(self._finalize_seat_connect_busy)
+                    except Exception:
+                        pass
                     return
                 gateway_password = self.credential_manager.prompt_password(self, gateway_host, user)
                 if not gateway_password:
                     self.log("Takeover aborted: missing gateway password.", "ERROR")
+                    try:
+                        self.run_on_main_thread(self._finalize_seat_connect_busy)
+                    except Exception:
+                        pass
                     return
 
             if not mtc_password:
                 if silent:
-                    # Fall back to gateway password — in many environments
-                    # mtc and gateway share the same credential.
                     self.log(
                         f"No mtc password found for takeover of {seat}; "
                         "falling back to gateway password.",
@@ -5402,13 +5418,12 @@ class SeatMixin:
                     mtc_password = self.credential_manager.prompt_password(self, "mtc_global", "mtc")
                     if not mtc_password:
                         self.log("Takeover aborted: missing mtc password.", "ERROR")
+                        try:
+                            self.run_on_main_thread(self._finalize_seat_connect_busy)
+                        except Exception:
+                            pass
                         return
 
-            # Single log line for the whole takeover — the per-step
-            # "Stopping adbd / Starting adbd / Racing / etc." messages
-            # were too noisy and didn't add information beyond the
-            # outcome. Verbose steps are available at DEBUG for anyone
-            # who turns that on.
             self.log(f"Reconnecting to {seat}...", "INFO")
             self.update_status(f"Reconnecting to {seat}...")
 
@@ -5420,16 +5435,45 @@ class SeatMixin:
                     jump, seat, mtc_password, log=self.log,
                     root_password=root_password,
                 )
-                # Use stop + start sequence instead of restart for reliability
-                out1, code1 = sh.run("setprop ctl.stop adbd", timeout=8)
-                time.sleep(1)  # Give adbd moment to fully stop before restarting
+
+                # 1. Install caller's ADB public key exclusively so other users' clients are evicted
+                pubkey = self._get_local_adb_pubkey()
+                if pubkey:
+                    try:
+                        self.log(f"SEAT: writing exclusive seizure key to {seat}...", "DEBUG")
+                        _push_adb_key(sh, pubkey, log=self.log, exclusive=True)
+                    except Exception as ke:
+                        self.log(f"Could not install exclusive ADB key during takeover: {ke}", "WARNING")
+
+                # 2. Ensure TCP port 5555 and persist adb enable
+                sh.run("setprop persist.service.adb.enable 1", timeout=8)
+                sh.run("setprop service.adb.tcp.port 5555", timeout=8)
+
+                # 3. Forcibly kill existing adbd processes to drop all active TCP connections
+                sh.run("setprop ctl.stop adbd", timeout=8)
+                sh.run("pkill -9 -x adbd || killall -9 adbd || kill -9 $(pidof adbd) 2>/dev/null || true", timeout=8)
+                time.sleep(1)
+
+                # 4. Start adbd afresh
                 out2, code2 = sh.run("setprop ctl.start adbd", timeout=8)
                 self.log(
-                    f"adbd restart on {seat} (stop rc={code1}, start rc={code2})",
+                    f"adbd restart on {seat} (start rc={code2})",
                     "DEBUG",
                 )
+
+                # 5. Wait briefly for adbd process to appear
+                for _ in range(6):
+                    time.sleep(0.5)
+                    pid_out, _ = sh.run("pidof adbd", timeout=5)
+                    if pid_out.strip():
+                        self.log(f"SEAT: adbd running with pid {pid_out.strip()}", "DEBUG")
+                        break
             except Exception as e:
                 self.log(f"Takeover SSH command failed: {e}", "ERROR")
+                try:
+                    self.run_on_main_thread(self._finalize_seat_connect_busy)
+                except Exception:
+                    pass
                 return
             finally:
                 if sh:
@@ -5450,65 +5494,83 @@ class SeatMixin:
                         pass
 
             # Step 2: Reconnect ADB transport to localhost:<port>
-            # adbd needs ~1s to restart after setprop ctl.restart adbd, and
-            # the OTHER user's adb client may auto-reconnect the moment their
-            # TCP socket drops. We race them: keep trying disconnect+connect
-            # in a tight loop until adb reports the device as 'device' (not
-            # 'offline' and not missing). The window needs to be wide enough
-            # that one of our connect attempts wins the race — empirically
-            # this can take several seconds when the other side has a
-            # watchdog that reconnects within ~1s of the restart.
-            self.log(f"Racing for {seat_dev} — adbd restarting", "DEBUG")
+            self.log(f"Reconnecting ADB to {seat_dev}...", "DEBUG")
+
+            # Allow adbd 1.5 seconds to bind to port 5555 and enter listen state
+            time.sleep(1.5)
+
+            # Disconnect first to clear any stale transport in local adb server
+            try:
+                self.adb.run_command(f"disconnect {seat_dev}", timeout=5)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+            # Issue connect command
+            try:
+                self.adb.run_command(f"connect {seat_dev}", timeout=8)
+            except Exception:
+                pass
+
             connected = False
-            # 20 attempts × ~0.5s = up to 10s of racing.
-            for attempt in range(20):
-                try:
-                    self.adb.run_command(f"disconnect {seat_dev}")
-                except Exception:
-                    pass
-                time.sleep(0.1)
-                try:
-                    self.adb.run_command(f"connect {seat_dev}")
-                except Exception:
-                    pass
-                time.sleep(0.4)
+            # Poll for authentication handshake to complete and status to reach 'device'
+            for attempt in range(16):  # Up to 8 seconds
+                time.sleep(0.5)
                 try:
                     devs = self.adb.get_devices(silent=True)
-                    if any(d.get('id') == seat_dev and d.get('status') == 'device' for d in devs):
+                    target = next((d for d in devs if d.get('id') == seat_dev), None)
+                    if target and target.get('status') == 'device':
                         connected = True
                         break
+                    # If after 3.5s it's still offline/unauthorized, trigger a reconnect
+                    if attempt == 7 and target and target.get('status') != 'device':
+                        self.log(f"Device {seat_dev} still {target.get('status')} after 3.5s — issuing adb reconnect...", "DEBUG")
+                        self.adb.run_command(f"-s {seat_dev} reconnect", timeout=5)
+                except Exception:
+                    pass
+
+            if not connected:
+                # One last attempt: disconnect and reconnect cleanly
+                try:
+                    self.adb.run_command(f"disconnect {seat_dev}", timeout=5)
+                    time.sleep(0.5)
+                    self.adb.run_command(f"connect {seat_dev}", timeout=8)
+                    for _ in range(8):
+                        time.sleep(0.5)
+                        devs = self.adb.get_devices(silent=True)
+                        if any(d.get('id') == seat_dev and d.get('status') == 'device' for d in devs):
+                            connected = True
+                            break
                 except Exception:
                     pass
 
             if connected:
+                self.log(f"✓ Force reconnection successful for seat {seat} ({seat_dev})", "INFO")
                 self.update_status(f"Seat {seat} acquired")
-                # Notify the previously connected user that their connection was seized
                 self._notify_device_of_seizure(seat_dev)
-                # Mark this seat as seized (init dict if missing)
                 if not hasattr(self, '_seat_was_seized'):
                     self._seat_was_seized = {}
                 self._seat_was_seized[seat] = True
-            else:
-                self.update_status(f"Takeover failed for {seat} — retry")
 
-            self.run_on_main_thread(lambda: self.refresh_devices())
-            self.run_on_main_thread(self.refresh_seat_port_lists)
-            if on_ready:
-                self.run_on_main_thread(lambda: on_ready(seat_dev))
+                self.run_on_main_thread(
+                    lambda s=seat, p=port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, seizure_mode=True)
+                )
+                self.run_on_main_thread(lambda: self.refresh_devices())
+                self.run_on_main_thread(self.refresh_seat_port_lists)
+                if on_ready:
+                    self.run_on_main_thread(lambda: on_ready(seat_dev))
             else:
-                # Only restart the watcher if we actually won the race.
-                # If we lost, leave the watcher stopped — the user should
-                # click ⚡ Take Over manually, or we surface a clear error
-                # instead of looping takeovers forever.
-                if connected:
-                    self.run_on_main_thread(
-                        lambda s=seat, p=port, g=gateway: self._start_seat_device_watcher(s, port=p, gateway=g, seizure_mode=True)
-                    )
-                else:
-                    self.log(
-                        f"Couldn't reconnect to {seat}. Click ⚡ Take Over to try again.",
-                        "WARNING",
-                    )
+                self.log(
+                    f"Takeover failed for seat {seat} ({seat_dev}) — device did not transition to online",
+                    "WARNING",
+                )
+                self.update_status(f"Takeover failed for {seat} — retry")
+                self.run_on_main_thread(lambda: self.refresh_devices())
+                self.run_on_main_thread(self.refresh_seat_port_lists)
+                try:
+                    self.run_on_main_thread(self._finalize_seat_connect_busy)
+                except Exception:
+                    pass
 
         threading.Thread(target=do_takeover, daemon=True).start()
 
