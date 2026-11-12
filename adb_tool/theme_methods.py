@@ -75,7 +75,7 @@ class ThemeMixin:
         stylesheet += "QWidget { background-color: " + bg + "; color: " + fg + "; } "
         stylesheet += "QPushButton { background-color: " + card_bg + "; color: " + fg + "; "
         stylesheet += "border: 1px solid " + border_color + "; border-radius: 4px; padding: 8px; "
-        stylesheet += "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; "
+        stylesheet += "font-family: Arial, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, sans-serif; "
         stylesheet += "font-size: 11pt; } "
         stylesheet += "QPushButton:hover { background-color: " + button_hover_color + "; } "
         stylesheet += "QPushButton:pressed { background-color: " + button_pressed_color + "; } "

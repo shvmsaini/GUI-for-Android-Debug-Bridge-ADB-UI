@@ -321,8 +321,8 @@ class _SeatJumpHost:
             askpass_file.write(
                 "#!/bin/sh\n"
                 f"case \"$1\" in\n"
-                f"  *\"password:\"*|*\"Password:\"*) cat '{pw_file.name}' ;;\n"
-                "  *) echo \"yes\" ;;\n"
+                f"  *\"yes/no\"*) echo \"yes\" ;;\n"
+                f"  *) cat '{pw_file.name}' ;;\n"
                 "esac\n"
             )
             askpass_file.close()
@@ -758,8 +758,8 @@ class _SeatJumpHost:
             askpass_file.write(
                 "#!/bin/sh\n"
                 f"case \"$1\" in\n"
-                f"  *\"password:\"*|*\"Password:\"*) cat '{gw_pw_file.name}' ;;\n"
-                "  *) echo \"yes\" ;;\n"
+                f"  *\"yes/no\"*) echo \"yes\" ;;\n"
+                f"  *) cat '{gw_pw_file.name}' ;;\n"
                 "esac\n"
             )
             askpass_file.close()
@@ -767,7 +767,7 @@ class _SeatJumpHost:
 
             cmd = [
                 "ssh",
-                "-tt",
+                "-T",
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "ConnectTimeout=15",
@@ -2844,19 +2844,6 @@ class SeatMixin:
                     self.run_on_main_thread(lambda s=seat, w=watcher: self._show_seat_disconnected_dialog(s, watcher=w))
                     return
 
-            # If device is offline OR missing on start, call the unified offline dialog
-            # Skip this when seizure_mode=True — user already approved takeover.
-            if (
-                not seizure_mode
-                and seat_status in (None, 'offline')
-                and elapsed['secs'] >= 2
-                and not first_device_seen['value']
-            ):
-                self.run_on_main_thread(
-                    lambda s=seat, g=gateway, w=watcher, sid=seat_device_id: self._show_seat_offline_dialog(
-                        s, gateway=g, device_id=sid, watcher=w,
-                    )
-                )
 
             # Mark that we've seen the device as 'device'
             if seat_status == 'device':
@@ -2890,16 +2877,17 @@ class SeatMixin:
         watcher.start()
 
     def _show_seat_offline_dialog(self, seat, gateway=None, device_id=None, watcher=None,
-                                  on_success=None, on_decline=None):
+                                  on_success=None, on_decline=None, force_prompt_only=False):
         """Unified dialog when a seat device goes offline or is held by another user.
 
         Flow:
-        1. Show 'Seat Went Offline' dialog: asks if the user wants to reconnect.
-        2. If user confirms, first attempts a fast NORMAL reconnection.
-        3. If normal reconnection succeeds and device is online ('device'), connection
+        1. If force_prompt_only is False:
+           Show 'Seat Went Offline' dialog: asks if the user wants to reconnect.
+           If user confirms, first attempts a fast NORMAL reconnection.
+           If normal reconnection succeeds and device is online ('device'), connection
            is restored cleanly without disrupting anyone.
-        4. If normal reconnection fails (still offline / held by another user), ask the
-           user if they want to Force Reconnect (which will seize the seat and sever other
+        2. If normal reconnection fails (or force_prompt_only is True):
+           Ask user for Force Reconnection (which will seize the seat and sever other
            sessions via takeover_seat).
         """
         from .safe_dialog import safe_question_multiline
@@ -2936,6 +2924,15 @@ class SeatMixin:
             self._seat_offline_prompt_pending.discard(seat)
             self._seat_seized_dialog_open.discard(seat)
 
+        def _clear_device_state():
+            if device_id and hasattr(self, '_device_ever_online') and device_id in self._device_ever_online:
+                del self._device_ever_online[device_id]
+            if hasattr(self, '_clear_mirror_auto_resume') and device_id:
+                try:
+                    self._clear_mirror_auto_resume(device_id)
+                except Exception:
+                    pass
+
         if not gateway:
             gateway = self.seat_port_manager.connected_seats.get(seat)
 
@@ -2953,6 +2950,48 @@ class SeatMixin:
             port = self.seat_port_manager.get_seat_port(seat)
             if port:
                 device_id = f"localhost:{port}"
+
+        def prompt_force_reconnect():
+            try:
+                force_confirmed = safe_question_multiline(
+                    self,
+                    "Force Reconnect",
+                    f"Normal reconnection to seat '{seat}' did not succeed (device is still offline).\n\n"
+                    "This may mean another user is actively using this device.\n\n"
+                    "Do you want to Force Reconnect? This will seize the seat and disconnect the other user.",
+                    yes_label="Force Reconnect",
+                    no_label="Cancel",
+                )
+                if force_confirmed:
+                    self.log(f"User confirmed force reconnection (seizure) for {seat}", "INFO")
+                    self.update_status(f"Force reconnecting to {seat} (seizing seat)...")
+                    if not hasattr(self, '_seat_was_seized'):
+                        self._seat_was_seized = {}
+                    self._seat_was_seized[seat] = True
+                    if watcher:
+                        self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
+                    self.takeover_seat(
+                        seat,
+                        gateway=gateway,
+                        silent=False,
+                        on_ready=lambda dev: self.run_on_main_thread(lambda: (
+                            self.update_status(f"Successfully seized and connected to {seat}"),
+                            on_success() if on_success else None
+                        ))
+                    )
+                else:
+                    self.log(f"User declined force reconnection for {seat}", "INFO")
+                    _clear_device_state()
+                    if watcher:
+                        self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
+                    if on_decline:
+                        on_decline()
+            finally:
+                _cleanup()
+
+        if force_prompt_only:
+            self.run_on_main_thread(prompt_force_reconnect)
+            return
 
         def auto_close_poll():
             try:
@@ -2984,6 +3023,7 @@ class SeatMixin:
 
         if not confirmed:
             _cleanup()
+            _clear_device_state()
             self.log(f"User declined reconnect for seat {seat}", "INFO")
             if watcher:
                 self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
@@ -3028,44 +3068,6 @@ class SeatMixin:
 
             # Step 2: Normal reconnection failed -> Ask user for Force Reconnection (seizure)
             self.log(f"Normal reconnection failed for {seat} — asking user for force reconnection (seizure)", "INFO")
-
-            def prompt_force_reconnect():
-                try:
-                    force_confirmed = safe_question_multiline(
-                        self,
-                        "Force Reconnect",
-                        f"Normal reconnection to seat '{seat}' did not succeed (device is still offline).\n\n"
-                        "This may mean another user is actively using this device.\n\n"
-                        "Do you want to Force Reconnect? This will seize the seat and disconnect the other user.",
-                        yes_label="Force Reconnect",
-                        no_label="Cancel",
-                    )
-                    if force_confirmed:
-                        self.log(f"User confirmed force reconnection (seizure) for {seat}", "INFO")
-                        self.update_status(f"Force reconnecting to {seat} (seizing seat)...")
-                        if not hasattr(self, '_seat_was_seized'):
-                            self._seat_was_seized = {}
-                        self._seat_was_seized[seat] = True
-                        if watcher:
-                            self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
-                        self.takeover_seat(
-                            seat,
-                            gateway=gateway,
-                            silent=False,
-                            on_ready=lambda dev: self.run_on_main_thread(lambda: (
-                                self.update_status(f"Successfully seized and connected to {seat}"),
-                                on_success() if on_success else None
-                            ))
-                        )
-                    else:
-                        self.log(f"User declined force reconnection for {seat}", "INFO")
-                        if watcher:
-                            self._teardown_seat_watcher(watcher, seat, mark_disconnected=False)
-                        if on_decline:
-                            on_decline()
-                finally:
-                    _cleanup()
-
             self.run_on_main_thread(prompt_force_reconnect)
 
         threading.Thread(target=do_reconnect_flow, daemon=True).start()
@@ -4611,6 +4613,7 @@ class SeatMixin:
                     with open(_stdout_path, 'w') as _out_f, open(_stderr_path, 'w') as _err_f:
                         result = subprocess.run(
                             cmd,
+                            stdin=subprocess.DEVNULL,
                             stdout=_out_f,
                             stderr=_err_f,
                             text=True,
@@ -5574,20 +5577,15 @@ class SeatMixin:
             except Exception:
                 pass
 
-        # Device is still offline / held by another user -> prompt for Force Reconnect directly
-        from .safe_dialog import safe_question_multiline
-        confirmed = safe_question_multiline(
-            self,
-            "Force Reconnect",
-            f"Seat '{seat}' ({device_id}) is offline or in use by another user.\n\n"
-            "Do you want to Force Reconnect? This will seize the seat and disconnect the other user.",
-            yes_label="Force Reconnect",
-            no_label="Cancel",
+        # Device is still offline / held by another user -> use unified offline flow (force prompt only)
+        self._show_seat_offline_dialog(
+            seat,
+            gateway=gateway,
+            device_id=device_id,
+            force_prompt_only=True,
+            on_success=lambda: self._finish_seat_connect_after_seizure_decision(seat, gateway, port),
+            on_decline=lambda: self._abort_seat_connect_after_seizure_decline(seat, gateway, port, device_id),
         )
-        if confirmed:
-            self.takeover_seat(seat, gateway=gateway, silent=True)
-        else:
-            self._abort_seat_connect_after_seizure_decline(seat, gateway, port, device_id)
 
     def _abort_seat_connect_after_seizure_decline(self, seat, gateway, port, device_id):
         """Tear down the half-state seat connection when the user declines a seizure.
