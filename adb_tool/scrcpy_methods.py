@@ -40,6 +40,14 @@ except ImportError:
     _check_embedded_mirror = None
 
 
+def _safe_stop_client(client):
+    """Call client.stop() without blocking the caller — ignores all errors."""
+    try:
+        client.stop()
+    except Exception:
+        pass
+
+
 def _run_scrcpy_canary(device_id, adb_path, bitrate, max_fps, max_size,
                        timeout=2.0):
     """Run scrcpy_canary.py as a subprocess to probe py_scrcpy_sdk.
@@ -1154,17 +1162,16 @@ class ScrcpyMixin:
     def _stop_in_window_mirror(self):
         """Stop the in-window scrcpy client."""
         self.mirror_closing = True
-        # Stop the first-frame watchdog so it doesn't fire after teardown.
         self._stop_mirror_watchdog()
         self.mirror_first_frame_received = False
         self.mirror_last_frame_time = None
-        if self.mirror_client is not None:
-            try:
-                self.mirror_client.stop()
-            except Exception:
-                pass
-            self.mirror_client = None
-        # Disable nav buttons
+        client = self.mirror_client
+        self.mirror_client = None
+        if client is not None:
+            # client.stop() can block waiting for the socket — run it off
+            # the main thread so the UI can immediately start the next mirror.
+            import threading as _t
+            _t.Thread(target=_safe_stop_client, args=(client,), daemon=True).start()
         if hasattr(self, 'mirror_nav_buttons'):
             for btn in self.mirror_nav_buttons:
                 btn.setEnabled(False)

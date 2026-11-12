@@ -899,22 +899,14 @@ class DeviceMixin:
             self.log("Deselected device")
             return
 
-        # If device is changing, switch to the new device's per-device state.
-        # The state for the outgoing device is saved (running streams, log
-        # history, view) and restored when the user comes back. The state
-        # for the new device (or defaults if first time) is loaded and any
-        # streams that were running for that device are restarted.
         if self.current_device != device_id:
             self._switch_to_device_state(device_id)
         else:
-            # Clicking the already-selected device is handled in the toggle
-            # branch at the top of this method; we shouldn't get here.
             self.current_device = device_id
 
         # Update button appearance
         for bid, btn in self.device_buttons.items():
             if bid == device_id:
-                # Selected: Green background, red on hover (to indicate disconnect)
                 btn.setStyleSheet(f"""
                     QPushButton {{
                         background-color: {self.colors['success']};
@@ -933,21 +925,15 @@ class DeviceMixin:
             else:
                 btn.setStyleSheet("")
 
-        # Look up device info from the cache we built during refresh_devices,
-        # so a click is instant. If we don't know the device yet, fall back
-        # to a synchronous adb query — better than blocking the UI thread
-        # every single time.
         model = 'Unknown'
         status = 'unknown'
 
-        # Try to find the device in cached_devices
         for d in getattr(self, 'cached_devices', []):
             if d.get('id') == device_id:
                 model = d.get('model') or d.get('product') or 'Unknown'
                 status = d.get('status') or 'unknown'
                 break
         else:
-            # Fallback: cache miss. Run a single, short adb query.
             try:
                 for d in self.adb.get_devices(silent=True):
                     if d.get('id') == device_id:
@@ -957,11 +943,9 @@ class DeviceMixin:
             except Exception:
                 pass
 
-        # For seat devices, try to get seat name and gateway info
         seat_name = ""
         gateway_name = ""
         if device_id.startswith('localhost:'):
-            # This is likely a seat device, try to find seat info
             try:
                 seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
                 for dev_info in seat_sh_devices:
@@ -972,11 +956,9 @@ class DeviceMixin:
             except Exception:
                 pass
 
-        # Format the display string
         if seat_name:
             display_text = f"Seat: {seat_name}"
             if gateway_name:
-                # Extract just the hostname from gateway if it has user@host
                 gw_display = gateway_name.split('@')[-1] if '@' in gateway_name else gateway_name
                 display_text += f" @ {gw_display}"
             display_text += f" - Status: {status}"
@@ -987,12 +969,6 @@ class DeviceMixin:
         self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
 
         self.log(f"Selected device: {device_id}")
-
-        # When device changes, switch the logcat and in-window mirror
-        # to the new device's state (each device's running stream is
-        # tracked separately, so this is an instant switch — the previous
-        # device's stream keeps running in the background).
-        self._switch_to_device_state(device_id)
 
     def _save_current_device_state(self, device_id=None):
         """Save the current logcat/mirror state under the given device id.
@@ -1021,54 +997,48 @@ class DeviceMixin:
            if this device has no saved state yet.
         3. If the new device had logcat/mirror running, restart them
            for the new device so it picks up where it left off.
+        4. If we were already in screen-mirror view, immediately restart
+           the mirror for the new device (regardless of saved state).
         """
-        # Save outgoing device's state under its (still-current) id, then
-        # stop its streams. self.current_device at this point is the
-        # outgoing device — we'll switch it to the new device after.
+        currently_in_screen = self.logs_view == 'screen'
+
         self._save_current_device_state()
         if self.log_running:
-            self.log_running = False  # tells logcat thread to exit
-        if self.mirror_client is not None and self.logs_view == 'screen':
+            self.log_running = False
+        if currently_in_screen and self.mirror_client is not None:
             self._stop_in_window_mirror()
 
-        # Now flip current_device to the new one
         self.current_device = device_id
 
-        # Load new device's state, defaulting to a fresh device
         state = self._device_state.get(device_id, {})
 
-        # Restore logcat filter (applies to the new device's saved text too)
         saved_filter = state.get('logcat_filter', '')
         self.logcat_filter_entry.blockSignals(True)
         self.logcat_filter_entry.setText(saved_filter)
         self.logcat_filter_entry.blockSignals(False)
 
-        # Restore logcat full-text cache and view
         self._logcat_full_text = state.get('logcat_full_text', '')
         saved_view = state.get('logs_view', 'logs')
         if saved_view == 'logcat' and self.logs_view != 'logcat':
-            # Show logcat view
             self.toggle_log_view()
         elif saved_view != 'logcat' and self.logs_view == 'logcat':
-            # Show logs view
             self.toggle_log_view()
 
-        # Refresh the visible widget to show the new device's saved text
         self.logcat_text.clear()
         if self.showing_logcat and self._logcat_full_text:
-            # Re-apply the filter to the restored text
             self._filter_logcat()
 
-        # If the new device had logcat running, restart it
         was_running = state.get('logcat_running', False)
         if was_running:
             self.logcat_button.setText("⏹️ Stop")
-            self.toggle_logcat()  # starts logcat since log_running is False
+            self.toggle_logcat()
 
-        # If the new device had the in-window mirror running, restart it
-        was_mirror = state.get('mirror_running', False)
-        if was_mirror and self.logs_view == 'screen':
-            QTimer.singleShot(300, self._start_in_window_mirror)
+        # If we're in screen-mirror view, always start the mirror immediately
+        # for the new device — no saved-state check needed.
+        if currently_in_screen:
+            QTimer.singleShot(50, self._start_in_window_mirror)
+        elif state.get('mirror_running', False) and self.logs_view == 'screen':
+            QTimer.singleShot(50, self._start_in_window_mirror)
 
     def on_device_selected(self, selection=None, silent=False):
         """Legacy method - now using button-based device selection"""
