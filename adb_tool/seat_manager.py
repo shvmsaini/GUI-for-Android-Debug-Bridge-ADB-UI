@@ -523,7 +523,13 @@ class SeatPortManager:
 
     def is_portforward_connected(self, gateway):
         """Check if port forward is connected"""
-        return self.connected_portforward == gateway
+        if not self.connected_portforward or not gateway:
+            return False
+        if self.connected_portforward == gateway:
+            return True
+        cp_host = self.connected_portforward.split('@')[-1].strip()
+        gw_host = gateway.split('@')[-1].strip()
+        return bool(cp_host and gw_host and cp_host == gw_host)
 
     def kill_seat_tunnel(self, seat, gateway=None):
         """Kill any stale SSH tunnels associated with this seat.

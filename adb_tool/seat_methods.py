@@ -3138,54 +3138,34 @@ class SeatMixin:
         if hasattr(self, 'pf_search_entry'):
             pf_filter = self.pf_search_entry.text().lower().strip()
 
-        # Cheap pre-check: skip the rebuild if nothing we care about
-        # (cached data + filter text) has changed since the last
-        # refresh. This avoids tearing down and re-creating up to 50
-        # seat buttons × 3 child widgets each on every 5-second timer
-        # tick, which was the main source of the visible UI stutter.
-        # The reconciliation block below still runs (so dropped-seat
-        # detection continues to advance), but the expensive button
-        # rebuild is skipped.
+        # Fetch data from external sources only if refetch=True or no cache exists
+        if refetch or getattr(self, '_cached_seat_sh_devices', None) is None:
+            self._cached_seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
+        if refetch or getattr(self, '_cached_pf_status', None) is None:
+            self._cached_pf_status = self.seat_port_manager.get_portforward_status()
+
+        seat_sh_devices = self._cached_seat_sh_devices or []
+        pf_status = self._cached_pf_status
+
         prev_filter_fp = getattr(self, '_seat_lists_filter_fp', None)
         prev_data_fp = getattr(self, '_seat_lists_data_fp', None)
         current_filter_fp = (seat_filter, pf_filter)
+        current_data_fp = (
+            tuple((d.get('seat'), d.get('gateway'), d.get('status'), d.get('device')) for d in seat_sh_devices),
+            (bool(pf_status and pf_status.get('active')), str(pf_status.get('rack') if pf_status else ''), str(pf_status.get('headend') if pf_status else '')),
+            tuple(sorted(getattr(self.seat_port_manager, 'connected_seats', {}).items())),
+            getattr(self.seat_port_manager, 'connected_portforward', None),
+        )
         skip_rebuild = (
             prev_filter_fp == current_filter_fp
-            and prev_data_fp is not None
+            and prev_data_fp == current_data_fp
             and not refetch
         )
 
-        # Fetch data from external sources only if refetch=True or no cache exists
-        if refetch or not hasattr(self, '_cached_seat_sh_devices'):
-            self._cached_seat_sh_devices = self.seat_port_manager.get_devices_from_seat_sh()
-        if refetch or not hasattr(self, '_cached_pf_status'):
-            self._cached_pf_status = self.seat_port_manager.get_portforward_status()
-
-        seat_sh_devices = self._cached_seat_sh_devices
-        pf_status = self._cached_pf_status
-
-        # Reconcile internal connection state against seat.sh output.
-        # A seat that we previously marked connected (via the click handler)
-        # but no longer appears in `seat.sh devices` has dropped in the
-        # background — clear our internal flag so the highlight goes away.
-        #
-        # Grace period: If seat.sh is slow or intermittently fails, don't
-        # clear connected state immediately. Wait for 2 consecutive
-        # failures (was 3, but the rebuild-fingerprint short-circuit now
-        # makes the UI update cheap on the next change, so the cost of
-        # a single transient failure is just one extra redraw). The user
-        # complained about a green seat button staying green long after
-        # ``seat.sh devices`` was empty — 2 ticks (~13s with the
-        # staggered timer) is a much better UX than 3 (~20s).
         current_seat_names = {d['seat'] for d in seat_sh_devices if d.get('seat')}
         if not hasattr(self, '_seat_sh_missing_count'):
             self._seat_sh_missing_count = {}
 
-        # Track whether the reconciliation actually changed the
-        # connected-set. If so, the button highlight has to redraw even
-        # if the rest of the data fingerprint is identical — otherwise
-        # the green button stays green until something else triggers a
-        # rebuild (and that something else may never come).
         reconciliation_changed = False
         for seat in list(self.seat_port_manager.connected_seats.keys()):
             if seat not in current_seat_names:
@@ -3200,24 +3180,13 @@ class SeatMixin:
                     reconciliation_changed = True
                 self._seat_sh_missing_count[seat] = 0
 
-        # Sync internal state with externally-connected seats (seat.sh auto-connect / external tools).
-        # When a device is connected via regular ADB or any means outside our click handler, we need
-        # to reflect that in our internal connected_seats map so the UI highlights it correctly.
-        # Only add seats that appear in seat.sh devices but aren't in our internal map.
         for dev_info in seat_sh_devices:
             seat = dev_info.get('seat')
             gateway = dev_info.get('gateway')
             if seat and gateway and seat not in self.seat_port_manager.connected_seats:
-                # Mark as connected so UI highlights it (even if we didn't initiate the connection)
                 self.seat_port_manager.mark_seat_connected(seat, gateway)
                 reconciliation_changed = True
 
-        # If the cached data is unchanged and we're not being asked to
-        # re-fetch, also skip the (expensive) button rebuild below. The
-        # reconciliation above already ran, so seat-highlight state
-        # stays correct for the next rebuild — UNLESS reconciliation
-        # actually flipped something, in which case we MUST rebuild or
-        # the stale green button sticks around.
         if skip_rebuild and not reconciliation_changed:
             return
 
@@ -3702,30 +3671,8 @@ class SeatMixin:
         # Record the fingerprints of what we just rendered so the next
         # ``refresh_seat_port_lists_async`` tick (5s later) can short-
         # circuit if neither the search filter nor the underlying data
-        # has changed. Captured AFTER all status / connected-state
-        # reconciliation is done, so the fingerprints include the
-        # current highlight / icon for each row.
-        self._seat_lists_filter_fp = (seat_filter, pf_filter)
-        # Build a tuple of (seat, gateway, port, status, is_connected)
-        # for visible seats and (gateway, headend, seat, port, status,
-        # is_connected) for visible pf rows. ``is_connected`` is the
-        # *post-reconciliation* highlight flag (the green / red
-        # styling), so a seat going online / offline alone flips the
-        # fp and triggers a rebuild.
-        seat_fp = tuple(
-            (e['seat'], e['gateway'], str(e.get('port', '')),
-             str(e.get('status', '')).lower(),
-             bool(e.get('_is_connected', False)))
-            for e in top_seats
-        )
-        pf_fp = tuple(
-            (e.get('gateway', ''), e.get('headend', '').strip(),
-             e.get('seat', ''), str(e.get('port', '')),
-             str(e.get('status', '')).lower(),
-             bool(e.get('_is_connected', False)))
-            for e in top_pf
-        )
-        self._seat_lists_data_fp = (seat_fp, pf_fp)
+        self._seat_lists_filter_fp = current_filter_fp
+        self._seat_lists_data_fp = current_data_fp
 
     def _on_seat_clicked(self, entry, source_button=None):
         """Handle seat button click"""
@@ -5991,10 +5938,9 @@ class SeatMixin:
                     or any(ind.lower() in stdout.lower() for ind in error_indicators)
                 )
 
-                # Verify actual status from the script / control socket
                 is_active = False
+                status = None
                 if not has_error:
-                    # Give background SSH daemon up to 2 seconds to bind ports and write state
                     for _ in range(4):
                         time.sleep(0.5)
                         status = self.seat_port_manager.get_portforward_status()
@@ -6002,14 +5948,21 @@ class SeatMixin:
                             is_active = True
                             break
 
-                self._cached_pf_status = None
                 if is_active:
+                    self._cached_pf_status = status
+                    current_rack = (status.get('rack') if status else None) or gateway_host
+                    self.last_pf_active = True
+                    self.last_active_rack = current_rack
                     self.seat_port_manager.mark_portforward_connected(gateway)
                     self.log(f"Port forward connected for {gateway} (headend: {partition})", "INFO")
-                    self.update_status(f"Port forward connected")
+                    self.log(f"Port forward is now active: Rack {current_rack}", "INFO")
+                    self.update_status("Port forward connected")
                     self.run_on_main_thread(self._sync_refresh_panels)
                     self.run_on_main_thread(self._finalize_portforward_busy)
                 else:
+                    self._cached_pf_status = {'active': False}
+                    self.last_pf_active = False
+                    self.last_active_rack = None
                     self.seat_port_manager.mark_portforward_disconnected()
                     error = stderr.strip() or stdout.strip() or f"Port forward failed to become active (script code {returncode})"
                     self.log(f"Failed to set up port forward: {error}", "ERROR")
@@ -6018,7 +5971,9 @@ class SeatMixin:
                     self.run_on_main_thread(self._finalize_portforward_busy)
             except Exception as e:
                 self.seat_port_manager.mark_portforward_disconnected()
-                self._cached_pf_status = None
+                self._cached_pf_status = {'active': False}
+                self.last_pf_active = False
+                self.last_active_rack = None
                 self.log(f"Error setting up port forward: {str(e)}", "ERROR")
                 self.update_status("Error setting up port forward")
                 self.run_on_main_thread(self._sync_refresh_panels)
@@ -6065,22 +6020,26 @@ class SeatMixin:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
 
                 self.seat_port_manager.mark_portforward_disconnected()
-                self._cached_pf_status = None
+                self._cached_pf_status = {'active': False}
+                self.last_pf_active = False
+                self.last_active_rack = None
                 if result.returncode == 0:
                     self.log("Port forward stopped", "INFO")
                     self.update_status("Port forward stopped")
-                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                    self.run_on_main_thread(self._sync_refresh_panels)
                 else:
                     error = result.stderr or result.stdout or "Unknown error"
                     self.log(f"Failed to stop port forward: {error}", "ERROR")
                     self.update_status("Failed to stop port forward")
-                    self.run_on_main_thread(self.refresh_seat_port_lists)
+                    self.run_on_main_thread(self._sync_refresh_panels)
             except Exception as e:
                 self.seat_port_manager.mark_portforward_disconnected()
-                self._cached_pf_status = None
+                self._cached_pf_status = {'active': False}
+                self.last_pf_active = False
+                self.last_active_rack = None
                 self.log(f"Error stopping port forward: {str(e)}", "ERROR")
                 self.update_status("Error stopping port forward")
-                self.run_on_main_thread(self.refresh_seat_port_lists)
+                self.run_on_main_thread(self._sync_refresh_panels)
 
         threading.Thread(target=do_disconnect, daemon=True).start()
 
