@@ -1579,11 +1579,11 @@ class GatewayMixin:
                 return
 
             output_dlg = QDialog(explorer)
-            output_dlg.setWindowTitle(f"\u25b6 {cmd[:60]}{'\u2026' if len(cmd) > 60 else ''}")
+            output_dlg.setWindowTitle(f"▶ {cmd[:60]}{'…' if len(cmd) > 60 else ''}")
             output_dlg.setMinimumSize(700, 400)
             o_layout = QVBoxLayout(output_dlg)
             o_layout.setSpacing(6)
-            status = QLabel("\u23f3 Running\u2026")
+            status = QLabel("⏳ Running…")
             o_layout.addWidget(status)
             output = QTextEdit()
             output.setReadOnly(True)
@@ -1712,7 +1712,7 @@ class GatewayMixin:
                                         except Exception:
                                             pass
                                         ui.call.emit(lambda: (
-                                            status.setText("\u274c Cancelled"),
+                                            status.setText("❌ Cancelled"),
                                             output.setPlainText("(cancelled by user)"),
                                         ))
                                         return
@@ -1747,14 +1747,14 @@ class GatewayMixin:
                     self.log(f"Gateway: ran '{cmd.splitlines()[0][:60]}', exit={code}", "INFO")
 
                     def apply():
-                        status.setText(f"\u2705 Done (exit {code})" if code == 0 else f"\u26a0\ufe0f Exit {code}")
+                        status.setText(f"✅ Done (exit {code})" if code == 0 else f"⚠️ Exit {code}")
                         output.setPlainText(combined or "(no output)")
                         output.moveCursor(QTextCursor.MoveOperation.End)
                     ui.call.emit(apply)
                 except Exception as e:
                     err = str(e)
                     def apply_err():
-                        status.setText("\u274c Failed")
+                        status.setText("❌ Failed")
                         output.setPlainText(err)
                     ui.call.emit(apply_err)
                     self.log(f"Gateway: run failed: {err}", "ERROR")
