@@ -782,7 +782,7 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                     def apply():
                         status.setText(f"✅ Done (exit {code})" if code == 0 else f"⚠️ Exit {code}")
                         output.setPlainText(out or "(no output)")
-                        output.moveCursor(QTextCursor.End)
+                        output.moveCursor(QTextCursor.MoveOperation.End)
                     ui.call.emit(apply)
                 except Exception as e:
                     err = str(e)
