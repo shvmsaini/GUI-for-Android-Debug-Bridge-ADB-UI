@@ -2288,6 +2288,15 @@ def _run_post_install_setup(sh, log):
     """Run the seat-side post-install setup the user requested. Each step
     is best-effort: failures are logged at WARNING level but don't abort
     the install (the key is already written by the time we get here).
+
+    Steps:
+      1. export ANDROID_DATA=/data + PATH (some seat images need it)
+      2. ulimit -v unlimited (work around per-process VM limits)
+      3. setprop persist.service.adb.enable 1 (persist adbd across reboots)
+      4. setprop service.adb.tcp.port 5555 (TCP mode for adb connect)
+      5. setprop ctl.start adbd (ensure adbd is running — added per the
+         user's reconnect snippet so first-reconnection paths apply the
+         same property setup the install path uses)
     """
     # 1. ANDROID_DATA + PATH — needed before running anything that touches
     #    /data paths on some seat images.
@@ -2315,6 +2324,16 @@ def _run_post_install_setup(sh, log):
     out, code = sh.run("setprop service.adb.tcp.port 5555", timeout=10)
     if code != 0:
         log(f"KEYS: post-install setprop service.adb.tcp.port failed: {out.strip()}", "WARNING")
+
+    # 5. ctl.start adbd — ensure adbd is started. Harmless no-op if
+    #    adbd is already running; useful after a `ctl.stop` from a
+    #    concurrent seizure/takeover, or when adbd was disabled by
+    #    a prior session and the property-only changes above aren't
+    #    enough on their own. Mirrors the user's reconnect snippet
+    #    for first-reconnection scenarios.
+    out, code = sh.run("setprop ctl.start adbd", timeout=10)
+    if code != 0:
+        log(f"KEYS: post-install setprop ctl.start adbd failed: {out.strip()}", "WARNING")
     else:
         log("KEYS: post-install setup complete", "INFO")
 
@@ -3042,17 +3061,54 @@ class SeatMixin:
             normal_success = False
 
             if device_id:
+                port = self._port_from_seat_dev(device_id)
                 try:
-                    self.adb.run_command(f"-s {device_id} reconnect device", timeout=3)
-                    time.sleep(0.3)
-                    self.adb.run_command(f"disconnect {device_id}", timeout=3)
-                    time.sleep(0.2)
-                    self.adb.run_command(f"connect {device_id}", timeout=4)
-                    time.sleep(0.8)
-                    devices = self.adb.get_devices(silent=True)
-                    status = next((d.get('status') for d in devices if d.get('id') == device_id), None)
-                    if status == 'device':
-                        normal_success = True
+                    # First-reconnection path: clean the port + adb
+                    # transport + bring up a fresh SSH tunnel before the
+                    # new adb handshake. Mirrors the user's snippet for
+                    # the "first reconnection" case — the Fast path
+                    # below (``reconnect device`` + ``disconnect`` +
+                    # ``connect``) doesn't tear down a wedged SSH tunnel
+                    # or a stale LISTENer, so the device frequently
+                    # stays offline if either is wedged. Only fall back
+                    # to the cheap path when the helper says no
+                    # (e.g. no port info or port won't free).
+                    if port:
+                        helper_result = self.seat_port_manager.reconnect_via_fresh_tunnel_with_retry(
+                            seat, gateway, port,
+                            adb_path=self.settings.get('adb_path', ''),
+                        )
+                        if helper_result.get('ok'):
+                            self.log(
+                                f"Offline reconnect: {seat} tunnel + device "
+                                f"online after {helper_result.get('attempt')}/"
+                                f"{helper_result.get('attempts')} attempt(s) "
+                                f"(state={helper_result.get('state')!r})",
+                                "INFO",
+                            )
+                            normal_success = (helper_result.get('state') == 'device')
+                        else:
+                            self.log(
+                                f"Offline reconnect via helper failed for "
+                                f"{seat} after {helper_result.get('attempts')}/"
+                                f"3 attempt(s): {helper_result.get('error')}; "
+                                "falling back to plain adb reconnect dance",
+                                "DEBUG",
+                            )
+
+                    if not normal_success and not port:
+                        # Cheap path: only used when there's no port to
+                        # anchor a tunnel rebuild. Original behaviour.
+                        self.adb.run_command(f"-s {device_id} reconnect device", timeout=3)
+                        time.sleep(0.3)
+                        self.adb.run_command(f"disconnect {device_id}", timeout=3)
+                        time.sleep(0.2)
+                        self.adb.run_command(f"connect {device_id}", timeout=4)
+                        time.sleep(0.8)
+                        devices = self.adb.get_devices(silent=True)
+                        status = next((d.get('status') for d in devices if d.get('id') == device_id), None)
+                        if status == 'device':
+                            normal_success = True
                 except Exception as e:
                     self.log(f"Fast local reconnect failed for {seat}: {e}", "DEBUG")
 
@@ -4418,31 +4474,38 @@ class SeatMixin:
             if hasattr(self, '_user_disconnected_seats'):
                 self._user_disconnected_seats.discard(seat)
             try:
-                # Kill any stale SSH tunnels for this seat before connecting.
-                # `seat.sh auto-connect` runs `ssh -f -N -L <port>:<seat>:5555 <gw>`
-                # and does NOT reap it on disconnect; orphans keep the local port
-                # bound and cause "Address already in use" on the next attempt.
-                self.seat_port_manager.kill_seat_tunnel(seat, gateway)
-
-                # Also kill whatever process is currently LISTENing on the
-                # previously-saved port for this seat. `pkill -f` above
-                # matches ssh command lines, but the LISTEN socket can be
-                # held by an orphaned adb / ssh wrapper whose argv0 no
-                # longer matches our patterns — those slips through pkill
-                # and bites us as `bind: Address already in use` on the
-                # next `auto-connect`. Mirrors the fish snippet:
-                #
-                #     set tunnel_pid (lsof -tiTCP:"$PORT" -sTCP:LISTEN)
-                #     if test -n "$tunnel_pid"; kill $tunnel_pid; end
-                #
-                # We look up the saved port from ~/.cache/adb-seat-ports
-                # BEFORE running auto-connect — that is the port the script
-                # will try to bind to. If no saved entry exists, auto-connect
-                # will pick a fresh port via findFreePort and there's
-                # nothing to free.
+                # Pre-cleanup for the saved port: kill any stale SSH
+                # tunnel + LISTENer + adb transport and wait for the
+                # port to actually free before we build the env. Mirrors
+                # the fish snippet used to recover from wedged
+                # connections; the helper runs in cleanup-only mode here
+                # because ``seat.sh auto-connect`` runs later (after
+                # ``_install_adb_key_pre_connect``) — the install must
+                # happen on a fresh tunnel, not the half-dead one. We
+                # pass '' for ``port`` when there's no saved entry yet
+                # (first connect ever); the helper short-circuits the
+                # port-bound steps cleanly in that case.
                 _saved_port = self._lookup_saved_seat_port(seat, gateway)
-                if _saved_port:
-                    self.seat_port_manager.kill_port_listener(_saved_port)
+                _cleanup = self.seat_port_manager.reconnect_via_fresh_tunnel(
+                    seat, gateway,
+                    port=_saved_port,  # '' when no saved entry — helper skips port steps
+                    adb_path=self.settings.get('adb_path', ''),
+                    run_auto_connect=False,
+                )
+                if not _cleanup.get('ok'):
+                    # Port stayed bound — don't bother running auto-connect,
+                    # it's just going to fail with 'Address already in use'.
+                    err = _cleanup.get('error') or 'port cleanup failed'
+                    self.log(
+                        f"Pre-cleanup failed for {seat} on port "
+                        f"{_cleanup.get('port') or '?'}: {err}",
+                        "ERROR",
+                    )
+                    self.update_status(
+                        f"❌ Stale SSH tunnel won't release port "
+                        f"{_cleanup.get('port') or '?'} — see logs"
+                    )
+                    return
 
                 # Resolve script path (custom override or bundled fallback)
                 script_path = self.seat_port_manager._get_seat_script_path()
@@ -4992,7 +5055,10 @@ class SeatMixin:
                         # silently drops QTimer.singleShot() from worker
                         # threads.
                         self.run_on_main_thread(
-                            lambda: self._reconnect_seat_device_after_install(seat_dev),
+                            lambda s=seat, g=gateway, sd=seat_dev:
+                                self._reconnect_seat_device_after_install(
+                                    sd, seat=s, gateway=g,
+                                ),
                         )
                 else:
                     # Key written but adbd not restarted. The new key takes
@@ -5120,7 +5186,7 @@ class SeatMixin:
         )
         return True
 
-    def _reconnect_seat_device_after_install(self, seat_dev):
+    def _reconnect_seat_device_after_install(self, seat_dev, seat=None, gateway=None):
         """Force adb to re-handshake the seat device so the freshly-appended
         ADB key takes effect. Schedules refresh_devices() once complete.
         Must be called on the GUI thread.
@@ -5139,6 +5205,20 @@ class SeatMixin:
 
         `kill-server` would also work but disconnects every other device,
         which we explicitly want to avoid.
+
+        When ``seat`` and ``gateway`` are supplied (the common path —
+        install flows always know which seat the device belongs to), we
+        route the reconnect through
+        ``SeatPortManager.reconnect_via_fresh_tunnel_with_retry`` so a
+        stale SSH tunnel + LISTENer from a previous failed connect is
+        also cleaned up, and the bring-up is retried up to 3 times
+        before we give up. This is the first-reconnection path from the
+        user's snippet: kill the listener on the port, drop the adb
+        transport, wait for the port to free, ``seat.sh auto-connect``,
+        wait for the new LISTENer, ``adb connect``, ``get-state``,
+        retry the whole sequence on transient failure. Falls back to
+        the simple ``adb disconnect`` + ``adb connect`` dance when the
+        seat/gateway can't be resolved.
         """
         self.log(f"Reconnecting {seat_dev} to pick up new ADB key...", "INFO")
 
@@ -5147,9 +5227,54 @@ class SeatMixin:
             # Some devices are slow to restart adbd, so we wait 5s instead of 3s.
             time.sleep(5)
             try:
-                self.adb.run_command(f"disconnect {seat_dev}")
-                time.sleep(1)
-                self.adb.run_command(f"connect {seat_dev}")
+                # Resolve seat/gateway if the caller didn't pass them
+                # (the install flow always knows; legacy callers may not).
+                _seat = seat
+                _gateway = gateway
+                if not _seat or not _gateway:
+                    parsed = self._parse_seat_dev(seat_dev)
+                    _seat = parsed['seat']
+                    _gateway = parsed['gateway']
+                port = self._port_from_seat_dev(seat_dev)
+
+                # Prefer the retry-style wrapper (matches the user's
+                # reconnect shell script): kills the stale LISTENer +
+                # adb transport + waits for port release + auto-connect
+                # + waits for new LISTENer + adb connect + get-state,
+                # and retries up to 3 times before giving up. Useful
+                # when adbd was just restarted — first attempt may
+                # catch adbd mid-restart, second/third should land
+                # cleanly. Falls back to the cheap ``adb disconnect``
+                # + ``adb connect`` dance when we lack the seat/gateway
+                # context to rebuild the tunnel.
+                if _seat and _gateway and port:
+                    result = self.seat_port_manager.reconnect_via_fresh_tunnel_with_retry(
+                        _seat, _gateway, port,
+                        adb_path=self.settings.get('adb_path', ''),
+                    )
+                    if result.get('ok'):
+                        self.log(
+                            f"Post-install reconnect: {_seat} on "
+                            f"localhost:{port} online "
+                            f"(state={result.get('state')!r})",
+                            "INFO",
+                        )
+                    else:
+                        self.log(
+                            f"Post-install reconnect via helper failed for "
+                            f"{seat_dev}: {result.get('error')}; falling "
+                            "back to plain adb disconnect/connect",
+                            "WARNING",
+                        )
+                        self.adb.run_command(f"disconnect {seat_dev}")
+                        time.sleep(1)
+                        self.adb.run_command(f"connect {seat_dev}")
+                else:
+                    # Fallback: no seat/gateway context. Old behaviour
+                    # — just bounce the adb transport.
+                    self.adb.run_command(f"disconnect {seat_dev}")
+                    time.sleep(1)
+                    self.adb.run_command(f"connect {seat_dev}")
             except Exception as e:
                 self.log(f"Reconnect {seat_dev} failed: {e}", "WARNING")
             # Marshal to GUI thread — PyQt6 silently drops
@@ -5157,6 +5282,53 @@ class SeatMixin:
             self.run_on_main_thread(lambda: self.refresh_devices())
 
         threading.Thread(target=do_reconnect, daemon=True).start()
+
+    @staticmethod
+    def _port_from_seat_dev(seat_dev):
+        """Extract the port from a ``localhost:<port>`` device id. Returns '' on miss.
+
+        Used by the post-install reconnect to decide whether the helper has
+        enough information to do a full port-aware reconnect (seat_dev
+        carries the port; seat/gateway are looked up separately).
+        """
+        if not seat_dev:
+            return ''
+        # Tolerate both 'localhost:60100' and bare '60100' shapes — the
+        # watcher sometimes hands us whichever the adb-server stored.
+        dev = str(seat_dev).strip()
+        if ':' in dev:
+            dev = dev.rsplit(':', 1)[-1]
+        dev = dev.strip()
+        return dev if dev.isdigit() else ''
+
+    def _parse_seat_dev(self, seat_dev):
+        """Best-effort recovery of ``{seat, gateway}`` from a seat device id.
+
+        Falls back to ``connected_seats`` (the last-known mapping) when
+        the port lookup is ambiguous — multiple seats can share the same
+        port at different times, but ``connected_seats`` only has the one
+        we currently think is live, which is the right answer in the
+        post-install reconnect context.
+        """
+        result = {'seat': '', 'gateway': ''}
+        if not seat_dev:
+            return result
+        port = self._port_from_seat_dev(seat_dev)
+        if not port:
+            return result
+        try:
+            for entry in self.seat_port_manager.load_history('seat'):
+                if (entry.get('port') or '').strip() == port:
+                    result['seat'] = entry.get('seat') or ''
+                    result['gateway'] = entry.get('gateway') or ''
+                    if result['seat'] and result['gateway']:
+                        return result
+        except Exception:
+            pass
+        # Fallback: connected_seats maps seat → gateway (no port info),
+        # so we can't pinpoint the seat from the port alone here. The
+        # caller should pass seat/gateway explicitly when it knows them.
+        return result
 
     def _retry_install_adb_key_with_new_mtc_password(self, seat, gateway, adb_key,
                                                      gateway_password, seat_dev):

@@ -1,5 +1,6 @@
 import sys
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -691,6 +692,469 @@ class SeatPortManager:
             time.sleep(0.3)
         except Exception:
             pass
+
+    def reconnect_via_fresh_tunnel(self, seat, gateway, port, adb_path='',
+                                   wait_release_iters=20, wait_release_delay=0.25,
+                                   wait_listen_iters=40, wait_listen_delay=0.25,
+                                   get_state_iters=5, get_state_delay=1.0,
+                                   tunnel_timeout=30, run_auto_connect=True):
+        """Re-establish a seat's SSH tunnel + adb transport from a known-clean state.
+
+        Mirrors the fish workflow used when a stale SSH tunnel or wedged
+        ``localhost:<port>`` LISTENer is preventing ``adb connect`` from
+        coming up clean:
+
+          1. Kill any process LISTENing on the port (orphaned ssh / adb /
+             wrapped-child — anything ``kill_seat_tunnel``'s pkill patterns
+             may have missed).
+          2. Drop the host-side adb transport: ``adb disconnect localhost:<port>``.
+          3. Wait (up to ``wait_release_iters * wait_listen_delay`` seconds)
+             for the kernel to release the port — bail with an error if it
+             stays bound (the previous listener didn't die, or another
+             process grabbed it; either way a fresh ``auto-connect`` will
+             just fail with ``bind: Address already in use``).
+          4. Run ``seat.sh auto-connect`` to bring up a brand-new SSH tunnel.
+          5. Wait (up to ``wait_listen_iters * wait_listen_delay`` seconds)
+             for the new LISTENer to appear. The wait is platform-aware:
+             POSIX uses ``nc -z`` (matches the snippet literally); Windows
+             and any platform without ``nc`` fall back to a pure-Python
+             ``socket.create_connection`` probe.
+          6. Issue ``adb connect localhost:<port>``.
+          7. Poll ``adb -s localhost:<port> get-state`` until it reports
+             ``device`` (with ``get_state_iters * get_state_delay``
+             seconds of budget). The device may briefly show as
+             ``offline`` / ``unauthorized`` while the SSH tunnel
+             finishes handshaking with adbd, even though the host-side
+             port is listening — single-shot checks false-positive
+             here, so we poll.
+
+        Step 4 onward can be skipped with ``run_auto_connect=False`` — useful
+        when the caller needs to do something between cleanup and the new
+        tunnel (e.g. ``connect_seat`` installs the ADB key before bringing
+        the tunnel up so the device comes up as 'device' instead of
+        'unauthorized'). In that mode the helper still runs steps 1-3
+        (kills the stale listener + adb transport + waits for the port to
+        free), returns ``{'ok': True, ...}`` once the port is free, and
+        leaves the new tunnel + adb connect for the caller.
+
+        Returns a dict::
+
+            {
+              'ok': bool,                # True when get-state == 'device'
+                                         # (full mode) or port released (cleanup-only)
+              'port': str,
+              'state': str | None,       # raw get-state output (full mode only)
+              'tunnel_returncode': int,  # seat.sh auto-connect return code
+                                         # (full mode only)
+              'error': str | None,       # populated when 'ok' is False
+            }
+
+        Args:
+            seat: seat name (e.g. ``seat007``) — used by ``kill_seat_tunnel``
+                for seat-scoped pkill patterns. Per the kill-seat-tunnel-scope
+                memory, the gateway is NEVER used as a tunnel-cleanup pattern.
+            gateway: full ``user@gateway`` string for the SSH target, passed
+                through to ``seat.sh auto-connect``.
+            port: TCP port the seat's ``localhost:<port>`` should bind to.
+                Caller resolves this from ``~/.cache/adb-seat-ports`` (the
+                saved port the script will reuse) or accepts the parameter
+                empty/None to skip the port-bound cleanup entirely.
+            adb_path: absolute path to the ``adb`` binary. Empty falls back
+                to ``shutil.which('adb')`` — same behaviour as the rest of
+                the codebase.
+            wait_release_iters / wait_release_delay: bounds for step 3's
+                port-release wait-loop. Default 20 × 0.25s = 5s.
+            wait_listen_iters / wait_listen_delay: bounds for step 5's
+                new-LISTENer wait-loop. Default 40 × 0.25s = 10s.
+            get_state_iters / get_state_delay: bounds for step 7's
+                ``get-state`` poll. Default 5 × 1.0s = 5s.
+            tunnel_timeout: subprocess timeout for ``seat.sh auto-connect``.
+            run_auto_connect: when True (default), run the full snippet
+                (steps 4-7). When False, stop after step 3 so the caller
+                can run its own pre-tunnel work (e.g. ADB-key install).
+        """
+        result = {
+            'ok': False,
+            'port': str(port or ''),
+            'state': None,
+            'tunnel_returncode': None,
+            'error': None,
+        }
+        port_str = str(port or '').strip()
+        if not port_str.isdigit():
+            result['error'] = f'invalid port: {port!r}'
+            return result
+        if not seat or not gateway:
+            result['error'] = f'missing seat={seat!r} or gateway={gateway!r}'
+            return result
+
+        adb = (adb_path or '').strip() or (shutil.which('adb') or 'adb')
+
+        # Resolve the script path using the same custom-override + bundled
+        # fallback the rest of the GUI uses. Sharing this logic keeps the
+        # helper consistent if the user later switches scripts.
+        script_path = self._get_seat_script_path()
+        if not script_path or not os.path.exists(script_path):
+            result['error'] = f'seat script missing: {script_path!r}'
+            return result
+
+        if self.log_callback:
+            self.log_callback(
+                f"reconnect_via_fresh_tunnel: cleaning port {port_str} for "
+                f"{seat} via {gateway} (run_auto_connect={run_auto_connect})",
+                "DEBUG",
+            )
+
+        # 1. Reap any stale SSH tunnels for THIS seat (seat-scoped, never
+        #    gateway-scoped — see kill-seat-tunnel-scope memory).
+        try:
+            self.kill_seat_tunnel(seat, gateway)
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(
+                    f"kill_seat_tunnel during reconnect cleanup failed: {e}",
+                    "DEBUG",
+                )
+
+        # 2. Kill any LISTENer on the port — companion to step 1; covers
+        #    orphaned adb processes and wrapped ssh children that pkill -f
+        #    can miss.
+        try:
+            self.kill_port_listener(port_str)
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(
+                    f"kill_port_listener during reconnect cleanup failed: {e}",
+                    "DEBUG",
+                )
+
+        # 3. Drop the host-side adb transport. `seat.sh auto-connect` runs
+        #    this itself, but doing it here means the subsequent
+        #    port-release wait isn't racing a half-dead adb client.
+        try:
+            subprocess.run(
+                [adb, 'disconnect', f'localhost:{port_str}'],
+                capture_output=True, timeout=5,
+            )
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(
+                    f"adb disconnect during reconnect cleanup failed: {e}",
+                    "DEBUG",
+                )
+
+        # 4. Wait for the kernel to actually release the port. If the
+        #    listener didn't die, we'd rather fail fast here than watch
+        #    `auto-connect` bounce off `bind: Address already in use`.
+        if not self._wait_for_port_free(
+            port_str,
+            iters=wait_release_iters,
+            delay=wait_release_delay,
+        ):
+            result['error'] = (
+                f'port {port_str} still LISTENing after {wait_release_iters} '
+                f'× {wait_release_delay}s — previous SSH tunnel did not die'
+            )
+            if self.log_callback:
+                self.log_callback(result['error'], "ERROR")
+            return result
+
+        if not run_auto_connect:
+            # Caller is going to do its own pre-tunnel work (e.g. ADB-key
+            # install) and bring up the tunnel itself. Report success at
+            # the cleanup boundary so the caller can continue.
+            result['ok'] = True
+            if self.log_callback:
+                self.log_callback(
+                    f"reconnect_via_fresh_tunnel: port {port_str} freed "
+                    f"for {seat}; auto-connect deferred to caller",
+                    "INFO",
+                )
+            return result
+
+        # 5. Bring up a brand-new SSH tunnel. We don't pass a custom env
+        #    (SSH_ASKPASS / known_hosts / DISPLAY) here — those are the
+        #    caller's responsibility, set up in connect_seat(). This helper
+        #    is meant to run AFTER connect_seat has already prepared env,
+        #    OR in a no-auth-required context (auto-connect relies on
+        #    keys / ssh-agent for the per-call SSH, not passwords).
+        try:
+            tunnel = subprocess.run(
+                [script_path, 'auto-connect', seat, gateway],
+                capture_output=True, text=True, timeout=tunnel_timeout,
+            )
+            result['tunnel_returncode'] = tunnel.returncode
+            stdout = (tunnel.stdout or '').strip()
+            stderr = (tunnel.stderr or '').strip()
+        except subprocess.TimeoutExpired:
+            result['error'] = (
+                f'seat.sh auto-connect timed out after {tunnel_timeout}s'
+            )
+            if self.log_callback:
+                self.log_callback(result['error'], "ERROR")
+            return result
+        except Exception as e:
+            result['error'] = f'seat.sh auto-connect failed: {e}'
+            if self.log_callback:
+                self.log_callback(result['error'], "ERROR")
+            return result
+
+        if tunnel.returncode != 0:
+            result['error'] = (
+                f'seat.sh auto-connect returned {tunnel.returncode}; '
+                f'stderr={stderr[:200]}; stdout={stdout[:200]}'
+            )
+            if self.log_callback:
+                self.log_callback(result['error'], "ERROR")
+            return result
+
+        # 6. Wait for the new LISTENer to appear. The fish snippet uses
+        #    `nc -z`; we mirror that on POSIX and use a pure-Python socket
+        #    probe elsewhere (Windows lacks a stock `nc`, and some minimal
+        #    Linux installs don't ship one either).
+        if not self._wait_for_port_listening(
+            port_str,
+            iters=wait_listen_iters,
+            delay=wait_listen_delay,
+        ):
+            result['error'] = (
+                f'no LISTENer on 127.0.0.1:{port_str} after '
+                f'{wait_listen_iters} × {wait_listen_delay}s'
+            )
+            if self.log_callback:
+                self.log_callback(result['error'], "ERROR")
+            return result
+
+        # 7. Register the host-side adb transport against the new tunnel.
+        try:
+            subprocess.run(
+                [adb, 'connect', f'localhost:{port_str}'],
+                capture_output=True, timeout=5,
+            )
+        except Exception as e:
+            result['error'] = f'adb connect failed: {e}'
+            if self.log_callback:
+                self.log_callback(result['error'], "ERROR")
+            return result
+
+        # 8. Verify the device is actually online. Poll get-state — the
+        #    device may briefly show up as 'offline' or 'unauthorized'
+        #    while the SSH tunnel finishes handshaking with adbd, even
+        #    though the host-side port is listening. Mirrors the
+        #    retry-style snippet:
+        #
+        #        for i in {1..N}; do
+        #          STATE=$(adb -s "$DEVICE" get-state 2>/dev/null)
+        #          [ "$STATE" = "device" ] && exit 0
+        #          sleep D
+        #        done
+        #
+        #    The default 5 × 1s = 5s budget matches the original snippet;
+        #    callers that need more headroom (post-install reconnect,
+        #    offline reconnect) pass larger budgets.
+        last_state = None
+        for _ in range(get_state_iters):
+            try:
+                state_proc = subprocess.run(
+                    [adb, '-s', f'localhost:{port_str}', 'get-state'],
+                    capture_output=True, text=True, timeout=5,
+                )
+                last_state = (state_proc.stdout or '').strip()
+                result['state'] = last_state
+                if last_state == 'device':
+                    result['ok'] = True
+                    if self.log_callback:
+                        self.log_callback(
+                            f"reconnect_via_fresh_tunnel: {seat} on "
+                            f"localhost:{port_str} is online (state='device')",
+                            "INFO",
+                        )
+                    return result
+            except Exception as e:
+                result['error'] = f'get-state failed: {e}'
+                last_state = None
+            try:
+                time.sleep(get_state_delay)
+            except Exception:
+                pass
+
+        result['error'] = (
+            f'get-state never reported device after '
+            f'{get_state_iters} × {get_state_delay}s (last={last_state!r})'
+        )
+
+        if self.log_callback:
+            self.log_callback(
+                f"reconnect_via_fresh_tunnel: {seat} tunnel up but device "
+                f"not online (last state={last_state!r}); {result['error']}",
+                "WARNING",
+            )
+        return result
+
+    # Per-step timings mirroring the user's reconnect shell script
+    # (20 × 0.5s port release, 30 × 1s tunnel-ready wait, 10 × 2s
+    # get-state poll). Kept as module-level constants so callers can
+    # tweak any of them without touching the helper signature.
+    _SCRIPT_RELEASE_ITERS = 20
+    _SCRIPT_RELEASE_DELAY = 0.5
+    _SCRIPT_LISTEN_ITERS = 30
+    _SCRIPT_LISTEN_DELAY = 1.0
+    _SCRIPT_STATE_ITERS = 10
+    _SCRIPT_STATE_DELAY = 2.0
+
+    def reconnect_via_fresh_tunnel_with_retry(self, seat, gateway, port,
+                                              adb_path='', max_attempts=3,
+                                              tunnel_timeout=30):
+        """Retry-style wrapper around :meth:`reconnect_via_fresh_tunnel`.
+
+        Mirrors the user's reconnect shell script — runs the full
+        snippet up to ``max_attempts`` times before giving up, using
+        the script's per-step budgets (port release 20×0.5s=10s, tunnel
+        ready 30×1s=30s, adb-ready poll 10×2s=20s) on every attempt.
+
+        Returns a dict with the helper's normal fields plus ``attempt``
+        (1-based index of the attempt that succeeded, or the last one
+        tried) and ``attempts`` (total attempts run, including failures).
+
+        Worst-case wall-clock per attempt: ~10s + 30s + 20s + 30s tunnel
+        timeout = ~90s. With the default ``max_attempts=3`` that's ~270s
+        before the final failure — the same ceiling the shell script
+        enforces.
+        """
+        last_result = {
+            'ok': False,
+            'port': str(port or ''),
+            'state': None,
+            'tunnel_returncode': None,
+            'error': 'no attempts run',
+            'attempt': 0,
+            'attempts': 0,
+        }
+        for attempt in range(1, max_attempts + 1):
+            if self.log_callback:
+                self.log_callback(
+                    f"reconnect_via_fresh_tunnel: attempt {attempt}/{max_attempts} "
+                    f"for {seat} on port {port}",
+                    "INFO",
+                )
+            result = self.reconnect_via_fresh_tunnel(
+                seat, gateway, port,
+                adb_path=adb_path,
+                wait_release_iters=self._SCRIPT_RELEASE_ITERS,
+                wait_release_delay=self._SCRIPT_RELEASE_DELAY,
+                wait_listen_iters=self._SCRIPT_LISTEN_ITERS,
+                wait_listen_delay=self._SCRIPT_LISTEN_DELAY,
+                get_state_iters=self._SCRIPT_STATE_ITERS,
+                get_state_delay=self._SCRIPT_STATE_DELAY,
+                tunnel_timeout=tunnel_timeout,
+            )
+            result['attempt'] = attempt
+            result['attempts'] = attempt
+            last_result = result
+            if result.get('ok'):
+                return result
+            # Don't retry when the port-still-bound bail fired — that's
+            # not a transient failure, the listener is genuinely wedged
+            # and the next attempt will hit the same wall.
+            err = (result.get('error') or '').lower()
+            if 'still listening' in err and 'did not die' in err:
+                if self.log_callback:
+                    self.log_callback(
+                        f"reconnect_via_fresh_tunnel: port {port} won't "
+                        f"release, aborting retries after attempt {attempt}",
+                        "ERROR",
+                    )
+                break
+            if self.log_callback:
+                self.log_callback(
+                    f"reconnect_via_fresh_tunnel: attempt {attempt} failed "
+                    f"({result.get('error')}); "
+                    + ("retrying" if attempt < max_attempts else "giving up"),
+                    "WARNING" if attempt < max_attempts else "ERROR",
+                )
+        return last_result
+
+    @staticmethod
+    def _wait_for_port_free(port_str, iters, delay):
+        """Return True once ``port_str`` is no longer LISTENing on localhost.
+
+        POSIX path uses ``lsof`` (same tool ``kill_port_listener`` already
+        probes with). On Windows / when lsof is missing, fall back to a
+        connect() probe — port is "free" when the OS rejects the connection
+        with ``ConnectionRefusedError`` (i.e. nothing is listening) versus
+        hanging (firewall black-hole) or accepting.
+        """
+        is_windows = sys.platform == 'win32'
+        have_lsof = shutil.which('lsof') is not None
+        for _ in range(iters):
+            listening = False
+            if have_lsof and not is_windows:
+                try:
+                    out = subprocess.run(
+                        ['lsof', '-tiTCP:' + port_str, '-sTCP:LISTEN'],
+                        capture_output=True, text=True, timeout=2,
+                    ).stdout or ''
+                    listening = bool(out.strip())
+                except Exception:
+                    listening = False
+            if not listening:
+                # Sanity check: a connect() that gets immediately refused
+                # confirms the port is free. Skip this on Windows where
+                # firewall black-holes are common and would block here.
+                if is_windows or not have_lsof:
+                    try:
+                        with socket.create_connection(
+                            ('127.0.0.1', int(port_str)), timeout=0.2,
+                        ):
+                            # Got a connection — port is NOT free.
+                            listening = True
+                    except (ConnectionRefusedError, OSError):
+                        listening = False
+                    except Exception:
+                        listening = False
+            if not listening:
+                return True
+            try:
+                time.sleep(delay)
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _wait_for_port_listening(port_str, iters, delay):
+        """Return True once ``port_str`` accepts a TCP connection on localhost.
+
+        POSIX path mirrors the fish snippet (``nc -z``). Cross-platform
+        fallback is ``socket.create_connection`` with a short timeout —
+        equivalent semantics to ``nc -z`` for our purposes (we don't care
+        about protocol-level handshake, only that something is listening).
+        """
+        is_windows = sys.platform == 'win32'
+        nc = shutil.which('nc') if not is_windows else None
+        for _ in range(iters):
+            if nc:
+                try:
+                    rc = subprocess.run(
+                        [nc, '-z', '127.0.0.1', port_str],
+                        capture_output=True, timeout=2,
+                    ).returncode
+                    if rc == 0:
+                        return True
+                except Exception:
+                    pass
+            else:
+                try:
+                    with socket.create_connection(
+                        ('127.0.0.1', int(port_str)), timeout=0.2,
+                    ):
+                        return True
+                except Exception:
+                    pass
+            try:
+                time.sleep(delay)
+            except Exception:
+                pass
+        return False
 
     def get_portforward_status(self):
         """Get current port forward status from script
