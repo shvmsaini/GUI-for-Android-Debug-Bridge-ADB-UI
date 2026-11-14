@@ -1101,7 +1101,9 @@ class _SeatJumpHost:
         """
         import uuid as _uuid
         basename = os.path.basename(local_path)
-        gw_staging = f"/tmp/{basename}"
+        # Use UUID-suffixed staging path on gateway to avoid collisions with
+        # leftover files from previous transfers that crashed before cleanup
+        gw_staging = f"/tmp/.adb-gui-gw-{_uuid.uuid4().hex[:8]}_{basename}"
 
         has_bct = self._probe_bct()
         self._log(f"Copy-to-seat: gateway bct availability = {has_bct}", "INFO")
@@ -1112,9 +1114,9 @@ class _SeatJumpHost:
         try:
             self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
         except Exception as e:
-            self._log(f"Staging directly as {gw_staging} failed ({e}), falling back to unique name", "DEBUG")
-            # UUID-only name avoids issues with spaces or special chars in basename
-            gw_staging = f"/tmp/.adb-gui-stage-{_uuid.uuid4().hex}"
+            self._log(f"Staging to {gw_staging} failed ({e}), trying unique name", "DEBUG")
+            # Try with a unique filename (UUID-only, avoiding spaces/special chars in original basename)
+            gw_staging = f"/tmp/.adb-gui-gw-{_uuid.uuid4().hex}.apk"
             self.run_scp_to_gateway(local_path, gw_staging, timeout=timeout)
 
         dest_dir = os.path.dirname(remote_path) or "/"
@@ -1251,8 +1253,8 @@ class _SeatJumpHost:
                     staging_candidates.remove(saved_dir)
                     staging_candidates.insert(0, saved_dir)
                 for staging_base in staging_candidates:
-                    stage_path = f"{staging_base}/{basename}"
-                    if stage_path == first_target or (os.path.dirname(stage_path) == dest_dir and first_target == remote_path):
+                    stage_path = f"{staging_base}/.adb-gui-{_uuid.uuid4().hex[:8]}.apk"
+                    if os.path.dirname(stage_path) == dest_dir and first_target == remote_path:
                         continue
                     self._log(f"Trying staging via {staging_base}…", "INFO")
                     if progress_callback:
@@ -1451,8 +1453,8 @@ class _SeatJumpHost:
                     staging_candidates.remove(saved_dir)
                     staging_candidates.insert(0, saved_dir)
                 for staging_base in staging_candidates:
-                    stage_path = f"{staging_base}/{basename}"
-                    if stage_path == first_target or (os.path.dirname(stage_path) == dest_dir and first_target == remote_path):
+                    stage_path = f"{staging_base}/.adb-gui-{_uuid.uuid4().hex[:8]}.apk"
+                    if os.path.dirname(stage_path) == dest_dir and first_target == remote_path:
                         continue
                     self._log(f"Trying staging via {staging_base}…", "INFO")
                     if progress_callback:

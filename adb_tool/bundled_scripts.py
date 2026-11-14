@@ -298,7 +298,7 @@ case "$1" in
 
     tunnel)
         PORT=${4:-5555}
-        ssh -L "$PORT:$2:5555" "$3"
+        ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -L "$PORT:$2:5555" "$3"
         ;;
 
     auto-connect|ac)
@@ -319,7 +319,7 @@ case "$1" in
 
         echo "Opening tunnel on localhost:$PORT"
 
-        ssh -f -N -L "$PORT:$SEAT:5555" "$SERVER"
+        ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -f -N -L "$PORT:$SEAT:5555" "$SERVER"
 
         sleep 1
 

@@ -377,9 +377,11 @@ class AppMixin:
         gateway_user, gateway_host = gateway.split('@', 1)
         from .seat_methods import _SeatJumpHost
         staged_base = _SeatJumpHost.get_working_path(gateway_host, seat_name) or "/data/local/tmp"
-        remote_path = f"{staged_base}/{apk_name}"
-
-        self.log(f"Gateway: Copying {apk_name} → {seat_name}:{remote_path}", "INFO")
+        # Use UUID-suffixed staging path to avoid collisions with leftover files
+        # from previous installs that crashed before cleanup ran
+        staging_suffix = uuid.uuid4().hex[:8]
+        remote_path = f"{staged_base}/.adb-gui-{staging_suffix}.apk"
+        self.log(f"Gateway: Copying {apk_name} → {seat_name}:{remote_path.rsplit('/', 1)[-1]}", "INFO")
         self.update_status(f"Gateway: Preparing copy...")
 
         # Get mtc password - try cache (global fallback) or use provided
@@ -397,13 +399,13 @@ class AppMixin:
                 "WARNING",
             )
             self.update_status("Gateway: Password missing — falling back to adb push")
-            cmd = f"{device_flag} push {shlex.quote(apk_path)} /data/local/tmp/{apk_name}"
+            cmd = f"{device_flag} push {shlex.quote(apk_path)} {shlex.quote(remote_path)}"
             result = self.adb.run_command(cmd, timeout=120)
             if not result['success']:
                 self.log("Push failed", "ERROR")
                 self.update_status("Gateway: Push failed")
                 return False
-            cmd = f"{device_flag} shell pm install -r -d -t /data/local/tmp/{apk_name}"
+            cmd = f"{device_flag} shell pm install -r -d -t {shlex.quote(remote_path)}"
             result = self.adb.run_command(cmd, timeout=180)
             if not result['success']:
                 self.log("Install failed", "ERROR")
@@ -412,7 +414,7 @@ class AppMixin:
             self.update_status("✅ Installed (fallback)")
             try:
                 self.adb.run_command(
-                    f"{device_flag} shell rm -f /data/local/tmp/{shlex.quote(apk_name)}",
+                    f"{device_flag} shell rm -f {shlex.quote(remote_path)}",
                     timeout=30,
                 )
             except Exception:
