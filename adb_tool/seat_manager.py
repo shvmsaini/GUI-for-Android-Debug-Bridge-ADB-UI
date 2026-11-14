@@ -568,7 +568,52 @@ class SeatPortManager:
             f'ssh.*mtc@{seat_re}\\b',              # install-key SSH into this seat
             f'ssh.*-J.*\\s+mtc@{seat_re}\\b',      # install-key ProxyJump into this seat
         ]
+        is_posix = sys.platform in ('darwin', 'linux')
         for pat in patterns:
+            ssh_pids = []
+            try:
+                proc = subprocess.run(
+                    ['pgrep', '-f', pat],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    ssh_pids = [
+                        int(line) for line in proc.stdout.split()
+                        if line.strip().isdigit()
+                    ]
+            except Exception:
+                ssh_pids = []
+
+            if is_posix and ssh_pids:
+                for ssh_pid in ssh_pids:
+                    try:
+                        kids = subprocess.run(
+                            ['pgrep', '-P', str(ssh_pid)],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if kids.returncode != 0 or not kids.stdout:
+                            continue
+                        for kpid in kids.stdout.split():
+                            kpid = kpid.strip()
+                            if not kpid.isdigit():
+                                continue
+                            try:
+                                argv = subprocess.run(
+                                    ['ps', '-p', kpid, '-o', 'comm='],
+                                    capture_output=True, text=True, timeout=5,
+                                ).stdout.strip().lower()
+                            except Exception:
+                                argv = ''
+                            if argv.startswith('openssl'):
+                                try:
+                                    os.kill(int(kpid), 15)  # SIGTERM
+                                except ProcessLookupError:
+                                    pass
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
             try:
                 subprocess.run(
                     ['pkill', '-f', pat],
