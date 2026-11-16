@@ -680,9 +680,19 @@ class DeviceMixin:
                     for dev_info in seat_sh_devices:
                         if dev_info.get('device') == device_id:
                             seat_name = dev_info.get('seat', '')
+                            gateway = dev_info.get('gateway', '')
                             if seat_name:
-                                self.log(f"Disconnecting seat device {seat_name}...")
-                                self.disconnect_seat(seat_name)
+                                from .safe_dialog import safe_question_multiline
+                                confirmed = safe_question_multiline(
+                                    self,
+                                    "Disconnect seat device?",
+                                    f"Disconnect from seat '{seat_name}'?\n\n"
+                                    f"Gateway: {gateway}\n\n"
+                                    f"This will tear down the tunnel and stop any open mirror window.",
+                                )
+                                if confirmed:
+                                    self.log(f"Disconnecting seat device {seat_name}...")
+                                    self.disconnect_seat(seat_name)
                                 return
                 except Exception:
                     pass

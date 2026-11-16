@@ -347,14 +347,62 @@ class AppMixin:
             mark the APK as installed — without a return value, a failed
             SCP was silently counted as a success and the user saw
             "Installed successfully" + an auto-launch prompt.
+
+        Cleanup contract:
+            - Every seat-side staging path written during this call is
+              tracked in ``seat_paths`` and removed before return
+              (success: deferred 2s so introspection can still see it;
+              failure or exception: removed immediately).
+            - A janitor sweep also removes any orphaned
+              ``.adb-gui-*.apk`` files older than 10 minutes on the seat.
+            - Gateway-side cleanup is owned by ``_SeatJumpHost``.
         """
         device_id = self.current_device
-        # IMPORTANT: Resolve device flag now to avoid race if user switches
-        # focus to another device during the install. The entire install (copy
-        # through pm install) must target the same device.
         device_flag = self.get_device_flag()
 
-        # Get seat info
+        seat_paths = set()
+        install_succeeded = False
+
+        def _janitor_sweep_seat(force_all=False):
+            """Remove orphaned .adb-gui-*.apk files from seat staging dirs."""
+            if force_all:
+                script = (
+                    "for d in /data/local/tmp /tmp /sdcard /storage/emulated/0; do "
+                    "[ -d \"$d\" ] || continue; "
+                    "rm -f \"$d\"/.adb-gui-*.apk 2>/dev/null; "
+                    "done; true"
+                )
+            else:
+                script = (
+                    "for d in /data/local/tmp /tmp /sdcard /storage/emulated/0; do "
+                    "[ -d \"$d\" ] || continue; "
+                    "if command -v find >/dev/null 2>&1; then "
+                    "  find \"$d\" -maxdepth 1 -name '.adb-gui-*.apk' "
+                    "    -mmin +10 -exec rm -f {} + 2>/dev/null; "
+                    "else "
+                    "  rm -f \"$d\"/.adb-gui-*.apk 2>/dev/null; "
+                    "fi; "
+                    "done; true"
+                )
+            cmd = f"{device_flag} shell sh -c {shlex.quote(script)}"
+            try:
+                self.adb.run_command(cmd, timeout=15)
+            except Exception:
+                pass
+
+        def _cleanup_seat_paths():
+            """Remove tracked seat paths. Best-effort."""
+            if not seat_paths:
+                return
+            quoted = " ".join(shlex.quote(p) for p in sorted(seat_paths))
+            cmd = f"{device_flag} shell rm -f {quoted}"
+            try:
+                self.adb.run_command(cmd, timeout=30)
+            except Exception:
+                pass
+
+        _janitor_sweep_seat()
+
         seat_name = ""
         gateway = ""
         try:
@@ -367,62 +415,58 @@ class AppMixin:
         except Exception as e:
             self.log(f"Error getting seat info: {e}", "ERROR")
             self.update_status("Gateway: Failed")
+            _cleanup_seat_paths()
             return False
 
         if not seat_name or not gateway or '@' not in gateway:
             self.log("Missing seat/gateway info", "ERROR")
             self.update_status("Gateway: Missing info")
+            _cleanup_seat_paths()
             return False
 
         gateway_user, gateway_host = gateway.split('@', 1)
         from .seat_methods import _SeatJumpHost
         staged_base = _SeatJumpHost.get_working_path(gateway_host, seat_name) or "/data/local/tmp"
-        # Use UUID-suffixed staging path to avoid collisions with leftover files
-        # from previous installs that crashed before cleanup ran
         staging_suffix = uuid.uuid4().hex[:8]
         remote_path = f"{staged_base}/.adb-gui-{staging_suffix}.apk"
+        seat_paths.add(remote_path)
         self.log(f"Gateway: Copying {apk_name} → {seat_name}:{remote_path.rsplit('/', 1)[-1]}", "INFO")
         self.update_status(f"Gateway: Preparing copy...")
 
-        # Get mtc password - try cache (global fallback) or use provided
         if not mtc_password and hasattr(self, 'credential_manager'):
             mtc_password = self.credential_manager.get_mtc_password_with_fallback()
 
         from .credentials import CredentialManager
         creds = getattr(self, 'credential_manager', None) or CredentialManager()
         gw_pw = creds.get_gateway_password_with_fallback(gateway_host, gateway_user)
-        if not gw_pw:
-            self.log(
-                f"Gateway password for {gateway_user}@{gateway_host} not "
-                f"cached — connect to the seat once to cache it, then "
-                f"retry. Falling back to adb push.",
-                "WARNING",
-            )
-            self.update_status("Gateway: Password missing — falling back to adb push")
-            cmd = f"{device_flag} push {shlex.quote(apk_path)} {shlex.quote(remote_path)}"
-            result = self.adb.run_command(cmd, timeout=120)
-            if not result['success']:
-                self.log("Push failed", "ERROR")
-                self.update_status("Gateway: Push failed")
-                return False
-            cmd = f"{device_flag} shell pm install -r -d -t {shlex.quote(remote_path)}"
-            result = self.adb.run_command(cmd, timeout=180)
-            if not result['success']:
-                self.log("Install failed", "ERROR")
-                self.update_status("Gateway: Install failed")
-                return False
-            self.update_status("✅ Installed (fallback)")
-            try:
-                self.adb.run_command(
-                    f"{device_flag} shell rm -f {shlex.quote(remote_path)}",
-                    timeout=30,
-                )
-            except Exception:
-                pass
-            return True
 
-        # Establish jump host connection and copy via gateway (bct put or scp)
+        jump = None
+        actual_remote_path = remote_path  # may be overridden by copy_to_seat_via_gateway
         try:
+            if not gw_pw:
+                self.log(
+                    f"Gateway password for {gateway_user}@{gateway_host} not "
+                    f"cached — connect to the seat once to cache it, then "
+                    f"retry. Falling back to adb push.",
+                    "WARNING",
+                )
+                self.update_status("Gateway: Password missing — falling back to adb push")
+                cmd = f"{device_flag} push {shlex.quote(apk_path)} {shlex.quote(remote_path)}"
+                result = self.adb.run_command(cmd, timeout=120)
+                if not result['success']:
+                    self.log("Push failed", "ERROR")
+                    self.update_status("Gateway: Push failed")
+                    return False
+                cmd = f"{device_flag} shell pm install -r -d -t {shlex.quote(remote_path)}"
+                result = self.adb.run_command(cmd, timeout=180)
+                if not result['success']:
+                    self.log("Install failed", "ERROR")
+                    self.update_status("Gateway: Install failed")
+                    return False
+                self.update_status("✅ Installed (fallback)")
+                install_succeeded = True
+                return True
+
             jump = _SeatJumpHost(f"{gateway_user}@{gateway_host}", gw_pw, self.log)
 
             def _on_stage(stage, msg):
@@ -433,16 +477,14 @@ class AppMixin:
                     self.update_status(f"Gateway: {msg}")
                     self.log(f"Gateway: {msg}", "INFO")
 
-            actual_remote_path = jump.copy_to_seat_via_gateway(
-                local_path=apk_path,
-                remote_path=remote_path,
-                seat_host=seat_name,
-                mtc_password=mtc_password,
-                timeout=300,
-                progress_callback=_on_stage,
-            )
-            if not isinstance(actual_remote_path, str):
-                actual_remote_path = remote_path
+            if isinstance(result, tuple) and len(result) == 2:
+                actual_remote_path, seat_copy_paths = result
+                seat_paths.update(seat_copy_paths)
+            else:
+                if isinstance(result, str):
+                    actual_remote_path = result
+                else:
+                    actual_remote_path = remote_path
 
             try:
                 self.adb.run_command(
@@ -459,6 +501,20 @@ class AppMixin:
                     )
                 except Exception:
                     pass
+
+            self.update_status(f"Gateway: Installing {apk_name}...")
+            self.log("Running pm install...", "INFO")
+            cmd = f"{device_flag} shell pm install -r -d -t {shlex.quote(actual_remote_path)}"
+            result = self.adb.run_command(cmd, timeout=180)
+            if not result['success']:
+                stderr = (result.get('stderr') or '').strip() or (result.get('stdout') or '').strip()
+                self.log(f"❌ pm install failed: {stderr[:200]}", "ERROR")
+                self.update_status(f"Gateway: pm install failed - {stderr[:80]}")
+                return False
+
+            self.update_status("Gateway: ✅ Installed")
+            install_succeeded = True
+            return True
 
         except _SeatSshError as e:
             err_str = str(e)
@@ -483,39 +539,31 @@ class AppMixin:
             self.update_status("Gateway: Exception")
             return False
         finally:
-            if 'jump' in locals():
+            if jump is not None:
                 try: jump.close()
                 except: pass
 
-        self.update_status(f"Gateway: Installing {apk_name}...")
-        self.log("Running pm install...", "INFO")
-        cmd = f"{device_flag} shell pm install -r -d -t {shlex.quote(actual_remote_path)}"
-        result = self.adb.run_command(cmd, timeout=180)
-        if not result['success']:
-            stderr = (result.get('stderr') or '').strip() or (result.get('stdout') or '').strip()
-            self.log(f"❌ pm install failed: {stderr[:200]}", "ERROR")
-            self.update_status(f"Gateway: pm install failed - {stderr[:80]}")
-            try:
-                self.adb.run_command(
-                    f"{device_flag} shell rm -f {shlex.quote(actual_remote_path)}",
-                    timeout=30,
-                )
-            except Exception:
-                pass
-            return False
-
-        def _cleanup():
-            try:
-                self.adb.run_command(f"{device_flag} shell rm -f {shlex.quote(actual_remote_path)}", timeout=30)
-            except Exception:
-                pass
-
-        self.log(f"Scheduling cleanup of APK file on seat: {actual_remote_path}", "DEBUG")
-        self.run_on_main_thread(lambda: (
-            QTimer.singleShot(2000, _cleanup) if not getattr(self, '_closing', False) else None
-        ))
-        self.update_status("Gateway: ✅ Installed")
-        return True
+            if install_succeeded:
+                self.log(f"Scheduling cleanup of seat staging files: {sorted(seat_paths)}", "DEBUG")
+                paths_snapshot = set(seat_paths)
+                sweep_fn = _janitor_sweep_seat
+                def _deferred_cleanup():
+                    try:
+                        quoted = " ".join(shlex.quote(p) for p in sorted(paths_snapshot))
+                        self.adb.run_command(f"{device_flag} shell rm -f {quoted}", timeout=30)
+                    except Exception:
+                        pass
+                    try:
+                        sweep_fn()
+                    except Exception:
+                        pass
+                self.run_on_main_thread(lambda: (
+                    QTimer.singleShot(2000, _deferred_cleanup)
+                    if not getattr(self, '_closing', False) else None
+                ))
+            else:
+                _cleanup_seat_paths()
+                _janitor_sweep_seat(force_all=True)
 
     def _show_progress(self, current, total):
         """Show progress bar and initialize values"""

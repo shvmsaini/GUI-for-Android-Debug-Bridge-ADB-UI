@@ -343,9 +343,11 @@ def open_seat_root_window(parent, seat_name, gateway_host, gateway_user, gateway
                         rows.append((display, size_str, is_dir, name))
                     rows.sort(key=lambda r: (not r[2], r[3].lower()))
                 except Exception as e:
-                    def apply_err():
+                    # Capture e's value as a default arg so the closure
+                    # doesn't reference the free variable after except exits
+                    def apply_err(err=str(e)):
                         listbox.setRowCount(1)
-                        listbox.setItem(0, 0, QTableWidgetItem(f"[Error] {str(e)}"))
+                        listbox.setItem(0, 0, QTableWidgetItem(f"[Error] {err}"))
                     ui.call.emit(apply_err)
                     explorer._ls_in_progress = False  # allow next refresh
                     return

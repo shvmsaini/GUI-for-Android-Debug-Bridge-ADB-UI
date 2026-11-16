@@ -1098,12 +1098,18 @@ class _SeatJumpHost:
         When provided and bct/scp fails with Permission Denied, tries a list
         of candidate staging paths on the seat (some seats lock /data/local/tmp,
         others lock /tmp), then uses the root shell to mv to the final destination.
+
+        Returns:
+            tuple: (actual_seat_path, list_of_seat_paths_we_may_have_written)
+            The second element is a list of paths that were used (or attempted)
+            on the seat, even on failure. The caller is responsible for cleaning
+            up any remaining files.
         """
         import uuid as _uuid
         basename = os.path.basename(local_path)
-        # Use UUID-suffixed staging path on gateway to avoid collisions with
-        # leftover files from previous transfers that crashed before cleanup
         gw_staging = f"/tmp/.adb-gui-gw-{_uuid.uuid4().hex[:8]}_{basename}"
+
+        seat_paths_we_may_have_written = []
 
         has_bct = self._probe_bct()
         self._log(f"Copy-to-seat: gateway bct availability = {has_bct}", "INFO")
@@ -1124,6 +1130,8 @@ class _SeatJumpHost:
         first_target = f"{saved_dir}/{basename}" if (saved_dir and saved_dir != dest_dir) else remote_path
         if first_target != remote_path:
             self._log(f"Gateway {self._host}: using saved working path {saved_dir} first", "INFO")
+
+        seat_paths_we_may_have_written.append(first_target)
 
         if has_bct:
             msg = f"Gateway copying is done, now doing bct to seat ({seat_host}:{first_target})…"
@@ -1254,6 +1262,7 @@ class _SeatJumpHost:
                     staging_candidates.insert(0, saved_dir)
                 for staging_base in staging_candidates:
                     stage_path = f"{staging_base}/.adb-gui-{_uuid.uuid4().hex[:8]}.apk"
+                    seat_paths_we_may_have_written.append(stage_path)
                     if os.path.dirname(stage_path) == dest_dir and first_target == remote_path:
                         continue
                     self._log(f"Trying staging via {staging_base}…", "INFO")
@@ -1318,11 +1327,30 @@ class _SeatJumpHost:
 
             if progress_callback:
                 progress_callback("done", f"✓ Done copying {basename} to {seat_host}")
-            return actual_seat_path
+            # Return tuple: (actual_path, list_of_paths_we_may_have_written)
+            return actual_seat_path, seat_paths_we_may_have_written
         finally:
-            if not success and getattr(self, '_password', None):
+            # Always clean up gateway-side staging files (both this attempt's
+            # and any orphaned leftovers from previous crashed attempts).
+            # Best-effort — don't propagate failures from cleanup.
+            if getattr(self, '_password', None):
                 try:
-                    self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=5)
+                    # Remove this attempt's staging file (if bct/scp didn't already)
+                    self.run_gateway_command(
+                        f"rm -f {shlex.quote(gw_staging)}",
+                        timeout=5
+                    )
+                except Exception:
+                    pass
+                try:
+                    # Janitor: sweep orphaned .adb-gui-gw-* staging files
+                    # older than ~10 minutes (stale marker). Files newer than
+                    # that are presumed to belong to an in-flight transfer.
+                    self.run_gateway_command(
+                        "find /tmp -maxdepth 1 -name '.adb-gui-gw-*' "
+                        "-mmin +10 -exec rm -f {} + 2>/dev/null; true",
+                        timeout=10
+                    )
                 except Exception:
                     pass
 
@@ -1454,6 +1482,7 @@ class _SeatJumpHost:
                     staging_candidates.insert(0, saved_dir)
                 for staging_base in staging_candidates:
                     stage_path = f"{staging_base}/.adb-gui-{_uuid.uuid4().hex[:8]}.apk"
+                    seat_paths_we_may_have_written.append(stage_path)
                     if os.path.dirname(stage_path) == dest_dir and first_target == remote_path:
                         continue
                     self._log(f"Trying staging via {staging_base}…", "INFO")
@@ -1609,6 +1638,15 @@ class _SeatJumpHost:
             if getattr(self, '_password', None):
                 try:
                     self.run_gateway_command(f"rm -f {shlex.quote(gw_staging)}", timeout=5)
+                except Exception:
+                    pass
+                try:
+                    # Janitor: sweep orphaned staging files older than 10 minutes
+                    self.run_gateway_command(
+                        "find /tmp -maxdepth 1 -name '.adb-gui-gw-*' "
+                        "-mmin +10 -exec rm -f {} + 2>/dev/null; true",
+                        timeout=10
+                    )
                 except Exception:
                     pass
 
